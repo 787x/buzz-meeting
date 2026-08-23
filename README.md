@@ -7,12 +7,6 @@
 Transcribe and translate audio offline on your personal computer. Powered by
 OpenAI's [Whisper](https://github.com/openai/whisper).
 
-![MIT License](https://img.shields.io/badge/license-MIT-green)
-[![CI](https://github.com/chidiwilliams/buzz/actions/workflows/ci.yml/badge.svg)](https://github.com/chidiwilliams/buzz/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/github/chidiwilliams/buzz/branch/main/graph/badge.svg?token=YJSB8S2VEP)](https://codecov.io/github/chidiwilliams/buzz)
-![GitHub release (latest by date)](https://img.shields.io/github/v/release/chidiwilliams/buzz)
-[![Github all releases](https://img.shields.io/github/downloads/chidiwilliams/buzz/total.svg)](https://GitHub.com/chidiwilliams/buzz/releases/)
-
 ![Buzz](https://raw.githubusercontent.com/chidiwilliams/buzz/refs/heads/main/buzz/assets/buzz-banner.jpg)
 
 ## Features
@@ -105,4 +99,3 @@ You can help the Buzz by starring 🌟 the repo and sharing it with your friends
     <img alt="Live recording" src="https://github.com/chidiwilliams/buzz/raw/main/share/screenshots/buzz-5-live_recording.png" style="max-width: 18%; margin-right: 1%; height:auto;" />
     <img alt="Resize" src="https://github.com/chidiwilliams/buzz/raw/main/share/screenshots/buzz-6-resize.png" style="max-width: 18%;" />
 </div>
-
