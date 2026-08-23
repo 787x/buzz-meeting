@@ -1,5 +1,4 @@
-import threading
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -40,14 +39,14 @@ def make_transcriber(
 
 
 class TestRecordingTranscriberInit:
-    def test_default_batch_size_is_5_seconds(self):
+    def test_default_max_utterance_is_12_seconds(self):
         t = make_transcriber(mode_index=0)
-        assert t.n_batch_samples == 5 * t.sample_rate
+        assert t.segmenter.max_utterance_seconds == 12.0
 
-    def test_append_and_correct_mode_batch_size_uses_transcription_step(self):
+    def test_append_and_correct_deadline_uses_transcription_step(self):
         mode_index = list(RecordingTranscriberMode).index(RecordingTranscriberMode.APPEND_AND_CORRECT)
         t = make_transcriber(mode_index=mode_index)
-        assert t.n_batch_samples == int(t.transcription_options.transcription_step * t.sample_rate)
+        assert t.segmenter.max_utterance_seconds == t.transcription_options.transcription_step
 
     def test_append_and_correct_mode_keep_sample_seconds(self):
         mode_index = list(RecordingTranscriberMode).index(RecordingTranscriberMode.APPEND_AND_CORRECT)
@@ -58,13 +57,14 @@ class TestRecordingTranscriberInit:
         t = make_transcriber(mode_index=0)
         assert t.keep_sample_seconds == 0.15
 
-    def test_queue_starts_empty(self):
+    def test_pending_utterance_queue_starts_empty(self):
         t = make_transcriber()
-        assert t.queue.size == 0 or t.queue.ndim == 0
+        assert list(t.pending_utterances) == []
+        assert t.pending_sample_count == 0
 
-    def test_max_queue_size_is_three_batches(self):
+    def test_pending_pcm_is_bounded_to_15_seconds(self):
         t = make_transcriber()
-        assert t.max_queue_size == 3 * t.n_batch_samples
+        assert t.max_pending_samples == 15 * t.sample_rate
 
 
 class TestAmplitude:
@@ -93,42 +93,36 @@ class TestStreamCallback:
 
         assert len(emitted) == 1
 
-    def test_appends_to_queue_when_not_full(self):
+    def test_appends_to_segmenter_buffer_before_endpoint(self):
         t = make_transcriber()
-        initial_size = t.queue.size
+        initial_size = t.segmenter.buffered_sample_count
         chunk = np.ones((100,), dtype=np.float32)
         t.on_audio(chunk)
-        assert t.queue.size == initial_size + 100
+        assert t.segmenter.buffered_sample_count == initial_size + 100
 
-    def test_drops_chunk_when_queue_full(self):
+    def test_drops_completed_utterance_when_pending_queue_full(self):
         t = make_transcriber()
-        # Fill the queue to max capacity
-        t.queue = np.ones(t.max_queue_size, dtype=np.float32)
-        size_before = t.queue.size
+        t.pending_sample_count = t.max_pending_samples
+        t.segmenter = MagicMock()
+        t.segmenter.push.return_value = [np.ones(100, dtype=np.float32)]
+        t.segmenter.buffered_sample_count = 0
 
-        chunk = np.array([[0.5], [0.5]], dtype=np.float32)
-        t.on_audio(chunk.reshape(-1))
+        t.on_audio(np.ones(100, dtype=np.float32))
 
-        assert t.queue.size == size_before  # chunk was dropped
+        assert list(t.pending_utterances) == []
+        assert t.pending_sample_count == t.max_pending_samples
 
-    def test_thread_safety_with_concurrent_callbacks(self):
+    def test_multiple_callback_blocks_preserve_samples_for_flush(self):
         t = make_transcriber()
-        errors = []
+        first = np.full(1_600, 0.1, dtype=np.float32)
+        second = np.full(1_600, 0.2, dtype=np.float32)
 
-        def callback():
-            try:
-                chunk = np.ones((10, 1), dtype=np.float32)
-                t.on_audio(chunk.reshape(-1))
-            except Exception as e:
-                errors.append(e)
+        t.on_audio(first)
+        t.on_audio(second)
+        utterances = t.segmenter.flush()
 
-        threads = [threading.Thread(target=callback) for _ in range(20)]
-        for th in threads:
-            th.start()
-        for th in threads:
-            th.join()
-
-        assert errors == []
+        assert len(utterances) == 1
+        np.testing.assert_array_equal(utterances[0], np.concatenate((first, second)))
 
 
 class TestGetDeviceSampleRate:
@@ -193,82 +187,11 @@ class TestStopRecording:
 class TestStartWithSilence:
     """Tests for the main transcription loop with silence threshold."""
 
-    def _run_with_mock_model(self, transcription_options, samples, expected_text):
-        """Helper to run a single transcription cycle with a mocked whisper model."""
-        mock_model = MagicMock()
-        mock_model.transcribe.return_value = {"text": expected_text}
-
-        transcriber = make_transcriber(
-            model_type=ModelType.WHISPER,
-            silence_threshold=0.0,
-        )
-        transcriber.transcription_options = transcription_options
-
-        received = []
-        transcriber.transcription.connect(lambda t: received.append(t))
-
-        def fake_input_stream(**kwargs):
-            ctx = MagicMock()
-            ctx.__enter__ = MagicMock(return_value=ctx)
-            ctx.__exit__ = MagicMock(return_value=False)
-            return ctx
-
-        transcriber.queue = samples.copy()
-        transcriber.is_running = True
-
-        # After processing one batch, stop.
-        call_count = [0]
-        original_emit = transcriber.transcription.emit
-
-        def stop_after_first(text):
-            original_emit(text)
-            transcriber.is_running = False
-
-        transcriber.transcription.emit = stop_after_first
-
-        with patch("buzz.transcriber.recording_transcriber.whisper") as mock_whisper, \
-             patch("buzz.transcriber.recording_transcriber.torch") as mock_torch:
-            mock_torch.cuda.is_available.return_value = False
-            mock_whisper.load_model.return_value = mock_model
-            mock_whisper.Whisper = type("Whisper", (), {})
-            # make isinstance(model, whisper.Whisper) pass
-            mock_model.__class__ = mock_whisper.Whisper
-
-            with patch.object(transcriber, "audio_source"):
-                transcriber.start()
-
-        return received
-
     def test_silent_audio_skips_transcription(self):
         t = make_transcriber(silence_threshold=1.0)  # very high threshold
+        t.on_audio(np.zeros(30 * t.sample_rate, dtype=np.float32))
 
-        received = []
-        t.transcription.connect(lambda text: received.append(text))
-
-        # Put silent samples in queue (amplitude = 0)
-        t.queue = np.zeros(t.n_batch_samples + 100, dtype=np.float32)
-        t.is_running = True
-
-        stop_event = threading.Event()
-
-        def stop_after_delay():
-            stop_event.wait(timeout=1.5)
-            t.stop_recording()
-
-        stopper = threading.Thread(target=stop_after_delay, daemon=True)
-
-        with patch("buzz.transcriber.recording_transcriber.whisper") as mock_whisper, \
-             patch("buzz.transcriber.recording_transcriber.torch") as mock_torch:
-            mock_torch.cuda.is_available.return_value = False
-            mock_whisper.load_model.return_value = MagicMock()
-
-            with patch.object(t, "audio_source"):
-                stopper.start()
-                stop_event.set()
-                t.start()
-
-        # No transcription should have been emitted since audio is silent
-        assert received == []
+        assert list(t.pending_utterances) == []
 
 
 class TestStartPortAudioError:
@@ -289,33 +212,23 @@ class TestStartPortAudioError:
         assert len(errors) == 1
 
 
-class TestFindSilenceCutPoint:
-    def test_returns_len_when_region_too_short(self):
-        samples = np.ones(10, dtype=np.float32)
-        cut = RecordingTranscriber.find_silence_cut_point(samples, sample_rate=2000)
-        assert cut == len(samples)
+class TestAdaptiveSegmentation:
+    def test_continuous_speech_reaches_normal_deadline(self):
+        t = make_transcriber()
 
-    def test_uniform_loud_signal_returns_len(self):
-        # Every window has identical energy, so none falls below the threshold.
-        samples = np.ones(4000, dtype=np.float32)
-        cut = RecordingTranscriber.find_silence_cut_point(samples, sample_rate=2000)
-        assert cut == len(samples)
+        t.on_audio(np.ones(12 * t.sample_rate, dtype=np.float32))
 
-    def test_cuts_at_trailing_silence(self):
-        loud = np.ones(2000, dtype=np.float32)
-        silent = np.zeros(2000, dtype=np.float32)
-        samples = np.concatenate([loud, silent])
-        cut = RecordingTranscriber.find_silence_cut_point(samples, sample_rate=2000)
-        # The cut should land inside the trailing silent region.
-        assert cut < len(samples)
-        assert cut >= len(loud)
+        assert len(t.pending_utterances) == 1
+        assert t.pending_utterances[0].size == 12 * t.sample_rate
 
 
 def _drive_one_cycle(transcriber, samples):
     """Run the transcription loop for exactly one batch then stop."""
     received = []
     transcriber.transcription.connect(received.append)
-    transcriber.queue = samples.copy()
+    transcriber.pending_utterances.append(samples.copy())
+    transcriber.pending_sample_count = samples.size
+    transcriber._utterance_available.set()
     transcriber.is_running = True
 
     def stop_after_first(_text):
@@ -332,7 +245,7 @@ def _drive_one_cycle(transcriber, samples):
 class TestModelBackends:
     def test_faster_whisper_joins_segment_text(self):
         t = make_transcriber(model_type=ModelType.FASTER_WHISPER)
-        samples = np.ones(t.n_batch_samples, dtype=np.float32)
+        samples = np.ones(12 * t.sample_rate, dtype=np.float32)
 
         class FakeWhisperModel:
             def __init__(self, **kwargs):
@@ -356,7 +269,7 @@ class TestModelBackends:
 
     def test_openai_api_returns_text(self):
         t = make_transcriber(model_type=ModelType.OPEN_AI_WHISPER_API)
-        samples = np.ones(t.n_batch_samples, dtype=np.float32)
+        samples = np.ones(12 * t.sample_rate, dtype=np.float32)
 
         transcript = MagicMock()
         transcript.model_extra = {}
@@ -374,7 +287,7 @@ class TestModelBackends:
 
     def test_hugging_face_returns_text(self):
         t = make_transcriber(model_type=ModelType.HUGGING_FACE)
-        samples = np.ones(t.n_batch_samples, dtype=np.float32)
+        samples = np.ones(12 * t.sample_rate, dtype=np.float32)
 
         class FakeTransformers:
             is_mms_model = False
@@ -394,6 +307,78 @@ class TestModelBackends:
             received = _drive_one_cycle(t, samples)
 
         assert received == ["hf text"]
+
+
+class TestEffectivePrompt:
+    def test_whisper_uses_effective_prompt(self):
+        t = make_transcriber(model_type=ModelType.WHISPER)
+
+        class FakeWhisper:
+            def __init__(self):
+                self.transcribe = MagicMock(return_value={"text": "text"})
+
+        model = FakeWhisper()
+        with patch("buzz.transcriber.recording_transcriber.whisper.Whisper", FakeWhisper):
+            t._transcribe_whisper(np.ones(100, dtype=np.float32), model, "dynamic")
+
+        assert model.transcribe.call_args.kwargs["initial_prompt"] == "dynamic"
+
+    def test_faster_whisper_uses_effective_prompt(self):
+        t = make_transcriber(model_type=ModelType.FASTER_WHISPER)
+
+        class FakeFasterWhisper:
+            def __init__(self):
+                self.transcribe = MagicMock(return_value=([], MagicMock()))
+
+        model = FakeFasterWhisper()
+        with patch(
+            "buzz.transcriber.recording_transcriber.faster_whisper.WhisperModel",
+            FakeFasterWhisper,
+        ):
+            t._transcribe_faster_whisper(
+                np.ones(100, dtype=np.float32),
+                model,
+                "dynamic",
+            )
+
+        assert model.transcribe.call_args.kwargs["initial_prompt"] == "dynamic"
+
+    @pytest.mark.parametrize(
+        "model_type",
+        [ModelType.OPEN_AI_WHISPER_API, ModelType.WHISPER_CPP],
+    )
+    def test_api_paths_use_effective_prompt(self, model_type):
+        t = make_transcriber(model_type=model_type)
+        t.openai_client = MagicMock()
+        transcript = MagicMock()
+        transcript.model_extra = {}
+        transcript.text = "text"
+        t.openai_client.audio.transcriptions.create.return_value = transcript
+
+        t._transcribe_via_api(np.ones(100, dtype=np.float32), "dynamic")
+
+        assert (
+            t.openai_client.audio.transcriptions.create.call_args.kwargs["prompt"]
+            == "dynamic"
+        )
+
+    def test_hugging_face_call_signature_is_unchanged(self):
+        t = make_transcriber(model_type=ModelType.HUGGING_FACE)
+
+        class FakeTransformers:
+            is_mms_model = False
+
+            def __init__(self):
+                self.transcribe = MagicMock(return_value={"text": "text"})
+
+        model = FakeTransformers()
+        with patch(
+            "buzz.transcriber.recording_transcriber.TransformersTranscriber",
+            FakeTransformers,
+        ):
+            t._transcribe_hugging_face(np.ones(100, dtype=np.float32), model)
+
+        assert "initial_prompt" not in model.transcribe.call_args.kwargs
 
 
 class TestStartLocalWhisperServer:
