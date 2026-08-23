@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 from sounddevice import PortAudioError
 
+from buzz.audio_capture.source import AudioSourceError
 from buzz.model_loader import TranscriptionModel, ModelType, WhisperModelSize
 from buzz.settings.recording_transcriber_mode import RecordingTranscriberMode
 from buzz.transcriber.recording_transcriber import RecordingTranscriber
@@ -88,7 +89,7 @@ class TestStreamCallback:
         t.amplitude_changed.connect(lambda v: emitted.append(v))
 
         chunk = np.array([[0.5], [0.5]], dtype=np.float32)
-        t.stream_callback(chunk, 2, None, None)
+        t.on_audio(chunk.reshape(-1))
 
         assert len(emitted) == 1
 
@@ -96,7 +97,7 @@ class TestStreamCallback:
         t = make_transcriber()
         initial_size = t.queue.size
         chunk = np.ones((100,), dtype=np.float32)
-        t.stream_callback(chunk.reshape(-1, 1), 100, None, None)
+        t.on_audio(chunk)
         assert t.queue.size == initial_size + 100
 
     def test_drops_chunk_when_queue_full(self):
@@ -106,7 +107,7 @@ class TestStreamCallback:
         size_before = t.queue.size
 
         chunk = np.array([[0.5], [0.5]], dtype=np.float32)
-        t.stream_callback(chunk, 2, None, None)
+        t.on_audio(chunk.reshape(-1))
 
         assert t.queue.size == size_before  # chunk was dropped
 
@@ -117,7 +118,7 @@ class TestStreamCallback:
         def callback():
             try:
                 chunk = np.ones((10, 1), dtype=np.float32)
-                t.stream_callback(chunk, 10, None, None)
+                t.on_audio(chunk.reshape(-1))
             except Exception as e:
                 errors.append(e)
 
@@ -233,12 +234,7 @@ class TestStartWithSilence:
             # make isinstance(model, whisper.Whisper) pass
             mock_model.__class__ = mock_whisper.Whisper
 
-            with patch.object(transcriber, "sounddevice") as mock_sd:
-                mock_stream_ctx = MagicMock()
-                mock_stream_ctx.__enter__ = MagicMock(return_value=mock_stream_ctx)
-                mock_stream_ctx.__exit__ = MagicMock(return_value=False)
-                mock_sd.InputStream.return_value = mock_stream_ctx
-
+            with patch.object(transcriber, "audio_source"):
                 transcriber.start()
 
         return received
@@ -266,12 +262,7 @@ class TestStartWithSilence:
             mock_torch.cuda.is_available.return_value = False
             mock_whisper.load_model.return_value = MagicMock()
 
-            with patch.object(t, "sounddevice") as mock_sd:
-                mock_stream_ctx = MagicMock()
-                mock_stream_ctx.__enter__ = MagicMock(return_value=mock_stream_ctx)
-                mock_stream_ctx.__exit__ = MagicMock(return_value=False)
-                mock_sd.InputStream.return_value = mock_stream_ctx
-
+            with patch.object(t, "audio_source"):
                 stopper.start()
                 stop_event.set()
                 t.start()
@@ -291,8 +282,8 @@ class TestStartPortAudioError:
             mock_torch.cuda.is_available.return_value = False
             mock_whisper.load_model.return_value = MagicMock()
 
-            with patch.object(t, "sounddevice") as mock_sd:
-                mock_sd.InputStream.side_effect = PortAudioError()
+            with patch.object(t, "audio_source") as audio_source:
+                audio_source.start.side_effect = AudioSourceError("open failed")
                 t.start()
 
         assert len(errors) == 1
@@ -332,10 +323,7 @@ def _drive_one_cycle(transcriber, samples):
 
     transcriber.transcription.connect(stop_after_first)
 
-    stream_ctx = MagicMock()
-    stream_ctx.__enter__ = MagicMock(return_value=stream_ctx)
-    stream_ctx.__exit__ = MagicMock(return_value=False)
-    transcriber.sounddevice.InputStream.return_value = stream_ctx
+    transcriber.audio_source = MagicMock()
 
     transcriber.start()
     return received

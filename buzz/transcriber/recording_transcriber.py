@@ -22,6 +22,8 @@ from openai import OpenAI
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from buzz import whisper_audio
+from buzz.audio_capture.source import AudioSource, AudioSourceError
+from buzz.audio_capture.sounddevice_source import SoundDeviceAudioSource
 from buzz.locale import _
 from buzz.assets import APP_BASE_DIR
 from buzz.model_loader import ModelType, map_language_to_mms
@@ -52,15 +54,32 @@ class RecordingTranscriber(QObject):
         model_path: str,
         sounddevice: sounddevice,
         parent: Optional[QObject] = None,
+        audio_source: Optional[AudioSource] = None,
     ) -> None:
         super().__init__(parent)
+        self.process = None
         self.settings = Settings()
         self.transcriber_mode = list(RecordingTranscriberMode)[
             self.settings.value(key=Settings.Key.RECORDING_TRANSCRIBER_MODE, default_value=0)]
         self.transcription_options = transcription_options
         self.current_stream = None
         self.input_device_index = input_device_index
-        self.sample_rate = sample_rate if sample_rate is not None else whisper_audio.SAMPLE_RATE
+        if audio_source is None:
+            self.sample_rate = (
+                sample_rate if sample_rate is not None else whisper_audio.SAMPLE_RATE
+            )
+            self.audio_source = SoundDeviceAudioSource(
+                device_index=input_device_index,
+                sample_rate=self.sample_rate,
+                sounddevice_module=sounddevice,
+            )
+        else:
+            if sample_rate is not None and sample_rate != audio_source.sample_rate:
+                raise ValueError(
+                    "RecordingTranscriber sample rate must match the audio source"
+                )
+            self.audio_source = audio_source
+            self.sample_rate = audio_source.sample_rate
         self.model_path = model_path
         self.n_batch_samples = int(5 * self.sample_rate)  # 5 seconds
         self.keep_sample_seconds = 0.15
@@ -71,12 +90,13 @@ class RecordingTranscriber(QObject):
         self.max_queue_size = 3 * self.n_batch_samples
         self.queue = np.ndarray([], dtype=np.float32)
         self.mutex = threading.Lock()
+        # Retained for constructor and field compatibility. Audio capture is
+        # owned by self.audio_source.
         self.sounddevice = sounddevice
         self.openai_client = None
         self.whisper_api_model = self.settings.value(
             key=Settings.Key.OPENAI_API_MODEL, default_value="whisper-1"
         )
-        self.process = None
         self._stderr_lines: list[bytes] = []
 
     def start(self):
@@ -98,13 +118,8 @@ class RecordingTranscriber(QObject):
         )
 
         try:
-            with self.sounddevice.InputStream(
-                samplerate=self.sample_rate,
-                device=self.input_device_index,
-                dtype="float32",
-                channels=1,
-                callback=self.stream_callback,
-            ):
+            self.audio_source.start(self.on_audio)
+            try:
                 while self.is_running:
                     if self.queue.size >= self.n_batch_samples:
                         self.mutex.acquire()
@@ -149,10 +164,12 @@ class RecordingTranscriber(QObject):
                         self.transcription.emit(next_text)
                     else:
                         time.sleep(0.5)
+            finally:
+                self.audio_source.stop()
 
-        except PortAudioError as exc:
+        except (AudioSourceError, PortAudioError) as exc:
             self.error.emit(str(exc))
-            logging.exception("PortAudio error during recording")
+            logging.exception("Audio source error during recording")
             return
         except Exception as exc:
             logging.exception("Unexpected error during recording")
@@ -385,16 +402,15 @@ class RecordingTranscriber(QObject):
                 return int(device_info.get("default_samplerate", sample_rate))
             return sample_rate
 
-    def stream_callback(self, in_data: np.ndarray, frame_count, time_info, status):
+    def on_audio(self, samples: np.ndarray) -> None:
         # Try to enqueue the next block. If the queue is already full, drop the block.
-        chunk: np.ndarray = in_data.ravel()
-
-        amplitude = self.amplitude(chunk)
+        amplitude = self.amplitude(samples)
         self.amplitude_changed.emit(amplitude)
 
         with self.mutex:
             if self.queue.size < self.max_queue_size:
-                self.queue = np.append(self.queue, chunk)
+                # np.append copies the borrowed callback buffer into queue-owned memory.
+                self.queue = np.append(self.queue, samples)
 
     @staticmethod
     def find_silence_cut_point(samples: np.ndarray, sample_rate: int,
