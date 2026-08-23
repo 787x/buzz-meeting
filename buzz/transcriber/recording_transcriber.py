@@ -8,6 +8,7 @@ import time
 import tempfile
 import threading
 import subprocess
+from collections import deque
 from typing import Optional
 from platformdirs import user_cache_dir
 
@@ -28,6 +29,7 @@ from buzz.locale import _
 from buzz.assets import APP_BASE_DIR
 from buzz.model_loader import ModelType, map_language_to_mms
 from buzz.settings.settings import Settings
+from buzz.transcriber.live_segmenter import LiveSegmenter
 from buzz.transcriber.transcriber import TranscriptionOptions, Task, DEFAULT_WHISPER_TEMPERATURE
 from buzz.transformers_whisper import TransformersTranscriber
 from buzz.settings.recording_transcriber_mode import RecordingTranscriberMode
@@ -81,14 +83,21 @@ class RecordingTranscriber(QObject):
             self.audio_source = audio_source
             self.sample_rate = audio_source.sample_rate
         self.model_path = model_path
-        self.n_batch_samples = int(5 * self.sample_rate)  # 5 seconds
         self.keep_sample_seconds = 0.15
+        max_utterance_seconds = 12.0
         if self.transcriber_mode == RecordingTranscriberMode.APPEND_AND_CORRECT:
-            self.n_batch_samples = int(transcription_options.transcription_step * self.sample_rate)
             self.keep_sample_seconds = 1.5
-        # pause queueing if more than 3 batches behind
-        self.max_queue_size = 3 * self.n_batch_samples
-        self.queue = np.ndarray([], dtype=np.float32)
+            max_utterance_seconds = transcription_options.transcription_step
+        self.segmenter = LiveSegmenter(
+            sample_rate=self.sample_rate,
+            speech_threshold=transcription_options.silence_threshold,
+            max_utterance_seconds=max_utterance_seconds,
+        )
+        self.max_pending_samples = int(15 * self.sample_rate)
+        self.pending_utterances: deque[np.ndarray] = deque()
+        self.pending_sample_count = 0
+        self._utterance_available = threading.Event()
+        self._previous_unique_tail = np.empty(0, dtype=np.float32)
         self.mutex = threading.Lock()
         # Retained for constructor and field compatibility. Audio capture is
         # owned by self.audio_source.
@@ -106,7 +115,6 @@ class RecordingTranscriber(QObject):
         if model is None and self.openai_client is None:
             return
 
-        keep_samples = int(self.keep_sample_seconds * self.sample_rate)
         initial_prompt = self.transcription_options.initial_prompt
 
         logging.debug(
@@ -121,51 +129,41 @@ class RecordingTranscriber(QObject):
             self.audio_source.start(self.on_audio)
             try:
                 while self.is_running:
-                    if self.queue.size >= self.n_batch_samples:
-                        self.mutex.acquire()
-                        cut = self.find_silence_cut_point(
-                            self.queue[:self.n_batch_samples], self.sample_rate,
-                        )
-                        samples = self.queue[:cut]
-                        if self.transcriber_mode == RecordingTranscriberMode.APPEND_AND_CORRECT:
-                            self.queue = self.queue[cut - keep_samples:]
-                        else:
-                            self.queue = self.queue[cut:]
-                        self.mutex.release()
+                    samples = self._take_pending_utterance()
+                    if samples is None:
+                        if not self.is_running:
+                            break
+                        self._utterance_available.wait()
+                        continue
 
-                        amplitude = self.amplitude(samples)
-                        self.average_amplitude_changed.emit(amplitude)
-                        self.queue_size_changed.emit(self.queue.size)
+                    amplitude = self.amplitude(samples)
+                    self.average_amplitude_changed.emit(amplitude)
 
-                        logging.debug(
-                            "Processing next frame, sample size = %s, queue size = %s, amplitude = %s",
-                            samples.size,
-                            self.queue.size,
-                            amplitude,
-                        )
+                    backend_samples = self._prepare_backend_samples(samples)
+                    logging.debug(
+                        "Processing next utterance, sample size = %s, pending size = %s, amplitude = %s",
+                        backend_samples.size,
+                        self.pending_sample_count,
+                        amplitude,
+                    )
 
-                        if amplitude < self.transcription_options.silence_threshold:
-                            time.sleep(0.5)
-                            continue
+                    time_started = datetime.datetime.now()
+                    result = self._transcribe(backend_samples, model, initial_prompt)
+                    if result is None:
+                        return
+                    next_text: str = result.get("text", "")
 
-                        time_started = datetime.datetime.now()
-                        result = self._transcribe(samples, model, initial_prompt)
-                        if result is None:
-                            return
-                        next_text: str = result.get("text", "")
+                    initial_prompt = next_text[-1000:]
 
-                        initial_prompt = next_text
-
-                        logging.debug(
-                            "Received next result, length = %s, time taken = %s",
-                            len(next_text),
-                            datetime.datetime.now() - time_started,
-                        )
-                        self.transcription.emit(next_text)
-                    else:
-                        time.sleep(0.5)
+                    logging.debug(
+                        "Received next result, length = %s, time taken = %s",
+                        len(next_text),
+                        datetime.datetime.now() - time_started,
+                    )
+                    self.transcription.emit(next_text)
             finally:
                 self.audio_source.stop()
+                self._discard_pending_utterances()
 
         except (AudioSourceError, PortAudioError) as exc:
             self.error.emit(str(exc))
@@ -292,7 +290,7 @@ class RecordingTranscriber(QObject):
             # Prevent crash on Windows
             # https://github.com/SYSTRAN/faster-whisper/issues/71#issuecomment-1526263764
             temperature=0 if platform.system() == "Windows" else DEFAULT_WHISPER_TEMPERATURE,
-            initial_prompt=self.transcription_options.initial_prompt,
+            initial_prompt=initial_prompt,
             word_timestamps=False,
             without_timestamps=True,
             no_speech_threshold=0.4,
@@ -337,7 +335,7 @@ class RecordingTranscriber(QObject):
                 "model": self.whisper_api_model,
                 "file": temp_file,
                 "response_format": "json",
-                "prompt": self.transcription_options.initial_prompt,
+                "prompt": initial_prompt,
             }
 
             try:
@@ -403,46 +401,73 @@ class RecordingTranscriber(QObject):
             return sample_rate
 
     def on_audio(self, samples: np.ndarray) -> None:
-        # Try to enqueue the next block. If the queue is already full, drop the block.
         amplitude = self.amplitude(samples)
         self.amplitude_changed.emit(amplitude)
 
+        utterances = self.segmenter.push(samples)
+        accepted = False
         with self.mutex:
-            if self.queue.size < self.max_queue_size:
-                # np.append copies the borrowed callback buffer into queue-owned memory.
-                self.queue = np.append(self.queue, samples)
+            for utterance in utterances:
+                if (
+                    self.pending_sample_count + utterance.size
+                    > self.max_pending_samples
+                ):
+                    logging.warning(
+                        "Dropping live utterance because the transcription queue is full: samples = %s",
+                        utterance.size,
+                    )
+                    continue
+                self.pending_utterances.append(utterance)
+                self.pending_sample_count += utterance.size
+                accepted = True
+            if accepted:
+                self._utterance_available.set()
+            pending_sample_count = self.pending_sample_count
 
-    @staticmethod
-    def find_silence_cut_point(samples: np.ndarray, sample_rate: int,
-                               search_seconds: float = 1.5,
-                               window_seconds: float = 0.02,
-                               silence_ratio: float = 0.5) -> int:
-        """Return index of the last quiet point in the final search_seconds of samples.
+        self.queue_size_changed.emit(
+            self.segmenter.buffered_sample_count + pending_sample_count,
+        )
 
-        Scans backwards through short windows; returns the midpoint of the rightmost
-        window whose RMS is below silence_ratio * mean_rms of the search region.
-        Falls back to len(samples) if no quiet window is found.
-        """
-        window = int(window_seconds * sample_rate)
-        search_start = max(0, len(samples) - int(search_seconds * sample_rate))
-        region = samples[search_start:]
-        n_windows = (len(region) - window) // window
-        if n_windows < 1:
-            return len(samples)
+    def _take_pending_utterance(self) -> Optional[np.ndarray]:
+        with self.mutex:
+            if self.pending_utterances:
+                utterance = self.pending_utterances.popleft()
+                self.pending_sample_count -= utterance.size
+                if not self.pending_utterances:
+                    self._utterance_available.clear()
+                pending_sample_count = self.pending_sample_count
+            else:
+                self._utterance_available.clear()
+                return None
 
-        energies = np.array([
-            np.sqrt(np.mean(region[i * window:(i + 1) * window] ** 2))
-            for i in range(n_windows)
-        ])
-        mean_energy = energies.mean()
-        threshold = silence_ratio * mean_energy
+        self.queue_size_changed.emit(
+            self.segmenter.buffered_sample_count + pending_sample_count,
+        )
+        return utterance
 
-        for i in range(n_windows - 1, -1, -1):
-            if energies[i] < threshold:
-                cut = search_start + i * window + window // 2
-                return cut
+    def _prepare_backend_samples(self, samples: np.ndarray) -> np.ndarray:
+        if self.transcriber_mode != RecordingTranscriberMode.APPEND_AND_CORRECT:
+            return samples
 
-        return len(samples)
+        if self._previous_unique_tail.size:
+            backend_samples = np.concatenate((self._previous_unique_tail, samples))
+        else:
+            backend_samples = samples
+
+        keep_samples = int(self.keep_sample_seconds * self.sample_rate)
+        self._previous_unique_tail = np.array(
+            samples[-keep_samples:],
+            dtype=np.float32,
+            copy=True,
+        )
+        return backend_samples
+
+    def _discard_pending_utterances(self) -> None:
+        with self.mutex:
+            self.pending_utterances.clear()
+            self.pending_sample_count = 0
+            self._utterance_available.clear()
+        self.queue_size_changed.emit(0)
 
     @staticmethod
     def amplitude(arr: np.ndarray):
@@ -454,7 +479,9 @@ class RecordingTranscriber(QObject):
                 self._stderr_lines.append(line)
 
     def stop_recording(self):
-        self.is_running = False
+        with self.mutex:
+            self.is_running = False
+            self._utterance_available.set()
         if self.process and self.process.poll() is None:
             self.process.terminate()
             try:

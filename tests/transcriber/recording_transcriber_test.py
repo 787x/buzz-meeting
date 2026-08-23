@@ -4,7 +4,7 @@ import threading
 import time
 import numpy as np
 import pytest
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import patch, MagicMock
 
 from PyQt6.QtCore import QThread
 
@@ -63,7 +63,6 @@ class TestGetDeviceSampleRate:
             assert rate == 16000
 
     def test_falls_back_to_device_default(self):
-        import sounddevice
         from sounddevice import PortAudioError
 
         def raise_error(*args, **kwargs):
@@ -174,8 +173,9 @@ class TestRecordingTranscriberInit:
             assert transcriber.sample_rate == 16000
             assert isinstance(transcriber.audio_source, SoundDeviceAudioSource)
             assert transcriber.model_path == "/fake/path"
-            assert transcriber.n_batch_samples == 5 * 16000
+            assert transcriber.segmenter.max_utterance_seconds == 12.0
             assert transcriber.keep_sample_seconds == 0.15
+            assert transcriber.max_pending_samples == 15 * 16000
             assert transcriber.is_running is False
             assert transcriber.openai_client is None
 
@@ -202,8 +202,11 @@ class TestRecordingTranscriberInit:
                 sounddevice=MockSoundDevice(),
             )
 
-            # APPEND_AND_CORRECT mode should use smaller batch size and longer keep duration
-            assert transcriber.n_batch_samples == int(transcription_options.transcription_step * 16000)
+            # APPEND_AND_CORRECT keeps its configured maximum update interval.
+            assert (
+                transcriber.segmenter.max_utterance_seconds
+                == transcription_options.transcription_step
+            )
             assert transcriber.keep_sample_seconds == 1.5
 
     def test_init_stores_silence_threshold(self):
@@ -246,7 +249,7 @@ class TestRecordingTranscriberInit:
 
 
 class TestAudioSourceCallback:
-    def test_on_audio_adds_to_queue(self):
+    def test_on_audio_adds_to_segmenter_buffer(self):
         transcription_options = TranscriptionOptions(
             model=TranscriptionModel(model_type=ModelType.WHISPER_CPP),
             language="en",
@@ -265,11 +268,10 @@ class TestAudioSourceCallback:
             # Create test audio data
             in_data = np.array([[0.1], [0.2], [0.3], [0.4]], dtype=np.float32)
 
-            initial_size = transcriber.queue.size
+            initial_size = transcriber.segmenter.buffered_sample_count
             transcriber.on_audio(in_data.reshape(-1))
 
-            # Queue should have grown by 4 samples
-            assert transcriber.queue.size == initial_size + 4
+            assert transcriber.segmenter.buffered_sample_count == initial_size + 4
 
     def test_on_audio_emits_amplitude_changed(self):
         transcription_options = TranscriptionOptions(
@@ -299,7 +301,7 @@ class TestAudioSourceCallback:
             assert len(amplitude_values) == 1
             assert amplitude_values[0] > 0
 
-    def test_on_audio_drops_data_when_queue_full(self):
+    def test_on_audio_drops_completed_utterance_when_pending_queue_full(self):
         transcription_options = TranscriptionOptions(
             model=TranscriptionModel(model_type=ModelType.WHISPER_CPP),
             language="en",
@@ -315,16 +317,17 @@ class TestAudioSourceCallback:
                 sounddevice=MockSoundDevice(),
             )
 
-            # Fill the queue beyond max_queue_size
-            transcriber.queue = np.ones(transcriber.max_queue_size, dtype=np.float32)
-            initial_size = transcriber.queue.size
+            transcriber.pending_sample_count = transcriber.max_pending_samples
+            transcriber.segmenter = MagicMock()
+            transcriber.segmenter.push.return_value = [
+                np.ones(100, dtype=np.float32),
+            ]
+            transcriber.segmenter.buffered_sample_count = 0
 
-            # Try to add more data
-            in_data = np.array([[0.1], [0.2]], dtype=np.float32)
-            transcriber.on_audio(in_data.reshape(-1))
+            transcriber.on_audio(np.ones(100, dtype=np.float32))
 
-            # Queue should not have grown (data was dropped)
-            assert transcriber.queue.size == initial_size
+            assert list(transcriber.pending_utterances) == []
+            assert transcriber.pending_sample_count == transcriber.max_pending_samples
 
     def test_queue_owns_samples_after_borrowed_callback_returns(self):
         audio_source = FakeAudioSource(sample_rate=16_000)
@@ -343,15 +346,14 @@ class TestAudioSourceCallback:
             audio_source=audio_source,
         )
         audio_source.start(transcriber.on_audio)
-        samples = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+        samples = np.full(3_200, 0.1, dtype=np.float32)
 
         audio_source.deliver(samples)
-        queued_samples = transcriber.queue[-samples.size:].copy()
         samples[:] = 0.9
+        utterances = transcriber.segmenter.flush()
 
-        np.testing.assert_array_equal(
-            transcriber.queue[-queued_samples.size:], queued_samples
-        )
+        assert len(utterances) == 1
+        np.testing.assert_array_equal(utterances[0], np.full(3_200, 0.1, dtype=np.float32))
         sounddevice_module.InputStream.assert_not_called()
         audio_source.stop()
 
@@ -386,7 +388,7 @@ class TestInjectedAudioSource:
                 audio_source=audio_source,
             )
 
-    def test_uses_injected_source_sample_rate_for_batching_when_rate_is_none(self):
+    def test_uses_injected_source_sample_rate_for_segmentation_when_rate_is_none(self):
         audio_source = FakeAudioSource(sample_rate=48_000)
         transcriber = RecordingTranscriber(
             transcription_options=TranscriptionOptions(
@@ -400,7 +402,8 @@ class TestInjectedAudioSource:
         )
 
         assert transcriber.sample_rate == 48_000
-        assert transcriber.n_batch_samples == 5 * 48_000
+        assert transcriber.segmenter.sample_rate == 48_000
+        assert transcriber.segmenter.max_utterance_seconds == 12.0
 
     def test_normal_stop_closes_source_before_finished(self):
         audio_source = FakeAudioSource()
@@ -435,7 +438,7 @@ class TestInjectedAudioSource:
             worker.start()
             assert audio_source.started_event.wait(timeout=2)
             audio_source.deliver(
-                np.ones(transcriber.n_batch_samples, dtype=np.float32)
+                np.ones(12 * audio_source.sample_rate, dtype=np.float32)
             )
             worker.join(timeout=2)
 
@@ -465,7 +468,7 @@ class TestInjectedAudioSource:
             worker.start()
             assert audio_source.started_event.wait(timeout=2)
             audio_source.deliver(
-                np.ones(transcriber.n_batch_samples, dtype=np.float32)
+                np.ones(12 * audio_source.sample_rate, dtype=np.float32)
             )
             worker.join(timeout=2)
             qtbot.waitUntil(lambda: len(errors) == 1, timeout=2_000)
@@ -494,7 +497,7 @@ class TestInjectedAudioSource:
             worker.start()
             assert audio_source.started_event.wait(timeout=2)
             audio_source.deliver(
-                np.ones(transcriber.n_batch_samples, dtype=np.float32)
+                np.ones(12 * audio_source.sample_rate, dtype=np.float32)
             )
             assert transcription_started.wait(timeout=2)
 
@@ -508,24 +511,354 @@ class TestInjectedAudioSource:
         assert not worker.is_alive()
         assert audio_source.stop_count == 1
 
-    def test_stop_does_not_drain_partial_queue(self):
+    def test_stop_does_not_transcribe_unfinalized_segmenter_tail(self):
         audio_source = FakeAudioSource()
         transcriber = self._make_transcriber(audio_source)
 
         with patch.object(transcriber, "_load_model", return_value=object()), \
+             patch.object(transcriber, "_transcribe") as transcribe, \
              patch.object(transcriber, "_cleanup_model"):
             worker = threading.Thread(target=transcriber.start)
             worker.start()
             assert audio_source.started_event.wait(timeout=2)
             samples = np.ones(100, dtype=np.float32)
             audio_source.deliver(samples)
-            queue_size = transcriber.queue.size
 
             transcriber.stop_recording()
             worker.join(timeout=2)
 
         assert not worker.is_alive()
-        assert transcriber.queue.size == queue_size
+        transcribe.assert_not_called()
+
+
+def _live_pcm(seconds: float, amplitude: float, sample_rate: int = 1_000):
+    samples = np.full(int(seconds * sample_rate), amplitude, dtype=np.float32)
+    samples[1::2] *= -1
+    return samples
+
+
+def _make_live_transcriber(
+    mode: RecordingTranscriberMode = RecordingTranscriberMode.APPEND_BELOW,
+    transcription_step: float = 3.5,
+):
+    source = FakeAudioSource(sample_rate=1_000)
+    options = TranscriptionOptions(
+        model=TranscriptionModel(model_type=ModelType.WHISPER),
+        language="en",
+        task=Task.TRANSCRIBE,
+        silence_threshold=0.01,
+        transcription_step=transcription_step,
+        initial_prompt="seed prompt",
+    )
+    mode_index = list(RecordingTranscriberMode).index(mode)
+    with patch("buzz.transcriber.recording_transcriber.Settings") as settings_class:
+        settings_class.return_value.value.side_effect = [mode_index, "whisper-1"]
+        transcriber = RecordingTranscriber(
+            transcription_options=options,
+            input_device_index=None,
+            sample_rate=source.sample_rate,
+            model_path="/fake/path",
+            sounddevice=MagicMock(),
+            audio_source=source,
+        )
+    return transcriber, source
+
+
+def _start_live_worker(transcriber, transcribe):
+    cleanup = patch.object(transcriber, "_cleanup_model")
+    load_model = patch.object(transcriber, "_load_model", return_value=object())
+    cleanup.start()
+    load_model.start()
+    transcribe_patch = patch.object(transcriber, "_transcribe", side_effect=transcribe)
+    transcribe_mock = transcribe_patch.start()
+    worker = threading.Thread(target=transcriber.start)
+    worker.start()
+    assert transcriber.audio_source.started_event.wait(timeout=2)
+    return worker, transcribe_mock, (transcribe_patch, load_model, cleanup)
+
+
+def _stop_live_worker(transcriber, worker, patches):
+    transcriber.stop_recording()
+    worker.join(timeout=2)
+    for active_patch in patches:
+        active_patch.stop()
+    assert not worker.is_alive()
+
+
+class _PausedWaitEvent:
+    """Pause immediately before Event.wait to exercise set-before-wait ordering."""
+
+    def __init__(self):
+        self._event = threading.Event()
+        self.wait_entered = threading.Event()
+        self.allow_wait = threading.Event()
+
+    def set(self):
+        self._event.set()
+
+    def clear(self):
+        self._event.clear()
+
+    def wait(self, timeout=None):
+        self.wait_entered.set()
+        assert self.allow_wait.wait(timeout=2)
+        return self._event.wait(timeout)
+
+
+class TestAdaptiveLiveIntegration:
+    def test_backend_waits_for_endpoint(self):
+        transcriber, _ = _make_live_transcriber()
+        worker, transcribe, patches = _start_live_worker(
+            transcriber,
+            lambda samples, model, prompt: {"text": "text"},
+        )
+
+        transcriber.audio_source.deliver(_live_pcm(1.0, 0.1))
+
+        transcribe.assert_not_called()
+        _stop_live_worker(transcriber, worker, patches)
+
+    def test_natural_pause_wakes_worker_and_transcribes(self):
+        transcriber, source = _make_live_transcriber()
+        called = threading.Event()
+
+        def transcribe(samples, model, prompt):
+            called.set()
+            return {"text": "natural"}
+
+        worker, transcribe_mock, patches = _start_live_worker(transcriber, transcribe)
+        source.deliver(np.concatenate((_live_pcm(1.2, 0.1), _live_pcm(0.6, 0))))
+
+        assert called.wait(timeout=2)
+        assert transcribe_mock.call_count == 1
+        _stop_live_worker(transcriber, worker, patches)
+
+    def test_short_pause_does_not_wake_backend(self):
+        transcriber, source = _make_live_transcriber()
+        worker, transcribe, patches = _start_live_worker(
+            transcriber,
+            lambda samples, model, prompt: {"text": "text"},
+        )
+        source.deliver(np.concatenate((
+            _live_pcm(1.2, 0.1),
+            _live_pcm(0.15, 0),
+            _live_pcm(1.0, 0.1),
+        )))
+
+        transcribe.assert_not_called()
+        _stop_live_worker(transcriber, worker, patches)
+
+    def test_normal_mode_forces_update_at_12_seconds(self):
+        transcriber, source = _make_live_transcriber()
+        called = threading.Event()
+
+        def transcribe(samples, model, prompt):
+            called.set()
+            return {"text": "normal"}
+
+        worker, transcribe_mock, patches = _start_live_worker(transcriber, transcribe)
+        source.deliver(_live_pcm(12.1, 0.1))
+
+        assert called.wait(timeout=2)
+        assert transcribe_mock.call_args.args[0].size == 12_000
+        _stop_live_worker(transcriber, worker, patches)
+
+    def test_append_and_correct_transcription_step_is_forced_deadline(self):
+        transcriber, source = _make_live_transcriber(
+            RecordingTranscriberMode.APPEND_AND_CORRECT,
+            transcription_step=3.5,
+        )
+        called = threading.Event()
+
+        def transcribe(samples, model, prompt):
+            called.set()
+            return {"text": "checkpoint"}
+
+        worker, transcribe_mock, patches = _start_live_worker(transcriber, transcribe)
+        source.deliver(_live_pcm(3.6, 0.1))
+
+        assert called.wait(timeout=2)
+        assert transcribe_mock.call_args.args[0].size == 3_500
+        _stop_live_worker(transcriber, worker, patches)
+
+    def test_append_and_correct_adds_exactly_one_context_tail(self):
+        transcriber, source = _make_live_transcriber(
+            RecordingTranscriberMode.APPEND_AND_CORRECT,
+        )
+        first_call = threading.Event()
+        second_call = threading.Event()
+
+        def transcribe(samples, model, prompt):
+            if transcribe_mock.call_count == 1:
+                first_call.set()
+            else:
+                second_call.set()
+            return {"text": "result"}
+
+        worker, transcribe_mock, patches = _start_live_worker(transcriber, transcribe)
+        source.deliver(_live_pcm(3.5, 0.1))
+        assert first_call.wait(timeout=2)
+        source.deliver(_live_pcm(3.5, 0.2))
+
+        assert second_call.wait(timeout=2)
+        first_samples = transcribe_mock.call_args_list[0].args[0]
+        second_samples = transcribe_mock.call_args_list[1].args[0]
+        assert first_samples.size == 3_500
+        assert second_samples.size == 5_000
+        np.testing.assert_array_equal(second_samples[:1_500], first_samples[-1_500:])
+        assert np.allclose(np.abs(second_samples[1_500:]), 0.2)
+        _stop_live_worker(transcriber, worker, patches)
+
+    def test_append_and_correct_context_uses_only_previous_unique_segment(self):
+        transcriber, _ = _make_live_transcriber(
+            RecordingTranscriberMode.APPEND_AND_CORRECT,
+        )
+        unique_segments = [
+            np.full(2_000, value, dtype=np.float32)
+            for value in (0.1, 0.2, 0.3, 0.4)
+        ]
+
+        backend_inputs = [
+            transcriber._prepare_backend_samples(segment)
+            for segment in unique_segments
+        ]
+
+        np.testing.assert_array_equal(backend_inputs[0], unique_segments[0])
+        for index in range(1, 4):
+            expected = np.concatenate((
+                unique_segments[index - 1][-1_500:],
+                unique_segments[index],
+            ))
+            np.testing.assert_array_equal(backend_inputs[index], expected)
+
+    def test_normal_mode_does_not_add_context(self):
+        transcriber, _ = _make_live_transcriber()
+        first = np.full(100, 0.1, dtype=np.float32)
+        second = np.full(100, 0.2, dtype=np.float32)
+
+        assert transcriber._prepare_backend_samples(first) is first
+        assert transcriber._prepare_backend_samples(second) is second
+
+    def test_one_callback_preserves_multiple_utterance_order(self):
+        transcriber, source = _make_live_transcriber()
+        first = np.full(100, 0.1, dtype=np.float32)
+        second = np.full(100, 0.2, dtype=np.float32)
+        transcriber.segmenter = MagicMock()
+        transcriber.segmenter.push.return_value = [first, second]
+        transcriber.segmenter.buffered_sample_count = 0
+        finished = threading.Event()
+
+        def transcribe(samples, model, prompt):
+            if transcribe_mock.call_count == 2:
+                finished.set()
+            return {"text": "result"}
+
+        worker, transcribe_mock, patches = _start_live_worker(transcriber, transcribe)
+        source.deliver(np.ones(10, dtype=np.float32))
+
+        assert finished.wait(timeout=2)
+        np.testing.assert_array_equal(transcribe_mock.call_args_list[0].args[0], first)
+        np.testing.assert_array_equal(transcribe_mock.call_args_list[1].args[0], second)
+        _stop_live_worker(transcriber, worker, patches)
+
+    def test_pending_overflow_keeps_oldest_complete_utterance(self):
+        transcriber, _ = _make_live_transcriber()
+        transcriber.max_pending_samples = 150
+        first = np.full(100, 0.1, dtype=np.float32)
+        second = np.full(100, 0.2, dtype=np.float32)
+        transcriber.segmenter = MagicMock()
+        transcriber.segmenter.push.return_value = [first, second]
+        transcriber.segmenter.buffered_sample_count = 0
+
+        transcriber.on_audio(np.ones(10, dtype=np.float32))
+
+        assert len(transcriber.pending_utterances) == 1
+        assert transcriber.pending_utterances[0] is first
+        assert transcriber.pending_sample_count == 100
+
+    def test_queue_size_signal_remains_a_sample_count(self):
+        transcriber, _ = _make_live_transcriber()
+        emitted = []
+        transcriber.queue_size_changed.connect(emitted.append)
+
+        transcriber.on_audio(np.concatenate((_live_pcm(1.2, 0.1), _live_pcm(0.6, 0))))
+
+        assert emitted[-1] == (
+            transcriber.segmenter.buffered_sample_count
+            + transcriber.pending_sample_count
+        )
+
+    def test_set_before_wait_cannot_miss_completed_utterance(self):
+        transcriber, source = _make_live_transcriber()
+        controlled_event = _PausedWaitEvent()
+        transcriber._utterance_available = controlled_event
+        called = threading.Event()
+
+        def transcribe(samples, model, prompt):
+            called.set()
+            return {"text": "ready"}
+
+        worker, transcribe_mock, patches = _start_live_worker(transcriber, transcribe)
+        assert controlled_event.wait_entered.wait(timeout=2)
+
+        source.deliver(np.concatenate((_live_pcm(0.1, 0.1), _live_pcm(0.6, 0))))
+        assert len(transcriber.pending_utterances) == 1
+        assert controlled_event._event.is_set()
+
+        controlled_event.allow_wait.set()
+        assert called.wait(timeout=2)
+        assert transcribe_mock.call_count == 1
+        _stop_live_worker(transcriber, worker, patches)
+
+    def test_stop_discards_already_finalized_pending_without_transcribing(self):
+        transcriber, source = _make_live_transcriber()
+        controlled_event = _PausedWaitEvent()
+        transcriber._utterance_available = controlled_event
+        worker, transcribe, patches = _start_live_worker(
+            transcriber,
+            lambda samples, model, prompt: {"text": "unexpected"},
+        )
+        assert controlled_event.wait_entered.wait(timeout=2)
+
+        source.deliver(np.concatenate((_live_pcm(0.1, 0.1), _live_pcm(0.6, 0))))
+        assert len(transcriber.pending_utterances) == 1
+
+        transcriber.stop_recording()
+        controlled_event.allow_wait.set()
+        worker.join(timeout=2)
+        for active_patch in patches:
+            active_patch.stop()
+
+        assert not worker.is_alive()
+        assert source.stop_count == 1
+        assert list(transcriber.pending_utterances) == []
+        assert transcriber.pending_sample_count == 0
+        transcribe.assert_not_called()
+
+    def test_rolling_prompt_uses_only_last_1000_characters(self):
+        transcriber, source = _make_live_transcriber()
+        transcriber.segmenter = MagicMock()
+        transcriber.segmenter.push.return_value = [
+            np.ones(100, dtype=np.float32),
+            np.ones(100, dtype=np.float32),
+        ]
+        transcriber.segmenter.buffered_sample_count = 0
+        second_call = threading.Event()
+        long_result = "x" * 1_500
+
+        def transcribe(samples, model, prompt):
+            if transcribe_mock.call_count == 1:
+                return {"text": long_result}
+            second_call.set()
+            return {"text": "done"}
+
+        worker, transcribe_mock, patches = _start_live_worker(transcriber, transcribe)
+        source.deliver(np.ones(10, dtype=np.float32))
+
+        assert second_call.wait(timeout=2)
+        assert transcribe_mock.call_args_list[0].args[2] == "seed prompt"
+        assert transcribe_mock.call_args_list[1].args[2] == "x" * 1_000
+        _stop_live_worker(transcriber, worker, patches)
 
 
 class TestStopRecording:
