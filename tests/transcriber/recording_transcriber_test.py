@@ -1,7 +1,9 @@
 import os
 import sys
+import threading
 import time
 import numpy as np
+import pytest
 from unittest.mock import Mock, patch, MagicMock
 
 from PyQt6.QtCore import QThread
@@ -12,6 +14,8 @@ from buzz.model_loader import TranscriptionModel, ModelType, WhisperModelSize
 from buzz.transcriber.recording_transcriber import RecordingTranscriber
 from buzz.transcriber.transcriber import TranscriptionOptions, Task
 from buzz.settings.recording_transcriber_mode import RecordingTranscriberMode
+from buzz.audio_capture.sounddevice_source import SoundDeviceAudioSource
+from tests.audio_capture.fake_audio_source import FakeAudioSource
 from tests.mock_sounddevice import MockSoundDevice
 from tests.model_loader import get_model_path
 
@@ -168,6 +172,7 @@ class TestRecordingTranscriberInit:
             assert transcriber.transcription_options == transcription_options
             assert transcriber.input_device_index == 0
             assert transcriber.sample_rate == 16000
+            assert isinstance(transcriber.audio_source, SoundDeviceAudioSource)
             assert transcriber.model_path == "/fake/path"
             assert transcriber.n_batch_samples == 5 * 16000
             assert transcriber.keep_sample_seconds == 0.15
@@ -240,8 +245,8 @@ class TestRecordingTranscriberInit:
             assert transcriber.sample_rate == 16000
 
 
-class TestStreamCallback:
-    def test_stream_callback_adds_to_queue(self):
+class TestAudioSourceCallback:
+    def test_on_audio_adds_to_queue(self):
         transcription_options = TranscriptionOptions(
             model=TranscriptionModel(model_type=ModelType.WHISPER_CPP),
             language="en",
@@ -261,12 +266,12 @@ class TestStreamCallback:
             in_data = np.array([[0.1], [0.2], [0.3], [0.4]], dtype=np.float32)
 
             initial_size = transcriber.queue.size
-            transcriber.stream_callback(in_data, 4, None, None)
+            transcriber.on_audio(in_data.reshape(-1))
 
             # Queue should have grown by 4 samples
             assert transcriber.queue.size == initial_size + 4
 
-    def test_stream_callback_emits_amplitude_changed(self):
+    def test_on_audio_emits_amplitude_changed(self):
         transcription_options = TranscriptionOptions(
             model=TranscriptionModel(model_type=ModelType.WHISPER_CPP),
             language="en",
@@ -288,13 +293,13 @@ class TestStreamCallback:
 
             # Create test audio data
             in_data = np.array([[0.1], [0.2], [0.3], [0.4]], dtype=np.float32)
-            transcriber.stream_callback(in_data, 4, None, None)
+            transcriber.on_audio(in_data.reshape(-1))
 
             # Should have emitted one amplitude value
             assert len(amplitude_values) == 1
             assert amplitude_values[0] > 0
 
-    def test_stream_callback_drops_data_when_queue_full(self):
+    def test_on_audio_drops_data_when_queue_full(self):
         transcription_options = TranscriptionOptions(
             model=TranscriptionModel(model_type=ModelType.WHISPER_CPP),
             language="en",
@@ -316,10 +321,211 @@ class TestStreamCallback:
 
             # Try to add more data
             in_data = np.array([[0.1], [0.2]], dtype=np.float32)
-            transcriber.stream_callback(in_data, 2, None, None)
+            transcriber.on_audio(in_data.reshape(-1))
 
             # Queue should not have grown (data was dropped)
             assert transcriber.queue.size == initial_size
+
+    def test_queue_owns_samples_after_borrowed_callback_returns(self):
+        audio_source = FakeAudioSource(sample_rate=16_000)
+        sounddevice_module = MagicMock()
+        transcription_options = TranscriptionOptions(
+            model=TranscriptionModel(model_type=ModelType.WHISPER_CPP),
+            language="en",
+            task=Task.TRANSCRIBE,
+        )
+        transcriber = RecordingTranscriber(
+            transcription_options=transcription_options,
+            input_device_index=0,
+            sample_rate=16_000,
+            model_path="/fake/path",
+            sounddevice=sounddevice_module,
+            audio_source=audio_source,
+        )
+        audio_source.start(transcriber.on_audio)
+        samples = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+
+        audio_source.deliver(samples)
+        queued_samples = transcriber.queue[-samples.size:].copy()
+        samples[:] = 0.9
+
+        np.testing.assert_array_equal(
+            transcriber.queue[-queued_samples.size:], queued_samples
+        )
+        sounddevice_module.InputStream.assert_not_called()
+        audio_source.stop()
+
+
+class TestInjectedAudioSource:
+    def _make_transcriber(self, audio_source: FakeAudioSource) -> RecordingTranscriber:
+        return RecordingTranscriber(
+            transcription_options=TranscriptionOptions(
+                model=TranscriptionModel(model_type=ModelType.WHISPER),
+                language="en",
+                task=Task.TRANSCRIBE,
+            ),
+            input_device_index=0,
+            sample_rate=audio_source.sample_rate,
+            model_path="/fake/path",
+            sounddevice=MagicMock(),
+            audio_source=audio_source,
+        )
+
+    def test_rejects_sample_rate_mismatch(self):
+        audio_source = FakeAudioSource(sample_rate=48_000)
+
+        with pytest.raises(ValueError, match="sample rate"):
+            RecordingTranscriber(
+                transcription_options=TranscriptionOptions(
+                    model=TranscriptionModel(model_type=ModelType.WHISPER),
+                ),
+                input_device_index=0,
+                sample_rate=16_000,
+                model_path="/fake/path",
+                sounddevice=MagicMock(),
+                audio_source=audio_source,
+            )
+
+    def test_uses_injected_source_sample_rate_for_batching_when_rate_is_none(self):
+        audio_source = FakeAudioSource(sample_rate=48_000)
+        transcriber = RecordingTranscriber(
+            transcription_options=TranscriptionOptions(
+                model=TranscriptionModel(model_type=ModelType.WHISPER),
+            ),
+            input_device_index=None,
+            sample_rate=None,
+            model_path="/fake/path",
+            sounddevice=MagicMock(),
+            audio_source=audio_source,
+        )
+
+        assert transcriber.sample_rate == 48_000
+        assert transcriber.n_batch_samples == 5 * 48_000
+
+    def test_normal_stop_closes_source_before_finished(self):
+        audio_source = FakeAudioSource()
+        transcriber = self._make_transcriber(audio_source)
+        cleanup_observations = []
+
+        def cleanup(model):
+            cleanup_observations.append(audio_source.stopped)
+            transcriber.finished.emit()
+
+        with patch.object(transcriber, "_load_model", return_value=object()), \
+             patch.object(transcriber, "_cleanup_model", side_effect=cleanup):
+            worker = threading.Thread(target=transcriber.start)
+            worker.start()
+            assert audio_source.started_event.wait(timeout=2)
+
+            transcriber.stop_recording()
+            worker.join(timeout=2)
+
+        assert not worker.is_alive()
+        assert audio_source.start_count == 1
+        assert audio_source.stop_count == 1
+        assert cleanup_observations == [True]
+
+    def test_transcribe_none_stops_source(self):
+        audio_source = FakeAudioSource()
+        transcriber = self._make_transcriber(audio_source)
+
+        with patch.object(transcriber, "_load_model", return_value=object()), \
+             patch.object(transcriber, "_transcribe", return_value=None):
+            worker = threading.Thread(target=transcriber.start)
+            worker.start()
+            assert audio_source.started_event.wait(timeout=2)
+            audio_source.deliver(
+                np.ones(transcriber.n_batch_samples, dtype=np.float32)
+            )
+            worker.join(timeout=2)
+
+        assert not worker.is_alive()
+        assert audio_source.start_count == 1
+        assert audio_source.stop_count == 1
+
+    def test_transcribe_exception_stops_source_before_emitting_error(self, qtbot):
+        audio_source = FakeAudioSource()
+        transcriber = self._make_transcriber(audio_source)
+        errors = []
+        cleanup_observations = []
+
+        def record_error(error):
+            cleanup_observations.append(audio_source.stopped)
+            errors.append(error)
+
+        transcriber.error.connect(record_error)
+
+        with patch.object(transcriber, "_load_model", return_value=object()), \
+             patch.object(
+                 transcriber,
+                 "_transcribe",
+                 side_effect=RuntimeError("test transcription failure"),
+             ):
+            worker = threading.Thread(target=transcriber.start)
+            worker.start()
+            assert audio_source.started_event.wait(timeout=2)
+            audio_source.deliver(
+                np.ones(transcriber.n_batch_samples, dtype=np.float32)
+            )
+            worker.join(timeout=2)
+            qtbot.waitUntil(lambda: len(errors) == 1, timeout=2_000)
+
+        assert not worker.is_alive()
+        assert audio_source.start_count == 1
+        assert audio_source.stop_count == 1
+        assert errors == ["test transcription failure"]
+        assert cleanup_observations == [True]
+
+    def test_stop_during_transcription_waits_for_backend_before_source_stop(self):
+        audio_source = FakeAudioSource()
+        transcriber = self._make_transcriber(audio_source)
+        transcription_started = threading.Event()
+        release_transcription = threading.Event()
+
+        def transcribe(samples, model, initial_prompt):
+            transcription_started.set()
+            assert release_transcription.wait(timeout=2)
+            return {"text": "finished batch"}
+
+        with patch.object(transcriber, "_load_model", return_value=object()), \
+             patch.object(transcriber, "_transcribe", side_effect=transcribe), \
+             patch.object(transcriber, "_cleanup_model"):
+            worker = threading.Thread(target=transcriber.start)
+            worker.start()
+            assert audio_source.started_event.wait(timeout=2)
+            audio_source.deliver(
+                np.ones(transcriber.n_batch_samples, dtype=np.float32)
+            )
+            assert transcription_started.wait(timeout=2)
+
+            transcriber.stop_recording()
+            assert audio_source.started
+            assert audio_source.stop_count == 0
+
+            release_transcription.set()
+            worker.join(timeout=2)
+
+        assert not worker.is_alive()
+        assert audio_source.stop_count == 1
+
+    def test_stop_does_not_drain_partial_queue(self):
+        audio_source = FakeAudioSource()
+        transcriber = self._make_transcriber(audio_source)
+
+        with patch.object(transcriber, "_load_model", return_value=object()), \
+             patch.object(transcriber, "_cleanup_model"):
+            worker = threading.Thread(target=transcriber.start)
+            worker.start()
+            assert audio_source.started_event.wait(timeout=2)
+            samples = np.ones(100, dtype=np.float32)
+            audio_source.deliver(samples)
+            queue_size = transcriber.queue.size
+
+            transcriber.stop_recording()
+            worker.join(timeout=2)
+
+        assert not worker.is_alive()
+        assert transcriber.queue.size == queue_size
 
 
 class TestStopRecording:
