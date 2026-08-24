@@ -8,6 +8,7 @@ import requests
 import logging
 import datetime
 import sounddevice
+import sys
 from enum import auto
 from typing import Optional, Tuple, Any
 
@@ -37,6 +38,7 @@ from buzz.model_loader import (
 )
 from buzz.store.keyring_store import get_password, Key
 from buzz.recording import RecordingAmplitudeListener
+from buzz.audio_capture.windows_system_source import WindowsSystemAudioSource
 from buzz.settings.settings import Settings
 from buzz.settings.recording_transcriber_mode import RecordingTranscriberMode
 from buzz.transcriber.incremental_transcript import (
@@ -80,6 +82,10 @@ class RecordingTranscriberWidget(QWidget):
     class RecordingStatus(enum.Enum):
         STOPPED = auto()
         RECORDING = auto()
+
+    class AudioSourceType(enum.Enum):
+        MICROPHONE = "microphone"
+        SYSTEM_AUDIO = "system_audio"
 
     def __init__(
         self,
@@ -184,6 +190,18 @@ class RecordingTranscriberWidget(QWidget):
         )
 
     def _create_ui_widgets(self, model_types: list[ModelType]) -> None:
+        self.audio_source_combo_box = QComboBox(self)
+        self.audio_source_combo_box.addItem(
+            _("Microphone"), self.AudioSourceType.MICROPHONE
+        )
+        if sys.platform == "win32":
+            self.audio_source_combo_box.addItem(
+                _("System audio"), self.AudioSourceType.SYSTEM_AUDIO
+            )
+        self.audio_source_combo_box.currentIndexChanged.connect(
+            self.on_audio_source_changed
+        )
+
         self.audio_devices_combo_box = AudioDevicesComboBox(self)
         self.audio_devices_combo_box.device_changed.connect(self.on_device_changed)
         self.selected_device_id = self.audio_devices_combo_box.get_default_device_id()
@@ -216,13 +234,27 @@ class RecordingTranscriberWidget(QWidget):
 
         self.audio_meter_widget = AudioMeterWidget(self)
 
+        self.audio_source_label = QLabel(_("Audio source:"))
         self.microphone_label = QLabel(_("Microphone:"))
+        self.system_output_label = QLabel(_("Output:"))
+        self.default_system_output_label = QLabel(_("Default system output"))
 
     def _build_layout(self) -> None:
         layout = QVBoxLayout(self)
 
         recording_options_layout = QFormLayout()
+        recording_options_layout.addRow(
+            self.audio_source_label, self.audio_source_combo_box
+        )
         recording_options_layout.addRow(self.microphone_label, self.audio_devices_combo_box)
+        recording_options_layout.addRow(
+            self.system_output_label, self.default_system_output_label
+        )
+
+        if sys.platform != "win32":
+            self.audio_source_label.hide()
+            self.audio_source_combo_box.hide()
+        self._update_audio_source_controls()
 
         record_button_layout = QHBoxLayout()
         record_button_layout.setContentsMargins(0, 4, 0, 8)
@@ -576,9 +608,57 @@ class RecordingTranscriberWidget(QWidget):
         self.selected_device_id = device_id
         self.reset_recording_amplitude_listener()
 
+    def is_system_audio_selected(self) -> bool:
+        return (
+            self.audio_source_combo_box.currentData()
+            == self.AudioSourceType.SYSTEM_AUDIO
+        )
+
+    def on_audio_source_changed(self, _index: int) -> None:
+        self._stop_recording_amplitude_listener()
+        self.audio_meter_widget.reset_amplitude()
+        self._update_audio_source_controls()
+        if not self.is_system_audio_selected():
+            self.reset_recording_amplitude_listener()
+
+    def _update_audio_source_controls(self) -> None:
+        system_audio = self.is_system_audio_selected()
+        stopped = self.current_status == self.RecordingStatus.STOPPED
+        self.microphone_label.setVisible(not system_audio)
+        self.audio_devices_combo_box.setVisible(not system_audio)
+        self.system_output_label.setVisible(system_audio)
+        self.default_system_output_label.setVisible(system_audio)
+        self.audio_devices_combo_box.setEnabled(stopped and not system_audio)
+        self.microphone_label.setEnabled(stopped and not system_audio)
+        self.system_output_label.setEnabled(stopped and system_audio)
+        self.default_system_output_label.setEnabled(stopped and system_audio)
+        self.audio_meter_widget.setEnabled(not system_audio or not stopped)
+
+    def _stop_recording_amplitude_listener(self) -> None:
+        listener = self.recording_amplitude_listener
+        if listener is None:
+            return
+        for signal, slot in (
+            (listener.amplitude_changed, self.on_recording_amplitude_changed),
+            (
+                listener.average_amplitude_changed,
+                self.audio_meter_widget.update_average_amplitude,
+            ),
+        ):
+            try:
+                signal.disconnect(slot)
+            except TypeError:
+                pass
+        listener.stop_recording()
+        self.recording_amplitude_listener = None
+
     def reset_recording_amplitude_listener(self):
-        if self.recording_amplitude_listener is not None:
-            self.recording_amplitude_listener.stop_recording()
+        self._stop_recording_amplitude_listener()
+
+        if self.is_system_audio_selected():
+            self.audio_meter_widget.reset_amplitude()
+            self.audio_meter_widget.setEnabled(False)
+            return
 
         # Listening to audio will fail if there are no input devices
         if self.selected_device_id is None or self.selected_device_id == -1:
@@ -607,22 +687,16 @@ class RecordingTranscriberWidget(QWidget):
         if self.current_status == self.RecordingStatus.STOPPED:
             # Stop amplitude listener and disconnect its signal before resetting
             # to prevent queued amplitude events from overriding the reset
-            if self.recording_amplitude_listener is not None:
-                self.recording_amplitude_listener.amplitude_changed.disconnect(
-                    self.on_recording_amplitude_changed
-                )
-                self.recording_amplitude_listener.average_amplitude_changed.disconnect(
-                    self.audio_meter_widget.update_average_amplitude
-                )
-                self.recording_amplitude_listener.stop_recording()
-                self.recording_amplitude_listener = None
+            self._stop_recording_amplitude_listener()
             self.audio_meter_widget.reset_amplitude()
+            self.audio_meter_widget.setEnabled(True)
             self.start_recording()
             self.current_status = self.RecordingStatus.RECORDING
             self.record_button.set_recording()
             self.transcription_options_group_box.setEnabled(False)
-            self.audio_devices_combo_box.setEnabled(False)
-            self.microphone_label.setEnabled(False)
+            self.audio_source_combo_box.setEnabled(False)
+            self.audio_source_label.setEnabled(False)
+            self._update_audio_source_controls()
             self.presentation_options_bar.show()
             self.copy_actions_bar.hide()
 
@@ -677,13 +751,24 @@ class RecordingTranscriberWidget(QWidget):
 
         self.transcription_thread = QThread()
 
-        self.transcriber = RecordingTranscriber(
-            input_device_index=self.selected_device_id,
-            sample_rate=self.device_sample_rate,
-            transcription_options=self.transcription_options,
-            model_path=model_path,
-            sounddevice=self.sounddevice,
-        )
+        transcriber_kwargs = {
+            "transcription_options": self.transcription_options,
+            "model_path": model_path,
+            "sounddevice": self.sounddevice,
+        }
+        if self.is_system_audio_selected():
+            audio_source = WindowsSystemAudioSource()
+            transcriber_kwargs.update(
+                input_device_index=None,
+                sample_rate=audio_source.sample_rate,
+                audio_source=audio_source,
+            )
+        else:
+            transcriber_kwargs.update(
+                input_device_index=self.selected_device_id,
+                sample_rate=self.device_sample_rate,
+            )
+        self.transcriber = RecordingTranscriber(**transcriber_kwargs)
 
         self.transcriber.moveToThread(self.transcription_thread)
 
@@ -770,8 +855,9 @@ class RecordingTranscriberWidget(QWidget):
         self.record_button.setEnabled(True)
         self.current_status = self.RecordingStatus.STOPPED
         self.transcription_options_group_box.setEnabled(True)
-        self.audio_devices_combo_box.setEnabled(True)
-        self.microphone_label.setEnabled(True)
+        self.audio_source_combo_box.setEnabled(True)
+        self.audio_source_label.setEnabled(True)
+        self._update_audio_source_controls()
         self.presentation_options_bar.hide()
         self.copy_actions_bar.show() #added this here
 
@@ -1226,13 +1312,27 @@ class RecordingTranscriberWidget(QWidget):
         self.audio_meter_widget.update_amplitude(amplitude)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        thread = self.transcription_thread
+        worker_running = False
+        if thread is not None:
+            try:
+                worker_running = thread.isRunning()
+            except RuntimeError:
+                thread = None
+
         if self._closing:
-            # Second call after deferred close — proceed normally
+            if worker_running:
+                event.ignore()
+                return
+            # Deferred worker cleanup is complete — proceed normally.
             self._do_close()
             super().closeEvent(event)
             return
 
-        if self.current_status == self.RecordingStatus.RECORDING:
+        if (
+            self.current_status == self.RecordingStatus.RECORDING
+            or worker_running
+        ):
             # Defer the close until the transcription thread finishes to avoid
             # blocking the GUI thread with a synchronous wait.
             event.ignore()
@@ -1245,12 +1345,10 @@ class RecordingTranscriberWidget(QWidget):
 
             # Connect to QThread.finished — the transcriber C++ object may already
             # be scheduled for deletion via deleteLater() by this point.
-            thread = self.transcription_thread
             if thread is not None:
                 try:
-                    if thread.isRunning():
-                        thread.finished.connect(self._on_close_transcriber_finished)
-                    else:
+                    thread.finished.connect(self._on_close_transcriber_finished)
+                    if not thread.isRunning():
                         self._on_close_transcriber_finished()
                 except RuntimeError:
                     self._on_close_transcriber_finished()

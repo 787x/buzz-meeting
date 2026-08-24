@@ -164,6 +164,10 @@ include = [
     "whisper_diarization",
     "deepmultilingualpunctuation",
     "ctc_forced_aligner",
+    "native/windows_audio_capture",
+    "patches/ctc_forced_aligner_windows_mutex.patch",
+    "scripts/build_ctc_forced_aligner.py",
+    "scripts/build_windows_audio_helper.py",
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 import pytest
 import platform
@@ -8,7 +9,7 @@ import tempfile
 from unittest.mock import call, patch, MagicMock
 from pytestqt.qtbot import QtBot
 from PyQt6.QtWidgets import QColorDialog
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QCloseEvent
 
 from buzz.locale import _
 from buzz.settings.recording_transcriber_mode import RecordingTranscriberMode
@@ -1151,6 +1152,162 @@ class TestOnDeviceChanged:
             assert widget.selected_device_id == -1
 
 
+class TestAudioSourceSelection:
+    @pytest.mark.timeout(60)
+    def test_windows_selector_has_microphone_and_system_audio(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            options = [
+                widget.audio_source_combo_box.itemText(index)
+                for index in range(widget.audio_source_combo_box.count())
+            ]
+
+            assert options == [_('Microphone'), _('System audio')]
+            assert not widget.is_system_audio_selected()
+
+    @pytest.mark.timeout(60)
+    def test_non_windows_selector_has_no_system_audio(self, qtbot):
+        with patch(
+            "buzz.widgets.recording_transcriber_widget.sys.platform", "linux"
+        ), _widget_ctx(qtbot) as widget:
+            options = [
+                widget.audio_source_combo_box.itemText(index)
+                for index in range(widget.audio_source_combo_box.count())
+            ]
+
+            assert options == [_('Microphone')]
+            assert widget.audio_source_combo_box.isHidden()
+
+    @pytest.mark.timeout(60)
+    def test_selecting_system_stops_mic_preview_and_disables_idle_meter(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            listener = widget.recording_amplitude_listener
+            assert listener is not None
+            with patch.object(listener, "stop_recording", wraps=listener.stop_recording) as stop:
+                widget.audio_source_combo_box.setCurrentIndex(1)
+
+            stop.assert_called_once_with()
+            assert widget.recording_amplitude_listener is None
+            assert widget.audio_devices_combo_box.isHidden()
+            assert widget.microphone_label.isHidden()
+            assert not widget.default_system_output_label.isHidden()
+            assert not widget.audio_meter_widget.isEnabled()
+
+    @pytest.mark.timeout(60)
+    def test_switching_back_to_microphone_restarts_preview(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            widget.audio_source_combo_box.setCurrentIndex(1)
+            assert widget.recording_amplitude_listener is None
+
+            with patch(
+                "buzz.widgets.recording_transcriber_widget.RecordingAmplitudeListener"
+            ) as listener_class:
+                widget.audio_source_combo_box.setCurrentIndex(0)
+
+            listener_class.assert_called_once_with(
+                input_device_index=widget.selected_device_id,
+                parent=widget,
+            )
+            listener_class.return_value.start_recording.assert_called_once_with()
+            assert not widget.audio_devices_combo_box.isHidden()
+            assert widget.audio_meter_widget.isEnabled()
+
+    @pytest.mark.timeout(60)
+    def test_system_microphone_system_preview_lifecycle(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            widget.audio_source_combo_box.setCurrentIndex(1)
+            assert widget.recording_amplitude_listener is None
+
+            with patch(
+                "buzz.widgets.recording_transcriber_widget.RecordingAmplitudeListener"
+            ) as listener_class:
+                listener = listener_class.return_value
+                widget.audio_source_combo_box.setCurrentIndex(0)
+                assert widget.recording_amplitude_listener is listener
+
+                widget.audio_source_combo_box.setCurrentIndex(1)
+
+            listener.start_recording.assert_called_once_with()
+            listener.stop_recording.assert_called_once_with()
+            assert widget.recording_amplitude_listener is None
+            assert not widget.audio_meter_widget.isEnabled()
+
+    @pytest.mark.timeout(60)
+    def test_system_finished_and_error_do_not_restart_mic_preview(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            widget.audio_source_combo_box.setCurrentIndex(1)
+            with patch(
+                "buzz.widgets.recording_transcriber_widget.RecordingAmplitudeListener"
+            ) as listener_class, patch(
+                "buzz.widgets.recording_transcriber_widget.QMessageBox.critical"
+            ):
+                widget.on_transcriber_finished()
+                widget.on_transcriber_error("device invalidated")
+
+            listener_class.assert_not_called()
+            assert widget.recording_amplitude_listener is None
+            assert not widget.audio_meter_widget.isEnabled()
+
+    @pytest.mark.timeout(60)
+    def test_recording_disables_source_selector(self, qtbot):
+        with _widget_ctx(qtbot) as widget, patch.object(
+            widget, "start_recording"
+        ):
+            widget.on_record_button_clicked()
+
+            assert not widget.audio_source_combo_box.isEnabled()
+            widget.set_recording_status_stopped()
+            assert widget.audio_source_combo_box.isEnabled()
+
+    @pytest.mark.timeout(60)
+    def test_source_selection_is_not_persisted(self, qtbot):
+        with _widget_ctx(qtbot) as widget, patch.object(
+            widget.settings, "set_value"
+        ) as set_value:
+            widget.audio_source_combo_box.setCurrentIndex(1)
+
+            set_value.assert_not_called()
+
+
+class TestSystemAudioModelLoaded:
+    @pytest.mark.timeout(60)
+    def test_system_audio_injects_fixed_rate_source(self, qtbot):
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget.WindowsSystemAudioSource"
+        ) as source_class, patch(
+            "buzz.widgets.recording_transcriber_widget.RecordingTranscriber"
+        ) as transcriber_class, patch(
+            "buzz.widgets.recording_transcriber_widget.QThread"
+        ):
+            source = MagicMock()
+            source.sample_rate = 16_000
+            source_class.return_value = source
+            widget.transcription_options.enable_llm_translation = False
+            widget.audio_source_combo_box.setCurrentIndex(1)
+
+            widget.on_model_loaded("/fake/model")
+
+            source_class.assert_called_once_with()
+            assert transcriber_class.call_args.kwargs["audio_source"] is source
+            assert transcriber_class.call_args.kwargs["input_device_index"] is None
+            assert transcriber_class.call_args.kwargs["sample_rate"] == 16_000
+
+    @pytest.mark.timeout(60)
+    def test_microphone_constructor_path_is_unchanged(self, qtbot):
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget.RecordingTranscriber"
+        ) as transcriber_class, patch(
+            "buzz.widgets.recording_transcriber_widget.QThread"
+        ):
+            widget.device_sample_rate = 16_000
+            widget.transcription_options.enable_llm_translation = False
+            widget.on_model_loaded("/fake/model")
+
+            kwargs = transcriber_class.call_args.kwargs
+            assert kwargs["input_device_index"] == widget.selected_device_id
+            assert kwargs["sample_rate"] == 16_000
+            assert "audio_source" not in kwargs
+
+
 
 class TestOnRecordButtonClickedStop:
     @pytest.mark.timeout(60)
@@ -1170,6 +1327,107 @@ class TestOnRecordButtonClickedStop:
             with patch.object(widget, "stop_recording"):
                 widget.on_record_button_clicked()
             assert widget.presentation_options_bar.isHidden()
+
+
+class _FakeThreadSignal:
+    def __init__(self):
+        self.callbacks = []
+
+    def connect(self, callback):
+        self.callbacks.append(callback)
+
+    def emit(self):
+        for callback in list(self.callbacks):
+            callback()
+
+
+class _FakeRunningThread:
+    def __init__(self, running=True):
+        self.running = running
+        self.finished = _FakeThreadSignal()
+
+    def isRunning(self):
+        return self.running
+
+
+class TestCloseLifecycle:
+    @pytest.mark.timeout(60)
+    def test_system_stop_then_immediate_close_waits_for_worker(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            widget.audio_source_combo_box.setCurrentIndex(1)
+            widget.current_status = widget.RecordingStatus.STOPPED
+            thread = _FakeRunningThread()
+            widget.transcription_thread = thread
+            widget.transcriber = MagicMock()
+            event = QCloseEvent()
+            cleanup_complete = threading.Event()
+
+            with patch.object(widget, "stop_recording") as stop_recording, \
+                 patch.object(widget, "_do_close") as do_close, \
+                 patch.object(widget, "close") as close:
+                close.side_effect = lambda: cleanup_complete.is_set() or pytest.fail(
+                    "close resumed before worker cleanup"
+                )
+                widget.closeEvent(event)
+
+                assert not event.isAccepted()
+                stop_recording.assert_called_once_with()
+                do_close.assert_not_called()
+                close.assert_not_called()
+
+                repeated_event = QCloseEvent()
+                widget.closeEvent(repeated_event)
+                assert not repeated_event.isAccepted()
+                do_close.assert_not_called()
+                close.assert_not_called()
+
+                cleanup_complete.set()
+                thread.running = False
+                thread.finished.emit()
+
+                close.assert_called_once_with()
+
+            widget._closing = False
+            widget.transcription_thread = None
+
+    @pytest.mark.timeout(60)
+    def test_recording_close_still_waits_for_worker(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            widget.current_status = widget.RecordingStatus.RECORDING
+            thread = _FakeRunningThread()
+            widget.transcription_thread = thread
+            event = QCloseEvent()
+
+            with patch.object(widget, "stop_recording") as stop_recording, \
+                 patch.object(widget, "close") as close:
+                widget.closeEvent(event)
+                assert not event.isAccepted()
+                stop_recording.assert_called_once_with()
+                close.assert_not_called()
+
+                thread.running = False
+                thread.finished.emit()
+                close.assert_called_once_with()
+
+            widget._closing = False
+            widget.transcription_thread = None
+
+    @pytest.mark.timeout(60)
+    def test_close_after_worker_finished_is_immediate(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            widget.current_status = widget.RecordingStatus.STOPPED
+            widget.transcription_thread = _FakeRunningThread(running=False)
+            event = QCloseEvent()
+
+            with patch.object(widget, "_do_close") as do_close, \
+                 patch.object(widget, "stop_recording") as stop_recording:
+                widget.closeEvent(event)
+
+            assert event.isAccepted()
+            do_close.assert_called_once_with()
+            stop_recording.assert_not_called()
+
+            widget.transcription_thread = None
 
 
 

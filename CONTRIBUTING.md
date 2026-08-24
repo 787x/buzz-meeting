@@ -95,7 +95,7 @@ Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManage
 ```
 2. Install the build tools. `choco install make cmake`
 3. Install the ffmpeg. `choco install ffmpeg`
-4. Download [Build Tools for Visual Studio 2022](https://visualstudio.microsoft.com/vs/older-downloads/) and install "Desktop development with C++" workload.
+4. Download [Build Tools for Visual Studio 2022](https://visualstudio.microsoft.com/vs/older-downloads/) and install "Desktop development with C++" workload with Windows SDK 10.0.20348 or newer.
 5. Add location of `namke` to your PATH environment variable. Usually it is `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x86`
 6. Install Vulkan SDK from https://vulkan.lunarg.com/sdk/home
 7. Clone the repository `git clone --recursive https://github.com/chidiwilliams/buzz.git`
@@ -103,8 +103,9 @@ Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManage
 9. Install uv `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`
 10. Install the dependencies `uv sync`
 11. Build Whisper.cpp `uv run make buzz/whisper_cpp`
-12. `cp -r .\dll_backup\ .\buzz\`
-13. Run Buzz `uv run buzz`
+12. Build and test the native Windows system-audio helper: `uv run python scripts/build_windows_audio_helper.py`, then `ctest --test-dir build/windows_audio_capture -C Release --output-on-failure`.
+13. `cp -r .\dll_backup\ .\buzz\`
+14. Run Buzz `uv run buzz`
 
 Note: It should be safe to ignore any "syntax errors" you see during the build. Buzz will work. Also you can ignore any errors for FFmpeg. Buzz tries to load FFmpeg by several different means and some of them throw errors, but FFmpeg should eventually be found and work. 
 
