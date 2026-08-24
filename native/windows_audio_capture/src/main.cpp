@@ -8,7 +8,9 @@
 #include <thread>
 #include <vector>
 
+#include "capture_options.h"
 #include "pcm_transport.h"
+#include "process_loopback_capture.h"
 #include "system_loopback_capture.h"
 
 namespace bwa = buzz::windows_audio;
@@ -100,13 +102,18 @@ void ControlThreadMain(HANDLE stop_event) {
 void WriterThreadMain(
     HANDLE stop_event,
     bwa::BoundedPcmQueue* queue,
-    std::atomic<int>* writer_exit_code
+    std::atomic<int>* writer_exit_code,
+    const char* transport_label
 ) {
     HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
     const bwa::ProtocolHeader header = bwa::SerializeProtocolHeader();
     if (!bwa::WriteAll(output, header.data(), header.size())) {
         writer_exit_code->store(static_cast<int>(bwa::ExitCode::kPipeFailure));
-        std::fprintf(stderr, "Failed to write system-audio startup handshake.\n");
+        std::fprintf(
+            stderr,
+            "Failed to write %s startup handshake.\n",
+            transport_label
+        );
         SetEvent(stop_event);
         return;
     }
@@ -119,7 +126,7 @@ void WriterThreadMain(
                 samples.size() * sizeof(float)
             )) {
             writer_exit_code->store(static_cast<int>(bwa::ExitCode::kPipeFailure));
-            std::fprintf(stderr, "System-audio PCM stdout pipe was closed.\n");
+            std::fprintf(stderr, "%s PCM stdout pipe was closed.\n", transport_label);
             SetEvent(stop_event);
             return;
         }
@@ -137,6 +144,16 @@ bool RunSelfTest() {
     if (format.nSamplesPerSec != bwa::kSampleRate ||
         format.nChannels != bwa::kChannelCount ||
         format.wFormatTag != WAVE_FORMAT_IEEE_FLOAT) {
+        return false;
+    }
+
+    const AUDIOCLIENT_ACTIVATION_PARAMS process_parameters =
+        bwa::BuildProcessActivationParameters(1234);
+    if (process_parameters.ActivationType !=
+            AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK ||
+        process_parameters.ProcessLoopbackParams.TargetProcessId != 1234 ||
+        process_parameters.ProcessLoopbackParams.ProcessLoopbackMode !=
+            PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE) {
         return false;
     }
 
@@ -159,13 +176,22 @@ bool RunSelfTest() {
     return true;
 }
 
-int RunSystemCapture() {
+template <typename CaptureType>
+int RunCapture(
+    CaptureType* capture,
+    const char* transport_label,
+    const char* com_label
+) {
     UniqueHandle stop_event;
     stop_event.value = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     UniqueHandle audio_ready_event;
     audio_ready_event.value = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (stop_event.value == nullptr || audio_ready_event.value == nullptr) {
-        std::fprintf(stderr, "Failed to create system-audio synchronization events.\n");
+        std::fprintf(
+            stderr,
+            "Failed to create %s synchronization events.\n",
+            transport_label
+        );
         return static_cast<int>(bwa::ExitCode::kInternalFailure);
     }
 
@@ -186,26 +212,36 @@ int RunSystemCapture() {
     if (FAILED(com_result)) {
         std::fprintf(
             stderr,
-            "Failed to initialize COM for system audio (HRESULT 0x%08lX).\n",
+            "Failed to initialize COM for %s (HRESULT 0x%08lX).\n",
+            com_label,
             static_cast<unsigned long>(com_result)
         );
         return static_cast<int>(bwa::ExitCode::kComInitialization);
     }
     com_apartment.initialized = true;
 
-    bwa::SystemLoopbackCapture capture;
-    bwa::CaptureResult result = capture.InitializeAndStart(audio_ready_event.value);
-    if (result.ok() && WaitForSingleObject(stop_event.value, 0) != WAIT_OBJECT_0) {
-        writer_thread = std::thread(
-            WriterThreadMain,
-            stop_event.value,
-            &queue,
-            &writer_exit_code
-        );
-        result = capture.Capture(stop_event.value, &queue);
+    bwa::CaptureResult result = capture->InitializeAndStart(
+        stop_event.value,
+        audio_ready_event.value
+    );
+    const bool transport_started = bwa::StartTransportAfterCaptureStart(
+        result,
+        stop_event.value,
+        [&]() {
+            writer_thread = std::thread(
+                WriterThreadMain,
+                stop_event.value,
+                &queue,
+                &writer_exit_code,
+                transport_label
+            );
+        }
+    );
+    if (transport_started) {
+        result = capture->Capture(stop_event.value, &queue);
     }
 
-    capture.Stop();
+    capture->Stop();
     thread_cleanup.StopAndJoin();
 
     if (!result.ok()) {
@@ -215,34 +251,76 @@ int RunSystemCapture() {
     return writer_exit_code.load();
 }
 
+int RunSystemCapture() {
+    bwa::SystemLoopbackCapture capture;
+    return RunCapture(&capture, "system-audio", "system audio");
+}
+
+int RunProcessCapture(DWORD process_id) {
+    DWORD windows_build = 0;
+    if (!bwa::QueryWindowsBuildNumber(&windows_build)) {
+        std::fprintf(
+            stderr,
+            "Unable to determine the Windows build for process loopback capture.\n"
+        );
+        return static_cast<int>(bwa::ExitCode::kUnsupportedProcessLoopback);
+    }
+    if (!bwa::IsProcessLoopbackBuildSupported(windows_build)) {
+        std::fprintf(
+            stderr,
+            "Process audio capture requires Windows 10 build 20348 or later "
+            "(current build %lu).\n",
+            static_cast<unsigned long>(windows_build)
+        );
+        return static_cast<int>(bwa::ExitCode::kUnsupportedProcessLoopback);
+    }
+
+    bwa::ProcessLoopbackCapture capture(process_id);
+    return RunCapture(&capture, "process-audio", "process audio");
+}
+
+void PrintUsage() {
+    std::fprintf(
+        stderr,
+        "Usage: buzz-windows-audio-capture.exe --mode system\n"
+        "       buzz-windows-audio-capture.exe --mode process --pid <DWORD>\n"
+        "       buzz-windows-audio-capture.exe --self-test\n"
+    );
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t* argv[]) {
     try {
-        if (argc == 2 && std::wcscmp(argv[1], L"--self-test") == 0) {
+        std::vector<const wchar_t*> arguments;
+        arguments.reserve(static_cast<std::size_t>(argc));
+        for (int index = 0; index < argc; ++index) {
+            arguments.push_back(argv[index]);
+        }
+
+        bwa::CaptureOptions options;
+        if (!bwa::ParseCaptureOptions(argc, arguments.data(), &options)) {
+            PrintUsage();
+            return static_cast<int>(bwa::ExitCode::kUsage);
+        }
+
+        switch (options.mode) {
+        case bwa::CaptureMode::kSelfTest:
             if (!RunSelfTest()) {
-                std::fprintf(stderr, "System-audio helper self-test failed.\n");
+                std::fprintf(stderr, "Windows-audio helper self-test failed.\n");
                 return static_cast<int>(bwa::ExitCode::kInternalFailure);
             }
-            std::fprintf(stderr, "System-audio helper self-test passed.\n");
+            std::fprintf(stderr, "Windows-audio helper self-test passed.\n");
             return 0;
-        }
-
-        if (argc == 3 && std::wcscmp(argv[1], L"--mode") == 0 &&
-            std::wcscmp(argv[2], L"system") == 0) {
+        case bwa::CaptureMode::kSystem:
             return RunSystemCapture();
+        case bwa::CaptureMode::kProcess:
+            return RunProcessCapture(options.process_id);
         }
-
-        std::fprintf(
-            stderr,
-            "Usage: buzz-windows-audio-capture.exe --mode system\n"
-            "       buzz-windows-audio-capture.exe --self-test\n"
-        );
-        return static_cast<int>(bwa::ExitCode::kUsage);
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "System-audio helper failed: %s\n", error.what());
+        std::fprintf(stderr, "Windows-audio helper failed: %s\n", error.what());
     } catch (...) {
-        std::fprintf(stderr, "System-audio helper failed with an unknown error.\n");
+        std::fprintf(stderr, "Windows-audio helper failed with an unknown error.\n");
     }
     return static_cast<int>(bwa::ExitCode::kInternalFailure);
 }

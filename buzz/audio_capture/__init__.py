@@ -5,6 +5,7 @@ from buzz.audio_capture.source import (
     AudioSourceError,
 )
 from buzz.audio_capture.sounddevice_source import SoundDeviceAudioSource
+from buzz.audio_capture.windows_process_source import WindowsProcessAudioSource
 from buzz.audio_capture.windows_system_source import WindowsSystemAudioSource
 
 __all__ = [
@@ -13,5 +14,6 @@ __all__ = [
     "AudioSource",
     "AudioSourceError",
     "SoundDeviceAudioSource",
+    "WindowsProcessAudioSource",
     "WindowsSystemAudioSource",
 ]

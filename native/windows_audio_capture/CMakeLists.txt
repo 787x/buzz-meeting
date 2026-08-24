@@ -20,7 +20,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(buzz_windows_audio_capture_core STATIC
+    src/capture_options.cpp
+    src/loopback_capture_session.cpp
     src/pcm_transport.cpp
+    src/process_loopback_capture.cpp
     src/system_loopback_capture.cpp
 )
 target_include_directories(buzz_windows_audio_capture_core PUBLIC src)
@@ -29,7 +32,7 @@ target_compile_definitions(buzz_windows_audio_capture_core PRIVATE
     WIN32_LEAN_AND_MEAN
     _WIN32_WINNT=0x0A00
 )
-target_link_libraries(buzz_windows_audio_capture_core PUBLIC ole32)
+target_link_libraries(buzz_windows_audio_capture_core PUBLIC Mmdevapi ole32)
 
 add_executable(buzz-windows-audio-capture src/main.cpp)
 target_link_libraries(
