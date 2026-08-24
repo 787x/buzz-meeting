@@ -5,7 +5,7 @@ import platform
 
 import tempfile
 
-from unittest.mock import patch, MagicMock
+from unittest.mock import call, patch, MagicMock
 from pytestqt.qtbot import QtBot
 from PyQt6.QtWidgets import QColorDialog
 from PyQt6.QtGui import QColor
@@ -192,6 +192,194 @@ class TestRecordingTranscriberWidget:
             qtbot.wait(500)
 
             widget.close()
+
+
+class TestIncrementalTranscriptIntegration:
+    @pytest.mark.timeout(60)
+    def test_append_and_correct_shows_committed_and_provisional(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            widget.transcriber_mode = RecordingTranscriberMode.APPEND_AND_CORRECT
+            widget.hide_unconfirmed = False
+
+            widget.on_next_transcription("we need to review")
+            assert widget.transcription_text_box.toPlainText() == "we need to review"
+
+            widget.on_next_transcription("review the budget tomorrow")
+            assert widget.transcription_text_box.toPlainText() == (
+                "we need to review the budget tomorrow"
+            )
+
+    @pytest.mark.timeout(60)
+    def test_append_and_correct_hides_provisional(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            widget.transcriber_mode = RecordingTranscriberMode.APPEND_AND_CORRECT
+            widget.hide_unconfirmed = True
+
+            widget.on_next_transcription("we need to review")
+            assert widget.transcription_text_box.toPlainText() == ""
+
+            widget.on_next_transcription("review the budget tomorrow")
+            assert widget.transcription_text_box.toPlainText() == "we need to review"
+
+    @pytest.mark.timeout(60)
+    def test_hide_toggle_immediately_replaces_only_provisional_tail(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            widget.transcriber_mode = RecordingTranscriberMode.APPEND_AND_CORRECT
+            widget.hide_unconfirmed = False
+            widget.on_next_transcription("we need to review")
+            widget.on_next_transcription("review the budget tomorrow")
+
+            widget.on_hide_unconfirmed_changed(True)
+            assert widget.transcription_text_box.toPlainText() == "we need to review"
+
+            widget.on_hide_unconfirmed_changed(False)
+            assert widget.transcription_text_box.toPlainText() == (
+                "we need to review the budget tomorrow"
+            )
+
+    @pytest.mark.timeout(60)
+    def test_hidden_updates_render_latest_provisional_when_unhidden(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            widget.transcriber_mode = RecordingTranscriberMode.APPEND_AND_CORRECT
+            widget.hide_unconfirmed = True
+            widget.on_next_transcription("we need to review")
+            widget.on_next_transcription("review the budget tomorrow")
+            widget.on_next_transcription("tomorrow and send the report")
+
+            assert widget.transcription_text_box.toPlainText() == (
+                "we need to review the budget tomorrow"
+            )
+
+            widget.on_hide_unconfirmed_changed(False)
+            assert widget.transcription_text_box.toPlainText() == (
+                "we need to review the budget tomorrow and send the report"
+            )
+
+    @pytest.mark.timeout(60)
+    def test_append_and_correct_does_not_set_full_plain_text(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            widget.transcriber_mode = RecordingTranscriberMode.APPEND_AND_CORRECT
+            widget.hide_unconfirmed = False
+
+            with patch.object(
+                widget.transcription_text_box,
+                "setPlainText",
+                wraps=widget.transcription_text_box.setPlainText,
+            ) as set_plain_text:
+                widget.on_next_transcription("we need to review")
+                widget.on_next_transcription("review the budget tomorrow")
+
+            set_plain_text.assert_not_called()
+
+    @pytest.mark.timeout(60)
+    def test_committed_prefix_remains_unchanged(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            widget.transcriber_mode = RecordingTranscriberMode.APPEND_AND_CORRECT
+            widget.hide_unconfirmed = False
+            widget.on_next_transcription("we need to review")
+            widget.on_next_transcription("review the budget tomorrow")
+            committed = widget.incremental_transcript.snapshot()
+
+            widget.on_next_transcription("tomorrow and send the report")
+
+            assert committed == "we need to review"
+            assert widget.transcription_text_box.toPlainText().startswith(committed)
+            assert widget.incremental_transcript.snapshot().startswith(committed)
+
+    @pytest.mark.timeout(60)
+    def test_qt_cursor_position_handles_non_bmp_provisional_text(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            widget.transcriber_mode = RecordingTranscriberMode.APPEND_AND_CORRECT
+            widget.hide_unconfirmed = False
+            widget.on_next_transcription("🙂 we need to review")
+            widget.on_next_transcription("review the budget")
+
+            widget.on_hide_unconfirmed_changed(True)
+            assert widget.transcription_text_box.toPlainText() == "🙂 we need to review"
+
+            widget.on_hide_unconfirmed_changed(False)
+            assert widget.transcription_text_box.toPlainText() == (
+                "🙂 we need to review the budget"
+            )
+
+    @pytest.mark.timeout(60)
+    def test_finished_finalizes_last_provisional(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            widget.transcriber_mode = RecordingTranscriberMode.APPEND_AND_CORRECT
+            widget.hide_unconfirmed = True
+            widget.on_next_transcription("final recognized words")
+            assert widget.transcription_text_box.toPlainText() == ""
+
+            with patch.object(widget, "set_recording_status_stopped"), patch.object(
+                widget, "reset_recording_amplitude_listener"
+            ):
+                widget.on_transcriber_finished()
+
+            assert widget.transcription_text_box.toPlainText() == "final recognized words"
+            assert widget.incremental_transcript.snapshot() == "final recognized words"
+
+    @pytest.mark.timeout(60)
+    def test_error_finalizes_last_provisional(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            widget.transcriber_mode = RecordingTranscriberMode.APPEND_AND_CORRECT
+            widget.hide_unconfirmed = True
+            widget.on_next_transcription("recognized before error")
+
+            with patch(
+                "buzz.widgets.recording_transcriber_widget.QMessageBox.critical"
+            ), patch.object(widget, "set_recording_status_stopped"), patch.object(
+                widget, "reset_recording_amplitude_listener"
+            ):
+                widget.on_transcriber_error("failure")
+
+            assert widget.transcription_text_box.toPlainText() == (
+                "recognized before error"
+            )
+
+            with patch.object(widget, "set_recording_status_stopped"), patch.object(
+                widget, "reset_recording_amplitude_listener"
+            ):
+                widget.on_transcriber_finished()
+
+            assert widget.transcription_text_box.toPlainText() == (
+                "recognized before error"
+            )
+
+    @pytest.mark.timeout(60)
+    def test_start_recording_resets_incremental_state(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            widget.incremental_transcript.update("old recording")
+            widget._current_provisional_text = "old recording"
+            widget.transcription_text_box.setPlainText("old recording")
+
+            with patch.object(
+                widget.transcription_options.model,
+                "get_local_model_path",
+                return_value="fake-model",
+            ), patch.object(widget, "on_model_loaded"):
+                widget.start_recording()
+
+            assert widget.incremental_transcript.snapshot(
+                include_provisional=True
+            ) == ""
+            assert widget._current_provisional_text == ""
+            assert widget._provisional_start_position == 0
+            assert widget.transcription_text_box.toPlainText() == ""
+
+    @pytest.mark.timeout(60)
+    def test_raw_hypotheses_still_use_legacy_translation_enqueue(self, qtbot):
+        with _widget_ctx(qtbot) as widget:
+            widget.transcriber_mode = RecordingTranscriberMode.APPEND_AND_CORRECT
+            widget.hide_unconfirmed = False
+            widget.translator = MagicMock()
+
+            widget.on_next_transcription("we need to review")
+            widget.on_next_transcription("review the budget tomorrow")
+
+            assert widget.translator.enqueue.call_args_list == [
+                call("we need to review"),
+                call("review the budget tomorrow"),
+            ]
 
 
 class TestRecordingTranscriberWidgetLineSeparator:
@@ -1175,6 +1363,28 @@ class TestUploadToServer:
             widget.on_next_transcription("hello")  # should not raise
 
     @pytest.mark.timeout(60)
+    def test_append_and_correct_upload_protocol_remains_raw_replace(self, qtbot):
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget.requests.post"
+        ) as mock_post:
+            widget.transcriber_mode = RecordingTranscriberMode.APPEND_AND_CORRECT
+            widget.hide_unconfirmed = False
+            widget.upload_url = "http://example.com/upload"
+
+            widget.on_next_transcription("review the budget tomorrow")
+
+            mock_post.assert_called_once_with(
+                url="http://example.com/upload",
+                json={
+                    "kind": "transcript",
+                    "text": "review the budget tomorrow",
+                    "mode": "replace",
+                },
+                headers={"Content-Type": "application/json"},
+                timeout=15,
+            )
+
+    @pytest.mark.timeout(60)
     def test_translation_uploaded_when_upload_url_set(self, qtbot):
         with _widget_ctx(qtbot) as widget, \
                 patch("buzz.widgets.recording_transcriber_widget.requests.post") as mock_post:
@@ -1580,6 +1790,56 @@ class TestAppendAndCorrectCsvExport:
             assert len(rows[0]) == 1
             assert "Hello" in rows[0][0]
             assert "Goodbye" in rows[0][0]
+        finally:
+            os.unlink(export_path)
+
+    @pytest.mark.timeout(60)
+    def test_txt_export_matches_visible_provisional_text(self, qtbot):
+        with _widget_ctx(qtbot) as widget, tempfile.NamedTemporaryFile(
+            suffix=".txt", delete=False, mode="w"
+        ) as f:
+            export_path = f.name
+
+        try:
+            widget.transcriber_mode = RecordingTranscriberMode.APPEND_AND_CORRECT
+            widget.hide_unconfirmed = False
+            widget.export_enabled = True
+            widget.export_file_type = "txt"
+            widget.transcript_export_file = export_path
+
+            widget.on_next_transcription("we need to review")
+            widget.on_next_transcription("review the budget tomorrow")
+
+            with open(export_path, encoding="utf-8") as f:
+                assert f.read() == "we need to review the budget tomorrow"
+        finally:
+            os.unlink(export_path)
+
+    @pytest.mark.timeout(60)
+    def test_hidden_provisional_is_exported_after_finished_finalize(self, qtbot):
+        with _widget_ctx(qtbot) as widget, tempfile.NamedTemporaryFile(
+            suffix=".txt", delete=False, mode="w"
+        ) as f:
+            export_path = f.name
+
+        try:
+            widget.transcriber_mode = RecordingTranscriberMode.APPEND_AND_CORRECT
+            widget.hide_unconfirmed = True
+            widget.export_enabled = True
+            widget.export_file_type = "txt"
+            widget.transcript_export_file = export_path
+            widget.on_next_transcription("final recognized words")
+
+            with open(export_path, encoding="utf-8") as f:
+                assert f.read() == ""
+
+            with patch.object(widget, "set_recording_status_stopped"), patch.object(
+                widget, "reset_recording_amplitude_listener"
+            ):
+                widget.on_transcriber_finished()
+
+            with open(export_path, encoding="utf-8") as f:
+                assert f.read() == "final recognized words"
         finally:
             os.unlink(export_path)
 
