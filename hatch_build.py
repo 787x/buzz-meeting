@@ -61,6 +61,48 @@ class CustomBuildHook(BuildHookInterface):
 
         try:
             # ------------------------------------------------------------
+            # Build the Windows system-audio helper for Windows wheels
+            # ------------------------------------------------------------
+
+            windows_audio_helper = (
+                project_root
+                / "buzz"
+                / "native"
+                / "windows"
+                / "buzz-windows-audio-capture.exe"
+            )
+
+            if sys.platform == "win32" and self.target_name == "wheel":
+                if not windows_audio_helper.exists():
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(
+                                project_root
+                                / "scripts"
+                                / "build_windows_audio_helper.py"
+                            ),
+                        ],
+                        cwd=project_root,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    print(result.stdout)
+                    if result.stderr:
+                        print(result.stderr, file=sys.stderr)
+
+                if not windows_audio_helper.is_file():
+                    raise FileNotFoundError(
+                        "Windows system-audio helper is missing after build"
+                    )
+
+                helper_relative_path = windows_audio_helper.relative_to(project_root)
+                build_data.setdefault("force_include", {})[
+                    str(helper_relative_path)
+                ] = str(helper_relative_path)
+
+            # ------------------------------------------------------------
             # Build whisper.cpp only when missing
             # ------------------------------------------------------------
 

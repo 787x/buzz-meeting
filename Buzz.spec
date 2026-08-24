@@ -110,6 +110,14 @@ if platform.system() == "Windows":
     datas += collect_data_files("msvc-runtime")
 
     binaries.append(("dll_backup/SDL2.dll", "dll_backup"))
+    windows_audio_helper = os.path.join(
+        "buzz", "native", "windows", "buzz-windows-audio-capture.exe"
+    )
+    if not os.path.isfile(windows_audio_helper):
+        raise FileNotFoundError(
+            f"Missing Windows system-audio helper: {windows_audio_helper}"
+        )
+    binaries.append((windows_audio_helper, "native/windows"))
 
 a = Analysis(
     ["main.py"],

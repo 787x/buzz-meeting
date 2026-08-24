@@ -14,6 +14,7 @@ from buzz.model_loader import TranscriptionModel, ModelType, WhisperModelSize
 from buzz.transcriber.recording_transcriber import RecordingTranscriber
 from buzz.transcriber.transcriber import TranscriptionOptions, Task
 from buzz.settings.recording_transcriber_mode import RecordingTranscriberMode
+from buzz.audio_capture.source import AudioSourceError
 from buzz.audio_capture.sounddevice_source import SoundDeviceAudioSource
 from tests.audio_capture.fake_audio_source import FakeAudioSource
 from tests.mock_sounddevice import MockSoundDevice
@@ -428,12 +429,48 @@ class TestInjectedAudioSource:
         assert audio_source.stop_count == 1
         assert cleanup_observations == [True]
 
-    def test_transcribe_none_stops_source(self):
+    def test_runtime_source_error_stops_source_before_emitting_error(self, qtbot):
         audio_source = FakeAudioSource()
         transcriber = self._make_transcriber(audio_source)
+        errors = []
+        cleanup_observations = []
+
+        def release_model(model):
+            cleanup_observations.append(("model", audio_source.stopped))
+
+        def record_error(error):
+            cleanup_observations.append(("error", audio_source.stopped))
+            errors.append(error)
+
+        transcriber.error.connect(record_error)
 
         with patch.object(transcriber, "_load_model", return_value=object()), \
-             patch.object(transcriber, "_transcribe", return_value=None):
+             patch.object(transcriber, "_release_model", side_effect=release_model):
+            worker = threading.Thread(target=transcriber.start)
+            worker.start()
+            assert audio_source.started_event.wait(timeout=2)
+
+            audio_source.fail(AudioSourceError("system output was disconnected"))
+            worker.join(timeout=2)
+            qtbot.waitUntil(lambda: len(errors) == 1, timeout=2_000)
+
+        assert not worker.is_alive()
+        assert audio_source.start_count == 1
+        assert audio_source.stop_count == 1
+        assert errors == ["system output was disconnected"]
+        assert cleanup_observations == [("model", True), ("error", True)]
+
+    def test_transcribe_none_stops_source_and_releases_model(self):
+        audio_source = FakeAudioSource()
+        transcriber = self._make_transcriber(audio_source)
+        finished = []
+        errors = []
+        transcriber.finished.connect(lambda: finished.append(True))
+        transcriber.error.connect(errors.append)
+
+        with patch.object(transcriber, "_load_model", return_value=object()), \
+             patch.object(transcriber, "_transcribe", return_value=None), \
+             patch.object(transcriber, "_release_model") as release_model:
             worker = threading.Thread(target=transcriber.start)
             worker.start()
             assert audio_source.started_event.wait(timeout=2)
@@ -445,6 +482,71 @@ class TestInjectedAudioSource:
         assert not worker.is_alive()
         assert audio_source.start_count == 1
         assert audio_source.stop_count == 1
+        release_model.assert_called_once()
+        assert finished == []
+        assert errors == []
+
+    @pytest.mark.parametrize(
+        ("backend_result", "expected_transcriptions"),
+        [
+            ({"text": "completed in-flight result"}, ["completed in-flight result"]),
+            (None, []),
+        ],
+    )
+    def test_runtime_source_error_wins_after_in_flight_backend_returns(
+        self,
+        qtbot,
+        backend_result,
+        expected_transcriptions,
+    ):
+        audio_source = FakeAudioSource()
+        transcriber = self._make_transcriber(audio_source)
+        backend_started = threading.Event()
+        release_backend = threading.Event()
+        errors = []
+        finished = []
+        transcriptions = []
+        cleanup_observations = []
+
+        def transcribe(samples, model, initial_prompt):
+            backend_started.set()
+            assert release_backend.wait(timeout=2)
+            return backend_result
+
+        def release_model(model):
+            cleanup_observations.append(audio_source.stopped)
+
+        def record_error(error):
+            cleanup_observations.append(audio_source.stopped)
+            errors.append(error)
+
+        transcriber.transcription.connect(transcriptions.append)
+        transcriber.finished.connect(lambda: finished.append(True))
+        transcriber.error.connect(record_error)
+
+        with patch.object(transcriber, "_load_model", return_value=object()), \
+             patch.object(transcriber, "_transcribe", side_effect=transcribe), \
+             patch.object(transcriber, "_release_model", side_effect=release_model):
+            worker = threading.Thread(target=transcriber.start)
+            worker.start()
+            assert audio_source.started_event.wait(timeout=2)
+            audio_source.deliver(
+                np.ones(12 * audio_source.sample_rate, dtype=np.float32)
+            )
+            assert backend_started.wait(timeout=2)
+
+            audio_source.fail(AudioSourceError("system output was disconnected"))
+            assert audio_source.stop_count == 0
+            release_backend.set()
+            worker.join(timeout=2)
+            qtbot.waitUntil(lambda: len(errors) == 1, timeout=2_000)
+
+        assert not worker.is_alive()
+        assert audio_source.stop_count == 1
+        assert errors == ["system output was disconnected"]
+        assert transcriptions == expected_transcriptions
+        assert finished == []
+        assert cleanup_observations == [True, True]
 
     def test_transcribe_exception_stops_source_before_emitting_error(self, qtbot):
         audio_source = FakeAudioSource()

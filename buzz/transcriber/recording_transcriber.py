@@ -97,6 +97,7 @@ class RecordingTranscriber(QObject):
         self.pending_utterances: deque[np.ndarray] = deque()
         self.pending_sample_count = 0
         self._utterance_available = threading.Event()
+        self._audio_source_error: Optional[Exception] = None
         self._previous_unique_tail = np.empty(0, dtype=np.float32)
         self.mutex = threading.Lock()
         # Retained for constructor and field compatibility. Audio capture is
@@ -125,53 +126,85 @@ class RecordingTranscriber(QObject):
             self.input_device_index,
         )
 
+        source_started = False
+        terminal_error: Optional[Exception] = None
+        backend_returned_none = False
         try:
-            self.audio_source.start(self.on_audio)
-            try:
-                while self.is_running:
-                    samples = self._take_pending_utterance()
-                    if samples is None:
-                        if not self.is_running:
-                            break
-                        self._utterance_available.wait()
-                        continue
+            with self.mutex:
+                self._audio_source_error = None
+            self.audio_source.start(self.on_audio, self._on_audio_source_error)
+            source_started = True
+            while self.is_running:
+                samples = self._take_pending_utterance()
+                if samples is None:
+                    if not self.is_running:
+                        break
+                    self._utterance_available.wait()
+                    continue
 
-                    amplitude = self.amplitude(samples)
-                    self.average_amplitude_changed.emit(amplitude)
+                amplitude = self.amplitude(samples)
+                self.average_amplitude_changed.emit(amplitude)
 
-                    backend_samples = self._prepare_backend_samples(samples)
-                    logging.debug(
-                        "Processing next utterance, sample size = %s, pending size = %s, amplitude = %s",
-                        backend_samples.size,
-                        self.pending_sample_count,
-                        amplitude,
-                    )
+                backend_samples = self._prepare_backend_samples(samples)
+                logging.debug(
+                    "Processing next utterance, sample size = %s, pending size = %s, amplitude = %s",
+                    backend_samples.size,
+                    self.pending_sample_count,
+                    amplitude,
+                )
 
-                    time_started = datetime.datetime.now()
-                    result = self._transcribe(backend_samples, model, initial_prompt)
-                    if result is None:
-                        return
-                    next_text: str = result.get("text", "")
+                time_started = datetime.datetime.now()
+                result = self._transcribe(backend_samples, model, initial_prompt)
+                if result is None:
+                    backend_returned_none = True
+                    break
+                next_text: str = result.get("text", "")
 
-                    initial_prompt = next_text[-1000:]
+                initial_prompt = next_text[-1000:]
 
-                    logging.debug(
-                        "Received next result, length = %s, time taken = %s",
-                        len(next_text),
-                        datetime.datetime.now() - time_started,
-                    )
-                    self.transcription.emit(next_text)
-            finally:
-                self.audio_source.stop()
-                self._discard_pending_utterances()
-
-        except (AudioSourceError, PortAudioError) as exc:
-            self.error.emit(str(exc))
-            logging.exception("Audio source error during recording")
-            return
+                logging.debug(
+                    "Received next result, length = %s, time taken = %s",
+                    len(next_text),
+                    datetime.datetime.now() - time_started,
+                )
+                self.transcription.emit(next_text)
         except Exception as exc:
-            logging.exception("Unexpected error during recording")
-            self.error.emit(str(exc))
+            terminal_error = exc
+        finally:
+            if source_started:
+                try:
+                    self.audio_source.stop()
+                except Exception as exc:
+                    if terminal_error is None:
+                        terminal_error = exc
+            try:
+                self._discard_pending_utterances()
+            except Exception as exc:
+                if terminal_error is None:
+                    terminal_error = exc
+
+        with self.mutex:
+            audio_source_error = self._audio_source_error
+        if audio_source_error is not None:
+            terminal_error = audio_source_error
+
+        if terminal_error is not None:
+            self._release_model(model)
+            self.error.emit(str(terminal_error))
+            if isinstance(terminal_error, (AudioSourceError, PortAudioError)):
+                logging.error(
+                    "Audio source error during recording: %s",
+                    terminal_error,
+                )
+            else:
+                logging.error(
+                    "Unexpected error during recording: %s",
+                    terminal_error,
+                )
+            return
+
+        if backend_returned_none:
+            self._release_model(model)
             return
 
         self._cleanup_model(model)
@@ -376,13 +409,25 @@ class RecordingTranscriber(QObject):
         os.unlink(temp_filename)
         return result
 
-    def _cleanup_model(self, model):
+    @staticmethod
+    def _release_model(model):
         if model:
             del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def _cleanup_model(self, model):
+        self._release_model(model)
         self.finished.emit()
+
+    def _on_audio_source_error(self, error: Exception) -> None:
+        """Wake the recording worker after the first runtime source failure."""
+        with self.mutex:
+            if not self.is_running or self._audio_source_error is not None:
+                return
+            self._audio_source_error = error
+            self.is_running = False
+            self._utterance_available.set()
 
     @staticmethod
     def get_device_sample_rate(device_id: Optional[int]) -> int:

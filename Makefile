@@ -9,6 +9,7 @@ bundle_windows: dist/Buzz
 	# Sanity-check: both halves of OpenSSL must ship together, otherwise users with
 	# a system OpenSSL on PATH hit "CRYPTO_calloc not found" from a mismatched pair.
 	powershell -NoProfile -Command "if (-not (Get-ChildItem -Path 'dist\Buzz' -Recurse -Filter 'libssl-3-x64.dll' -ErrorAction SilentlyContinue)) { Write-Error 'Missing libssl-3-x64.dll in dist\Buzz'; exit 1 }; if (-not (Get-ChildItem -Path 'dist\Buzz' -Recurse -Filter 'libcrypto-3-x64.dll' -ErrorAction SilentlyContinue)) { Write-Error 'Missing libcrypto-3-x64.dll in dist\Buzz'; exit 1 }"
+	powershell -NoProfile -Command "if (-not (Get-ChildItem -Path 'dist\Buzz' -Recurse -Filter 'buzz-windows-audio-capture.exe' -ErrorAction SilentlyContinue)) { Write-Error 'Missing buzz-windows-audio-capture.exe in dist\Buzz'; exit 1 }"
 	iscc installer.iss
 
 bundle_mac: dist/Buzz.app codesign_all_mac zip_mac notarize_zip staple_app_mac dmg_mac
@@ -43,7 +44,7 @@ COVERAGE_THRESHOLD := 70
 ctc_forced_aligner_ext:
 	python scripts/build_ctc_forced_aligner.py
 
-test: buzz/whisper_cpp ctc_forced_aligner_ext
+test: buzz/whisper_cpp ctc_forced_aligner_ext windows_audio_helper_test
 # A check to get updates of yt-dlp and certifi. Should run only on local as part of regular development operations
 # Sort of a local "update checker"
 ifndef CI
@@ -54,8 +55,20 @@ endif
 benchmarks: buzz/whisper_cpp ctc_forced_aligner_ext
 	pytest -s -vv --benchmark-only --benchmark-json benchmarks.json
 
-dist/Buzz dist/Buzz.app: buzz/whisper_cpp
+dist/Buzz dist/Buzz.app: buzz/whisper_cpp windows_audio_helper
 	pyinstaller --noconfirm Buzz.spec
+
+.PHONY: windows_audio_helper windows_audio_helper_test
+windows_audio_helper:
+ifeq ($(OS), Windows_NT)
+	python scripts/build_windows_audio_helper.py
+endif
+
+windows_audio_helper_test: windows_audio_helper
+ifeq ($(OS), Windows_NT)
+	ctest --test-dir build/windows_audio_capture -C Release --output-on-failure
+	buzz/native/windows/buzz-windows-audio-capture.exe --self-test
+endif
 
 version:
 	echo "VERSION = \"${version}\"" > buzz/__version__.py
