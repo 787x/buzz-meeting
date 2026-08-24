@@ -39,6 +39,10 @@ from buzz.store.keyring_store import get_password, Key
 from buzz.recording import RecordingAmplitudeListener
 from buzz.settings.settings import Settings
 from buzz.settings.recording_transcriber_mode import RecordingTranscriberMode
+from buzz.transcriber.incremental_transcript import (
+    IncrementalTranscript,
+    TranscriptUpdate,
+)
 from buzz.transcriber.recording_transcriber import RecordingTranscriber
 from buzz.transcriber.transcriber import (
     TranscriptionOptions,
@@ -101,8 +105,10 @@ class RecordingTranscriberWidget(QWidget):
     def _init_state(self) -> None:
         self.translation_thread = None
         self.translator = None
-        self.transcripts = []
         self.translations = []
+        self.incremental_transcript = IncrementalTranscript()
+        self._current_provisional_text = ""
+        self._provisional_start_position = 0
         self.current_status = self.RecordingStatus.STOPPED
         self.setWindowTitle(_("Live Recording"))
 
@@ -535,6 +541,11 @@ class RecordingTranscriberWidget(QWidget):
 
     def on_hide_unconfirmed_changed(self, value: bool):
         self.hide_unconfirmed = value
+        if self.transcriber_mode == RecordingTranscriberMode.APPEND_AND_CORRECT:
+            self._render_incremental_transcript_update(
+                TranscriptUpdate("", self._current_provisional_text)
+            )
+            self._write_incremental_transcript_export()
 
     def on_transcription_options_changed(
         self, transcription_options: TranscriptionOptions
@@ -622,8 +633,10 @@ class RecordingTranscriberWidget(QWidget):
 
     def start_recording(self):
         self.record_button.setDisabled(True)
-        self.transcripts = []
         self.translations = []
+        self.incremental_transcript.reset()
+        self._current_provisional_text = ""
+        self._provisional_start_position = 0
 
         if self.upload_url:
             try:
@@ -913,6 +926,7 @@ class RecordingTranscriberWidget(QWidget):
         return text1 + text2[overlap_start:]
 
     def process_transcription_merge(self, text: str, texts, text_box, export_file):
+        """Legacy overlapping-text reconciliation used by live translation."""
         texts.append(text)
 
         # Possibly in future we want to tie this to some setting, to limit amount of data that needs
@@ -959,6 +973,54 @@ class RecordingTranscriberWidget(QWidget):
                 self.write_csv_export(export_file, merged_texts, 0)
             else:
                 self.write_to_export_file(export_file, merged_texts, mode="w")
+
+    def _render_incremental_transcript_update(
+        self,
+        update: TranscriptUpdate,
+    ) -> None:
+        cursor = self.transcription_text_box.textCursor()
+        cursor.setPosition(self._provisional_start_position)
+        cursor.movePosition(
+            QTextCursor.MoveOperation.End,
+            QTextCursor.MoveMode.KeepAnchor,
+        )
+        cursor.removeSelectedText()
+        cursor.insertText(update.newly_committed_text)
+
+        # Store a position produced by QTextCursor. Qt document positions use
+        # UTF-16 semantics and cannot safely be derived from Python len().
+        self._provisional_start_position = cursor.position()
+        self._current_provisional_text = update.provisional_text
+        if not self.hide_unconfirmed:
+            cursor.insertText(update.provisional_text)
+
+        self.transcription_text_box.setTextCursor(cursor)
+        self.transcription_text_box.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _write_incremental_transcript_export(self) -> None:
+        if not self.export_enabled or not self.transcript_export_file:
+            return
+
+        visible_text = self.incremental_transcript.snapshot(
+            include_provisional=not self.hide_unconfirmed
+        )
+        if self.export_file_type == "csv":
+            self.write_to_export_file(self.transcript_export_file, "", mode="w")
+            self.write_csv_export(self.transcript_export_file, visible_text, 0)
+        else:
+            self.write_to_export_file(
+                self.transcript_export_file,
+                visible_text,
+                mode="w",
+            )
+
+    def _finalize_incremental_transcript(self) -> None:
+        if self.transcriber_mode != RecordingTranscriberMode.APPEND_AND_CORRECT:
+            return
+
+        update = self.incremental_transcript.finalize()
+        self._render_incremental_transcript_update(update)
+        self._write_incremental_transcript_export()
 
     def on_next_transcription(self, text: str):
         text = self.filter_text(text)
@@ -1010,7 +1072,9 @@ class RecordingTranscriberWidget(QWidget):
                     self.write_txt_export(self.transcript_export_file, text, "prepend", self.export_max_entries, self.transcription_options.line_separator)
 
         elif self.transcriber_mode == RecordingTranscriberMode.APPEND_AND_CORRECT:
-            self.process_transcription_merge(text, self.transcripts, self.transcription_text_box, self.transcript_export_file)
+            update = self.incremental_transcript.update(text)
+            self._render_incremental_transcript_update(update)
+            self._write_incremental_transcript_export()
 
         #Update presentation window if it is open
         if self.presentation_window and self.presentation_window.isVisible():
@@ -1111,12 +1175,14 @@ class RecordingTranscriberWidget(QWidget):
         self.record_button.setDisabled(True)
 
     def on_transcriber_finished(self):
+        self._finalize_incremental_transcript()
         self.set_recording_status_stopped()
         # Restart amplitude listener now that the transcription stream is closed
         self.reset_recording_amplitude_listener()
         self.transcription_stopped.emit()
 
     def on_transcriber_error(self, error: str):
+        self._finalize_incremental_transcript()
         self.reset_record_button()
         self.set_recording_status_stopped()
         self.reset_recording_amplitude_listener()
