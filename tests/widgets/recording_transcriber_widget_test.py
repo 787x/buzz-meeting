@@ -7,11 +7,16 @@ import platform
 import tempfile
 
 from unittest.mock import call, patch, MagicMock
+from types import SimpleNamespace
 from pytestqt.qtbot import QtBot
 from PyQt6.QtWidgets import QColorDialog
 from PyQt6.QtGui import QColor, QCloseEvent
 
 from buzz.locale import _
+from buzz.audio_capture.windows_application_targets import (
+    WindowsApplicationAudioTarget,
+    WindowsApplicationTargetError,
+)
 from buzz.settings.recording_transcriber_mode import RecordingTranscriberMode
 from buzz.widgets.recording_transcriber_widget import RecordingTranscriberWidget
 from buzz.widgets.presentation_window import PresentationWindow
@@ -1154,15 +1159,32 @@ class TestOnDeviceChanged:
 
 class TestAudioSourceSelection:
     @pytest.mark.timeout(60)
-    def test_windows_selector_has_microphone_and_system_audio(self, qtbot):
+    def test_supported_windows_selector_has_all_three_sources(self, qtbot):
         with _widget_ctx(qtbot) as widget:
             options = [
                 widget.audio_source_combo_box.itemText(index)
                 for index in range(widget.audio_source_combo_box.count())
             ]
 
-            assert options == [_('Microphone'), _('System audio')]
+            assert options == [
+                _('Microphone'),
+                _('System audio'),
+                _('Application audio'),
+            ]
             assert not widget.is_system_audio_selected()
+
+    @pytest.mark.timeout(60)
+    def test_windows_build_20347_hides_only_application_audio(self, qtbot):
+        with patch(
+            "buzz.widgets.recording_transcriber_widget.sys.getwindowsversion",
+            return_value=SimpleNamespace(build=20_347),
+        ), _widget_ctx(qtbot) as widget:
+            options = [
+                widget.audio_source_combo_box.itemText(index)
+                for index in range(widget.audio_source_combo_box.count())
+            ]
+
+            assert options == [_('Microphone'), _('System audio')]
 
     @pytest.mark.timeout(60)
     def test_non_windows_selector_has_no_system_audio(self, qtbot):
@@ -1306,6 +1328,489 @@ class TestSystemAudioModelLoaded:
             assert kwargs["input_device_index"] == widget.selected_device_id
             assert kwargs["sample_rate"] == 16_000
             assert "audio_source" not in kwargs
+
+
+def _application_audio_target(
+    *,
+    hwnd: int = 100,
+    window_pid: int = 20,
+    capture_pid: int = 10,
+    title: str = "Meeting",
+) -> WindowsApplicationAudioTarget:
+    return WindowsApplicationAudioTarget(
+        hwnd=hwnd,
+        window_title=title,
+        window_pid=window_pid,
+        capture_pid=capture_pid,
+        process_name="app.exe",
+        executable_path=r"C:\Apps\app.exe",
+        app_user_model_id=None,
+    )
+
+
+def _select_application_audio(widget: RecordingTranscriberWidget) -> None:
+    application_index = widget.audio_source_combo_box.findData(
+        widget.AudioSourceType.APPLICATION_AUDIO
+    )
+    assert application_index >= 0
+    widget.audio_source_combo_box.setCurrentIndex(application_index)
+
+
+class TestApplicationAudioSelection:
+    @pytest.mark.timeout(60)
+    def test_selecting_application_shows_target_row_and_stops_preview(self, qtbot):
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "list_windows_application_audio_targets",
+            return_value=[],
+        ):
+            listener = widget.recording_amplitude_listener
+            assert listener is not None
+            with patch.object(
+                listener, "stop_recording", wraps=listener.stop_recording
+            ) as stop:
+                _select_application_audio(widget)
+
+            stop.assert_called_once_with()
+            assert widget.recording_amplitude_listener is None
+            assert widget.audio_devices_combo_box.isHidden()
+            assert not widget.application_audio_target_widget.isHidden()
+            assert not widget.audio_meter_widget.isEnabled()
+
+    @pytest.mark.timeout(60)
+    def test_application_to_system_does_not_start_microphone_preview(self, qtbot):
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "list_windows_application_audio_targets",
+            return_value=[],
+        ):
+            _select_application_audio(widget)
+            with patch(
+                "buzz.widgets.recording_transcriber_widget.RecordingAmplitudeListener"
+            ) as listener_class:
+                widget.audio_source_combo_box.setCurrentIndex(1)
+
+            listener_class.assert_not_called()
+            assert widget.recording_amplitude_listener is None
+
+    @pytest.mark.timeout(60)
+    def test_system_application_microphone_starts_exactly_one_preview(self, qtbot):
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "list_windows_application_audio_targets",
+            return_value=[],
+        ):
+            widget.audio_source_combo_box.setCurrentIndex(1)
+            _select_application_audio(widget)
+            with patch(
+                "buzz.widgets.recording_transcriber_widget.RecordingAmplitudeListener"
+            ) as listener_class:
+                widget.audio_source_combo_box.setCurrentIndex(0)
+
+            listener_class.assert_called_once_with(
+                input_device_index=widget.selected_device_id,
+                parent=widget,
+            )
+            listener_class.return_value.start_recording.assert_called_once_with()
+
+    @pytest.mark.timeout(60)
+    def test_ten_source_transitions_do_not_duplicate_preview_listener(self, qtbot):
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "list_windows_application_audio_targets",
+            return_value=[],
+        ), patch(
+            "buzz.widgets.recording_transcriber_widget.RecordingAmplitudeListener"
+        ) as listener_class:
+            for _transition_index in range(10):
+                _select_application_audio(widget)
+                widget.audio_source_combo_box.setCurrentIndex(0)
+
+            assert listener_class.call_count == 10
+            assert widget.recording_amplitude_listener is listener_class.return_value
+
+    @pytest.mark.timeout(60)
+    def test_placeholder_disables_record_and_selection_enables_it(self, qtbot):
+        target = _application_audio_target()
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "list_windows_application_audio_targets",
+            return_value=[target],
+        ):
+            _select_application_audio(widget)
+            assert not widget.record_button.isEnabled()
+
+            widget.application_audio_target_combo_box.setCurrentIndex(1)
+
+            assert widget.record_button.isEnabled()
+
+    @pytest.mark.timeout(60)
+    def test_idle_reset_button_does_not_override_missing_target_eligibility(
+        self, qtbot
+    ):
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "list_windows_application_audio_targets",
+            return_value=[],
+        ):
+            _select_application_audio(widget)
+
+            widget.reset_record_button()
+
+            assert not widget.record_button.isEnabled()
+
+    @pytest.mark.timeout(60)
+    def test_options_and_control_resets_never_enable_application_without_target(
+        self, qtbot
+    ):
+        from buzz.model_loader import ModelType, TranscriptionModel
+        from buzz.transcriber.transcriber import TranscriptionOptions
+
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "list_windows_application_audio_targets",
+            return_value=[],
+        ):
+            _select_application_audio(widget)
+
+            for options in (
+                TranscriptionOptions(language="fr"),
+                TranscriptionOptions(
+                    language="de",
+                    model=TranscriptionModel(
+                        model_type=ModelType.HUGGING_FACE,
+                        hugging_face_model_id="org/model",
+                    ),
+                    silence_threshold=0.05,
+                ),
+            ):
+                widget.transcription_options_group_box.transcription_options_changed.emit(
+                    options
+                )
+                assert not widget.record_button.isEnabled()
+
+            widget.reset_transcriber_controls()
+            assert not widget.record_button.isEnabled()
+
+    @pytest.mark.timeout(60)
+    def test_application_target_and_existing_model_conditions_are_both_required(
+        self, qtbot
+    ):
+        from buzz.model_loader import ModelType, TranscriptionModel
+        from buzz.transcriber.transcriber import TranscriptionOptions
+
+        target = _application_audio_target()
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "list_windows_application_audio_targets",
+            return_value=[target],
+        ):
+            _select_application_audio(widget)
+            widget.application_audio_target_combo_box.setCurrentIndex(1)
+
+            widget.on_transcription_options_changed(
+                TranscriptionOptions(
+                    model=TranscriptionModel(
+                        model_type=ModelType.HUGGING_FACE,
+                        hugging_face_model_id="",
+                    )
+                )
+            )
+            assert not widget.record_button.isEnabled()
+
+            widget.on_transcription_options_changed(
+                TranscriptionOptions(
+                    model=TranscriptionModel(
+                        model_type=ModelType.HUGGING_FACE,
+                        hugging_face_model_id="org/model",
+                    )
+                )
+            )
+            assert widget.record_button.isEnabled()
+
+    @pytest.mark.timeout(60)
+    def test_refresh_preserves_same_hwnd_pid_but_not_disappeared_selection(
+        self, qtbot
+    ):
+        target = _application_audio_target(title="Old")
+        renamed = _application_audio_target(title="New")
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "list_windows_application_audio_targets",
+            side_effect=[[target], [renamed], []],
+        ):
+            _select_application_audio(widget)
+            widget.application_audio_target_combo_box.setCurrentIndex(1)
+
+            widget.refresh_application_audio_targets()
+            assert widget.application_audio_target_combo_box.selected_target is renamed
+
+            widget.refresh_application_audio_targets()
+            assert widget.application_audio_target_combo_box.selected_target is None
+            assert (
+                widget.application_audio_target_combo_box.currentText()
+                == "No applications available"
+            )
+            assert not widget.record_button.isEnabled()
+
+    @pytest.mark.timeout(60)
+    def test_refresh_does_not_select_a_new_first_target(self, qtbot):
+        target = _application_audio_target()
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "list_windows_application_audio_targets",
+            return_value=[target],
+        ):
+            _select_application_audio(widget)
+
+            assert widget.application_audio_target_combo_box.selected_target is None
+            assert not widget.record_button.isEnabled()
+
+    @pytest.mark.timeout(60)
+    def test_empty_and_enumeration_error_have_distinct_ui(self, qtbot):
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "list_windows_application_audio_targets",
+            return_value=[],
+        ):
+            _select_application_audio(widget)
+            assert (
+                widget.application_audio_target_combo_box.currentText()
+                == "No applications available"
+            )
+
+            with patch(
+                "buzz.widgets.recording_transcriber_widget."
+                "list_windows_application_audio_targets",
+                side_effect=WindowsApplicationTargetError("EnumWindows failed"),
+            ), patch(
+                "buzz.widgets.recording_transcriber_widget.QMessageBox.warning"
+            ) as warning:
+                widget.refresh_application_audio_targets()
+
+            assert (
+                widget.application_audio_target_combo_box.currentText()
+                == "Unable to refresh applications"
+            )
+            warning.assert_called_once()
+
+    @pytest.mark.timeout(60)
+    def test_invalid_target_click_does_not_download_model_or_construct_source(
+        self, qtbot
+    ):
+        target = _application_audio_target()
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "list_windows_application_audio_targets",
+            side_effect=[[target], []],
+        ), patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "validate_windows_application_audio_target",
+            return_value=False,
+        ), patch.object(widget, "start_recording") as start_recording, patch(
+            "buzz.widgets.recording_transcriber_widget.QMessageBox.warning"
+        ) as warning:
+            _select_application_audio(widget)
+            widget.application_audio_target_combo_box.setCurrentIndex(1)
+
+            widget.on_record_button_clicked()
+
+            start_recording.assert_not_called()
+            warning.assert_called_once()
+            assert widget.current_status == widget.RecordingStatus.STOPPED
+            assert widget._recording_application_target is None
+
+    @pytest.mark.timeout(60)
+    def test_model_loaded_revalidates_and_does_not_start_invalid_source(self, qtbot):
+        target = _application_audio_target()
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "list_windows_application_audio_targets",
+            return_value=[],
+        ), patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "validate_windows_application_audio_target",
+            return_value=False,
+        ), patch(
+            "buzz.widgets.recording_transcriber_widget.WindowsProcessAudioSource"
+        ) as source_class, patch(
+            "buzz.widgets.recording_transcriber_widget.RecordingTranscriber"
+        ) as transcriber_class, patch(
+            "buzz.widgets.recording_transcriber_widget.QThread"
+        ) as thread_class, patch(
+            "buzz.widgets.recording_transcriber_widget.QMessageBox.warning"
+        ):
+            _select_application_audio(widget)
+            widget._recording_application_target = target
+            widget.current_status = widget.RecordingStatus.RECORDING
+
+            widget.on_model_loaded("/fake/model")
+
+            source_class.assert_not_called()
+            transcriber_class.assert_not_called()
+            thread_class.assert_not_called()
+            assert widget.current_status == widget.RecordingStatus.STOPPED
+            assert widget.model_loader is None
+
+    @pytest.mark.timeout(60)
+    def test_target_disappearing_during_scheduled_download_never_starts_capture(
+        self, qtbot
+    ):
+        target = _application_audio_target()
+        loader = MagicMock()
+        loader.signals = SimpleNamespace(
+            progress=MagicMock(),
+            error=MagicMock(),
+            finished=MagicMock(),
+        )
+        thread_pool = MagicMock()
+
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "list_windows_application_audio_targets",
+            side_effect=[[target], []],
+        ), patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "validate_windows_application_audio_target",
+            side_effect=[True, False],
+        ) as validate_target, patch(
+            "buzz.widgets.recording_transcriber_widget.ModelDownloader",
+            return_value=loader,
+        ) as downloader_class, patch(
+            "buzz.widgets.recording_transcriber_widget.QThreadPool"
+        ) as thread_pool_class, patch(
+            "buzz.model_loader.TranscriptionModel.get_local_model_path",
+            return_value=None,
+        ), patch(
+            "buzz.widgets.recording_transcriber_widget.WindowsProcessAudioSource"
+        ) as source_class, patch(
+            "buzz.widgets.recording_transcriber_widget.RecordingTranscriber"
+        ) as transcriber_class, patch(
+            "buzz.widgets.recording_transcriber_widget.QThread"
+        ) as transcription_thread_class, patch(
+            "buzz.widgets.recording_transcriber_widget.QMessageBox.warning"
+        ):
+            thread_pool_class.return_value.globalInstance.return_value = thread_pool
+            _select_application_audio(widget)
+            widget.application_audio_target_combo_box.setCurrentIndex(1)
+
+            widget.on_record_button_clicked()
+
+            downloader_class.assert_called_once_with(
+                model=widget.transcription_options.model
+            )
+            thread_pool.start.assert_called_once_with(loader)
+            assert widget.model_loader is loader
+            assert widget.current_status == widget.RecordingStatus.RECORDING
+
+            finished_callback = loader.signals.finished.connect.call_args.args[0]
+            finished_callback("/fake/model")
+
+            assert validate_target.call_args_list == [call(target), call(target)]
+            source_class.assert_not_called()
+            transcriber_class.assert_not_called()
+            transcription_thread_class.assert_not_called()
+            assert widget.transcription_thread is None
+            assert widget.model_loader is None
+            assert widget.current_status == widget.RecordingStatus.STOPPED
+            assert widget._recording_application_target is None
+            assert not widget.record_button.isEnabled()
+
+    @pytest.mark.timeout(60)
+    def test_valid_target_injects_exact_capture_pid_process_source(self, qtbot):
+        target = _application_audio_target(capture_pid=4242)
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "list_windows_application_audio_targets",
+            return_value=[target],
+        ), patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "validate_windows_application_audio_target",
+            return_value=True,
+        ), patch(
+            "buzz.widgets.recording_transcriber_widget.WindowsProcessAudioSource"
+        ) as source_class, patch(
+            "buzz.widgets.recording_transcriber_widget.RecordingTranscriber"
+        ) as transcriber_class, patch(
+            "buzz.widgets.recording_transcriber_widget.QThread"
+        ):
+            source = MagicMock(sample_rate=16_000)
+            source_class.return_value = source
+            widget.transcription_options.enable_llm_translation = False
+            _select_application_audio(widget)
+            widget.application_audio_target_combo_box.setCurrentIndex(1)
+            widget._recording_application_target = target
+
+            widget.on_model_loaded("/fake/model")
+
+            source_class.assert_called_once_with(process_id=4242)
+            kwargs = transcriber_class.call_args.kwargs
+            assert kwargs["audio_source"] is source
+            assert kwargs["input_device_index"] is None
+            assert kwargs["sample_rate"] == 16_000
+
+    @pytest.mark.timeout(60)
+    def test_recording_disables_application_controls_and_stop_restores_them(
+        self, qtbot
+    ):
+        target = _application_audio_target()
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "list_windows_application_audio_targets",
+            return_value=[target],
+        ), patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "validate_windows_application_audio_target",
+            return_value=True,
+        ), patch.object(widget, "start_recording"):
+            _select_application_audio(widget)
+            widget.application_audio_target_combo_box.setCurrentIndex(1)
+
+            widget.on_record_button_clicked()
+
+            assert not widget.audio_source_combo_box.isEnabled()
+            assert not widget.application_audio_target_combo_box.isEnabled()
+            assert not widget.application_audio_refresh_button.isEnabled()
+
+            widget.set_recording_status_stopped()
+            assert widget.audio_source_combo_box.isEnabled()
+            assert widget.application_audio_target_combo_box.isEnabled()
+            assert widget.application_audio_refresh_button.isEnabled()
+
+    @pytest.mark.timeout(60)
+    def test_refresh_is_ignored_while_recording(self, qtbot):
+        target = _application_audio_target()
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "list_windows_application_audio_targets",
+            return_value=[target],
+        ) as list_targets:
+            _select_application_audio(widget)
+            list_targets.reset_mock()
+            widget.current_status = widget.RecordingStatus.RECORDING
+
+            assert not widget.refresh_application_audio_targets()
+            list_targets.assert_not_called()
+
+    @pytest.mark.timeout(60)
+    def test_application_finish_and_error_do_not_restart_mic_preview(self, qtbot):
+        with _widget_ctx(qtbot) as widget, patch(
+            "buzz.widgets.recording_transcriber_widget."
+            "list_windows_application_audio_targets",
+            return_value=[],
+        ):
+            _select_application_audio(widget)
+            with patch(
+                "buzz.widgets.recording_transcriber_widget.RecordingAmplitudeListener"
+            ) as listener_class, patch(
+                "buzz.widgets.recording_transcriber_widget.QMessageBox.critical"
+            ):
+                widget.on_transcriber_finished()
+                widget.on_transcriber_error("device invalidated")
+
+            listener_class.assert_not_called()
+            assert widget.recording_amplitude_listener is None
+            assert not widget.audio_meter_widget.isEnabled()
 
 
 
