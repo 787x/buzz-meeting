@@ -38,6 +38,13 @@ from buzz.model_loader import (
 )
 from buzz.store.keyring_store import get_password, Key
 from buzz.recording import RecordingAmplitudeListener
+from buzz.audio_capture.windows_application_targets import (
+    WindowsApplicationAudioTarget,
+    WindowsApplicationTargetError,
+    list_windows_application_audio_targets,
+    validate_windows_application_audio_target,
+)
+from buzz.audio_capture.windows_process_source import WindowsProcessAudioSource
 from buzz.audio_capture.windows_system_source import WindowsSystemAudioSource
 from buzz.settings.settings import Settings
 from buzz.settings.recording_transcriber_mode import RecordingTranscriberMode
@@ -53,6 +60,9 @@ from buzz.transcriber.transcriber import (
 from buzz.translator import Translator
 from buzz.widgets.audio_devices_combo_box import AudioDevicesComboBox
 from buzz.widgets.audio_meter_widget import AudioMeterWidget
+from buzz.widgets.application_audio_target_combo_box import (
+    ApplicationAudioTargetComboBox,
+)
 from buzz.widgets.model_download_progress_dialog import ModelDownloadProgressDialog
 from buzz.widgets.record_button import RecordButton
 from buzz.widgets.text_display_box import TextDisplayBox
@@ -64,6 +74,22 @@ from buzz.widgets.icon import NewWindowIcon, FullscreenIcon, ColorBackgroundIcon
 
 REAL_CHARS_REGEX = re.compile(r'\w')
 NO_SPACE_BETWEEN_SENTENCES = re.compile(r'([.!?。！？])([A-Z])')
+
+
+def _is_application_audio_supported(
+    *,
+    platform_name: str | None = None,
+    windows_build: int | None = None,
+) -> bool:
+    selected_platform = platform_name or sys.platform
+    if selected_platform != "win32":
+        return False
+    if windows_build is None:
+        try:
+            windows_build = sys.getwindowsversion().build
+        except AttributeError:
+            return False
+    return windows_build >= WindowsProcessAudioSource.MIN_WINDOWS_BUILD
 
 
 class RecordingTranscriberWidget(QWidget):
@@ -86,6 +112,7 @@ class RecordingTranscriberWidget(QWidget):
     class AudioSourceType(enum.Enum):
         MICROPHONE = "microphone"
         SYSTEM_AUDIO = "system_audio"
+        APPLICATION_AUDIO = "application_audio"
 
     def __init__(
         self,
@@ -115,6 +142,8 @@ class RecordingTranscriberWidget(QWidget):
         self.incremental_transcript = IncrementalTranscript()
         self._current_provisional_text = ""
         self._provisional_start_position = 0
+        self._application_targets_loaded = False
+        self._recording_application_target: WindowsApplicationAudioTarget | None = None
         self.current_status = self.RecordingStatus.STOPPED
         self.setWindowTitle(_("Live Recording"))
 
@@ -198,8 +227,43 @@ class RecordingTranscriberWidget(QWidget):
             self.audio_source_combo_box.addItem(
                 _("System audio"), self.AudioSourceType.SYSTEM_AUDIO
             )
+            if _is_application_audio_supported():
+                self.audio_source_combo_box.addItem(
+                    _("Application audio"), self.AudioSourceType.APPLICATION_AUDIO
+                )
+                application_index = self.audio_source_combo_box.count() - 1
+                self.audio_source_combo_box.setItemData(
+                    application_index,
+                    _(
+                        "Captures audio from the selected application. Some "
+                        "multi-process apps may include audio from other windows "
+                        "of the same application."
+                    ),
+                    Qt.ItemDataRole.ToolTipRole,
+                )
         self.audio_source_combo_box.currentIndexChanged.connect(
             self.on_audio_source_changed
+        )
+
+        self.application_audio_target_combo_box = ApplicationAudioTargetComboBox(self)
+        self.application_audio_target_combo_box.currentIndexChanged.connect(
+            self.on_application_audio_target_changed
+        )
+        self.application_audio_refresh_button = QPushButton(_("Refresh"), self)
+        self.application_audio_refresh_button.clicked.connect(
+            self.on_refresh_application_audio_targets_clicked
+        )
+
+        self.application_audio_target_widget = QWidget(self)
+        application_audio_target_layout = QHBoxLayout(
+            self.application_audio_target_widget
+        )
+        application_audio_target_layout.setContentsMargins(0, 0, 0, 0)
+        application_audio_target_layout.addWidget(
+            self.application_audio_target_combo_box, stretch=1
+        )
+        application_audio_target_layout.addWidget(
+            self.application_audio_refresh_button
         )
 
         self.audio_devices_combo_box = AudioDevicesComboBox(self)
@@ -238,6 +302,7 @@ class RecordingTranscriberWidget(QWidget):
         self.microphone_label = QLabel(_("Microphone:"))
         self.system_output_label = QLabel(_("Output:"))
         self.default_system_output_label = QLabel(_("Default system output"))
+        self.application_audio_target_label = QLabel(_("Application:"))
 
     def _build_layout(self) -> None:
         layout = QVBoxLayout(self)
@@ -249,6 +314,10 @@ class RecordingTranscriberWidget(QWidget):
         recording_options_layout.addRow(self.microphone_label, self.audio_devices_combo_box)
         recording_options_layout.addRow(
             self.system_output_label, self.default_system_output_label
+        )
+        recording_options_layout.addRow(
+            self.application_audio_target_label,
+            self.application_audio_target_widget,
         )
 
         if sys.platform != "win32":
@@ -602,6 +671,12 @@ class RecordingTranscriberWidget(QWidget):
                 and self.transcription_options.model.hugging_face_model_id == ""):
             button_enabled = False
 
+        if (
+            self.is_application_audio_selected()
+            and self.application_audio_target_combo_box.selected_target is None
+        ):
+            button_enabled = False
+
         self.record_button.setEnabled(button_enabled)
 
     def on_device_changed(self, device_id: int):
@@ -614,25 +689,88 @@ class RecordingTranscriberWidget(QWidget):
             == self.AudioSourceType.SYSTEM_AUDIO
         )
 
+    def is_application_audio_selected(self) -> bool:
+        return (
+            self.audio_source_combo_box.currentData()
+            == self.AudioSourceType.APPLICATION_AUDIO
+        )
+
+    def is_microphone_selected(self) -> bool:
+        return (
+            self.audio_source_combo_box.currentData()
+            == self.AudioSourceType.MICROPHONE
+        )
+
     def on_audio_source_changed(self, _index: int) -> None:
         self._stop_recording_amplitude_listener()
         self.audio_meter_widget.reset_amplitude()
         self._update_audio_source_controls()
-        if not self.is_system_audio_selected():
+        if self.is_application_audio_selected() and not self._application_targets_loaded:
+            self.refresh_application_audio_targets()
+        if self.is_microphone_selected():
             self.reset_recording_amplitude_listener()
+        self.reset_transcriber_controls()
+
+    def on_application_audio_target_changed(self, _index: int) -> None:
+        self.reset_transcriber_controls()
+
+    def on_refresh_application_audio_targets_clicked(self) -> None:
+        self.refresh_application_audio_targets()
+
+    def refresh_application_audio_targets(
+        self,
+        *,
+        force: bool = False,
+        show_error: bool = True,
+    ) -> bool:
+        if not force and self.current_status != self.RecordingStatus.STOPPED:
+            return False
+
+        self._application_targets_loaded = True
+        try:
+            targets = list_windows_application_audio_targets()
+        except WindowsApplicationTargetError:
+            self.application_audio_target_combo_box.set_refresh_error()
+            if show_error:
+                QMessageBox.warning(
+                    self,
+                    "",
+                    _("Unable to refresh applications. Please try again."),
+                )
+            self.reset_transcriber_controls()
+            return False
+
+        self.application_audio_target_combo_box.set_targets(
+            targets, preserve_selection=True
+        )
+        self.reset_transcriber_controls()
+        return True
 
     def _update_audio_source_controls(self) -> None:
         system_audio = self.is_system_audio_selected()
+        application_audio = self.is_application_audio_selected()
+        microphone = self.is_microphone_selected()
         stopped = self.current_status == self.RecordingStatus.STOPPED
-        self.microphone_label.setVisible(not system_audio)
-        self.audio_devices_combo_box.setVisible(not system_audio)
+        self.microphone_label.setVisible(microphone)
+        self.audio_devices_combo_box.setVisible(microphone)
         self.system_output_label.setVisible(system_audio)
         self.default_system_output_label.setVisible(system_audio)
-        self.audio_devices_combo_box.setEnabled(stopped and not system_audio)
-        self.microphone_label.setEnabled(stopped and not system_audio)
+        self.application_audio_target_label.setVisible(application_audio)
+        self.application_audio_target_widget.setVisible(application_audio)
+        self.audio_devices_combo_box.setEnabled(stopped and microphone)
+        self.microphone_label.setEnabled(stopped and microphone)
         self.system_output_label.setEnabled(stopped and system_audio)
         self.default_system_output_label.setEnabled(stopped and system_audio)
-        self.audio_meter_widget.setEnabled(not system_audio or not stopped)
+        self.application_audio_target_label.setEnabled(
+            stopped and application_audio
+        )
+        self.application_audio_target_combo_box.setEnabled(
+            stopped and application_audio
+        )
+        self.application_audio_refresh_button.setEnabled(
+            stopped and application_audio
+        )
+        self.audio_meter_widget.setEnabled(not stopped or microphone)
 
     def _stop_recording_amplitude_listener(self) -> None:
         listener = self.recording_amplitude_listener
@@ -655,7 +793,7 @@ class RecordingTranscriberWidget(QWidget):
     def reset_recording_amplitude_listener(self):
         self._stop_recording_amplitude_listener()
 
-        if self.is_system_audio_selected():
+        if not self.is_microphone_selected():
             self.audio_meter_widget.reset_amplitude()
             self.audio_meter_widget.setEnabled(False)
             return
@@ -685,12 +823,23 @@ class RecordingTranscriberWidget(QWidget):
 
     def on_record_button_clicked(self):
         if self.current_status == self.RecordingStatus.STOPPED:
+            if self.is_application_audio_selected():
+                target = self.application_audio_target_combo_box.selected_target
+                if target is None:
+                    self.reset_transcriber_controls()
+                    return
+                if not self._is_application_audio_target_valid(target):
+                    self._handle_invalid_application_audio_target()
+                    return
+                self._recording_application_target = target
+            else:
+                self._recording_application_target = None
+
             # Stop amplitude listener and disconnect its signal before resetting
             # to prevent queued amplitude events from overriding the reset
             self._stop_recording_amplitude_listener()
             self.audio_meter_widget.reset_amplitude()
             self.audio_meter_widget.setEnabled(True)
-            self.start_recording()
             self.current_status = self.RecordingStatus.RECORDING
             self.record_button.set_recording()
             self.transcription_options_group_box.setEnabled(False)
@@ -699,11 +848,33 @@ class RecordingTranscriberWidget(QWidget):
             self._update_audio_source_controls()
             self.presentation_options_bar.show()
             self.copy_actions_bar.hide()
+            self.start_recording()
 
         else:  # RecordingStatus.RECORDING
             self.stop_recording()
             self.set_recording_status_stopped()
             self.presentation_options_bar.hide()
+
+    @staticmethod
+    def _is_application_audio_target_valid(
+        target: WindowsApplicationAudioTarget,
+    ) -> bool:
+        try:
+            return validate_windows_application_audio_target(target)
+        except WindowsApplicationTargetError:
+            return False
+
+    def _handle_invalid_application_audio_target(self) -> None:
+        self.refresh_application_audio_targets(force=True, show_error=False)
+        QMessageBox.warning(
+            self,
+            "",
+            _(
+                "The selected application is no longer available. Refresh the "
+                "application list and try again."
+            ),
+        )
+        self.reset_transcriber_controls()
 
     def start_recording(self):
         self.record_button.setDisabled(True)
@@ -741,8 +912,18 @@ class RecordingTranscriberWidget(QWidget):
         QThreadPool().globalInstance().start(self.model_loader)
 
     def on_model_loaded(self, model_path: str):
-        self.reset_recording_controls()
         self.model_loader = None
+
+        if self.is_application_audio_selected():
+            target = self._recording_application_target
+            if target is None or not self._is_application_audio_target_valid(target):
+                self.reset_model_download()
+                self._handle_invalid_application_audio_target()
+                self.set_recording_status_stopped()
+                self.reset_recording_amplitude_listener()
+                return
+
+        self.reset_recording_controls()
 
         if model_path == "" and self.transcription_options.model.model_type != ModelType.OPEN_AI_WHISPER_API:
             self.on_transcriber_error("")
@@ -758,6 +939,16 @@ class RecordingTranscriberWidget(QWidget):
         }
         if self.is_system_audio_selected():
             audio_source = WindowsSystemAudioSource()
+            transcriber_kwargs.update(
+                input_device_index=None,
+                sample_rate=audio_source.sample_rate,
+                audio_source=audio_source,
+            )
+        elif self.is_application_audio_selected():
+            target = self._recording_application_target
+            if target is None:
+                raise RuntimeError("Application audio target was not validated")
+            audio_source = WindowsProcessAudioSource(process_id=target.capture_pid)
             transcriber_kwargs.update(
                 input_device_index=None,
                 sample_rate=audio_source.sample_rate,
@@ -852,12 +1043,13 @@ class RecordingTranscriberWidget(QWidget):
 
     def set_recording_status_stopped(self):
         self.record_button.set_stopped()
-        self.record_button.setEnabled(True)
         self.current_status = self.RecordingStatus.STOPPED
+        self._recording_application_target = None
         self.transcription_options_group_box.setEnabled(True)
         self.audio_source_combo_box.setEnabled(True)
         self.audio_source_label.setEnabled(True)
         self._update_audio_source_controls()
+        self.reset_transcriber_controls()
         self.presentation_options_bar.hide()
         self.copy_actions_bar.show() #added this here
 
@@ -867,7 +1059,7 @@ class RecordingTranscriberWidget(QWidget):
         self.stop_recording()
         self.set_recording_status_stopped()
         self.reset_recording_amplitude_listener()
-        self.record_button.setDisabled(False)
+        self.reset_transcriber_controls()
 
     @staticmethod
     def strip_newlines(text):
@@ -1289,7 +1481,7 @@ class RecordingTranscriberWidget(QWidget):
         self.reset_model_download()
         self.set_recording_status_stopped()
         self.reset_recording_amplitude_listener()
-        self.record_button.setDisabled(False)
+        self.reset_transcriber_controls()
 
     def reset_model_download(self):
         if self.model_download_progress_dialog is not None:
@@ -1306,7 +1498,10 @@ class RecordingTranscriberWidget(QWidget):
         self.reset_model_download()
 
     def reset_record_button(self):
-        self.record_button.setEnabled(True)
+        if self.current_status == self.RecordingStatus.RECORDING:
+            self.record_button.setEnabled(True)
+        else:
+            self.reset_transcriber_controls()
 
     def on_recording_amplitude_changed(self, amplitude: float):
         self.audio_meter_widget.update_amplitude(amplitude)
