@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 from threading import Thread
+from types import SimpleNamespace
 from typing import List
 from unittest.mock import Mock
 
@@ -27,6 +28,7 @@ from buzz.transcriber.transcriber import (
     Segment,
 )
 from buzz.transcriber.whisper_file_transcriber import (
+    DetailedWhisperFileTranscriber,
     WhisperFileTranscriber,
     check_file_has_audio_stream,
     terminate_child_processes,
@@ -145,9 +147,9 @@ class TestTerminateChildProcesses:
         terminate_child_processes(worker.pid)
 
         # The grandchild must be gone...
-        assert _wait_until(lambda: _is_dead_or_zombie(grandchild_proc)), (
-            "whisper-cli stand-in subprocess was orphaned instead of killed"
-        )
+        assert _wait_until(
+            lambda: _is_dead_or_zombie(grandchild_proc)
+        ), "whisper-cli stand-in subprocess was orphaned instead of killed"
 
         # ...and the worker must still be reapable via multiprocessing (i.e.
         # terminate_child_processes must not have stolen its waitpid()).
@@ -525,9 +527,9 @@ class TestWhisperFileTranscriber:
             except psutil.NoSuchProcess:
                 return False
 
-        assert _wait_until(worker_tree_is_up, timeout=60), (
-            "whisper.cpp worker/subprocess did not start"
-        )
+        assert _wait_until(
+            worker_tree_is_up, timeout=60
+        ), "whisper.cpp worker/subprocess did not start"
 
         worker_pid = transcriber.current_process.pid
         worker_proc = psutil.Process(worker_pid)
@@ -538,13 +540,15 @@ class TestWhisperFileTranscriber:
 
         # run() must return promptly and the whole process tree must be gone.
         run_thread.join(timeout=30)
-        assert not run_thread.is_alive(), "transcriber.run() did not return after stop()"
+        assert (
+            not run_thread.is_alive()
+        ), "transcriber.run() did not return after stop()"
 
         assert _wait_until(lambda: _is_dead_or_zombie(worker_proc))
         for child in descendants:
-            assert _wait_until(lambda child=child: _is_dead_or_zombie(child)), (
-                f"whisper-cli subprocess {child.pid} still running after stop()"
-            )
+            assert _wait_until(
+                lambda child=child: _is_dead_or_zombie(child)
+            ), f"whisper-cli subprocess {child.pid} still running after stop()"
 
         # Assert that file was not created
         assert os.path.isfile(output_file_path) is False
@@ -560,10 +564,228 @@ class TestTranscribeFasterWhisper:
                     whisper_model_size=WhisperModelSize.TINY,
                 )
             ),
-            file_transcription_options=FileTranscriptionOptions(file_paths=[test_audio_path]),
+            file_transcription_options=FileTranscriptionOptions(
+                file_paths=[test_audio_path]
+            ),
             file_path=test_audio_path,
         )
         with pytest.raises(FileNotFoundError, match="BUZZ_MODEL_ROOT"):
             WhisperFileTranscriber.transcribe_faster_whisper(task)
 
         time.sleep(3)
+
+
+def _detailed_task(
+    model_type: ModelType, *, word_level_timings: bool = True
+) -> FileTranscriptionTask:
+    return FileTranscriptionTask(
+        model_path="local-model",
+        transcription_options=TranscriptionOptions(
+            language="zh",
+            task=Task.TRANSCRIBE,
+            word_level_timings=word_level_timings,
+            initial_prompt="",
+            model=TranscriptionModel(
+                model_type=model_type,
+                whisper_model_size=WhisperModelSize.SMALL,
+            ),
+        ),
+        file_transcription_options=FileTranscriptionOptions(output_formats=set()),
+        file_path="meeting.wav",
+    )
+
+
+class TestDetailedWhisperResult:
+    def test_openai_whisper_preserves_native_phrase_and_words_one_inference(
+        self, monkeypatch
+    ) -> None:
+        raw_result = SimpleNamespace(
+            segments=[
+                SimpleNamespace(
+                    start=1.0,
+                    end=2.5,
+                    text=" phrase text ",
+                    words=[
+                        SimpleNamespace(start=1.0, end=1.4, word=" first "),
+                        SimpleNamespace(start=1.3, end=1.8, word=" second "),
+                        SimpleNamespace(start=1.8, end=1.9, word="   "),
+                    ],
+                )
+            ]
+        )
+        model = Mock()
+        model.transcribe.return_value = raw_result
+        monkeypatch.setattr(
+            WhisperFileTranscriber,
+            "_load_openai_whisper_model",
+            Mock(return_value=model),
+        )
+        modify_model = Mock()
+        monkeypatch.setattr(
+            "buzz.transcriber.whisper_file_transcriber.stable_whisper.modify_model",
+            modify_model,
+        )
+        monkeypatch.setattr(
+            "buzz.transcriber.whisper_file_transcriber.whisper_audio.load_audio",
+            Mock(return_value="pcm"),
+        )
+
+        result = WhisperFileTranscriber.transcribe_openai_whisper_detailed(
+            _detailed_task(ModelType.WHISPER)
+        )
+
+        assert model.transcribe.call_count == 1
+        assert len(result.segments) == 1
+        assert result.segments[0].text == " phrase text "
+        assert [word.text for word in result.words] == ["first", "second"]
+        assert [word.source_segment_ordinal for word in result.words] == [0, 0]
+        assert (result.words[1].start_ms, result.words[1].end_ms) == (1300, 1800)
+        options = model.transcribe.call_args.kwargs
+        assert options["temperature"] == (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+        assert options["beam_size"] == 5
+        assert options["best_of"] == 5
+        assert options["patience"] == 1.0
+        modify_model.assert_called_once_with(model)
+
+    def test_faster_preserves_native_phrase_and_words_one_inference(
+        self, monkeypatch
+    ) -> None:
+        raw_segment = SimpleNamespace(
+            start=0.5,
+            end=2.0,
+            text=" native phrase ",
+            words=(
+                SimpleNamespace(start=0.5, end=1.0, word=" one "),
+                SimpleNamespace(start=0.9, end=1.4, word=" two "),
+            ),
+        )
+        pipeline = Mock()
+        pipeline.transcribe.return_value = (iter((raw_segment,)), SimpleNamespace())
+        monkeypatch.setattr(
+            "buzz.transcriber.whisper_file_transcriber.faster_whisper.WhisperModel",
+            Mock(return_value=Mock()),
+        )
+        monkeypatch.setattr(
+            "buzz.transcriber.whisper_file_transcriber.faster_whisper.BatchedInferencePipeline",
+            Mock(return_value=pipeline),
+        )
+        monkeypatch.setattr(
+            "buzz.transcriber.whisper_file_transcriber.whisper_audio.load_audio",
+            Mock(return_value="pcm"),
+        )
+        monkeypatch.setattr(
+            "buzz.transcriber.whisper_file_transcriber.torch.cuda.is_available",
+            Mock(return_value=False),
+        )
+
+        result = WhisperFileTranscriber.transcribe_faster_whisper_detailed(
+            _detailed_task(ModelType.FASTER_WHISPER)
+        )
+
+        assert pipeline.transcribe.call_count == 1
+        assert len(result.segments) == 1
+        assert result.segments[0].text == " native phrase "
+        assert [word.text for word in result.words] == ["one", "two"]
+        assert result.words[0].source_segment_ordinal == 0
+        options = pipeline.transcribe.call_args.kwargs
+        assert options["word_timestamps"] is True
+        assert options["temperature"] == 0.0
+        assert options["beam_size"] == 5
+        assert options["best_of"] == 5
+        assert options["patience"] == 1.0
+
+    def test_ordinary_openai_word_path_keeps_v1_options(self, monkeypatch) -> None:
+        raw_result = SimpleNamespace(
+            segments=[
+                SimpleNamespace(
+                    words=[SimpleNamespace(start=0.0, end=0.5, word=" word ")]
+                )
+            ]
+        )
+        model = Mock()
+        model.transcribe.return_value = raw_result
+        monkeypatch.setattr(
+            WhisperFileTranscriber,
+            "_load_openai_whisper_model",
+            Mock(return_value=model),
+        )
+        monkeypatch.setattr(
+            "buzz.transcriber.whisper_file_transcriber.stable_whisper.modify_model",
+            Mock(),
+        )
+        monkeypatch.setattr(
+            "buzz.transcriber.whisper_file_transcriber.whisper_audio.load_audio",
+            Mock(return_value="pcm"),
+        )
+
+        segments = WhisperFileTranscriber.transcribe_openai_whisper(
+            _detailed_task(ModelType.WHISPER)
+        )
+
+        assert [segment.text for segment in segments] == ["word"]
+        options = model.transcribe.call_args.kwargs
+        assert "beam_size" not in options
+        assert "best_of" not in options
+        assert "patience" not in options
+
+    def test_ordinary_faster_path_keeps_v1_options(self, monkeypatch) -> None:
+        raw_segment = SimpleNamespace(
+            start=0.0,
+            end=1.0,
+            text="phrase",
+            words=None,
+        )
+        pipeline = Mock()
+        pipeline.transcribe.return_value = (iter((raw_segment,)), SimpleNamespace())
+        monkeypatch.setattr(
+            "buzz.transcriber.whisper_file_transcriber.faster_whisper.WhisperModel",
+            Mock(return_value=Mock()),
+        )
+        monkeypatch.setattr(
+            "buzz.transcriber.whisper_file_transcriber.faster_whisper.BatchedInferencePipeline",
+            Mock(return_value=pipeline),
+        )
+        monkeypatch.setattr(
+            "buzz.transcriber.whisper_file_transcriber.whisper_audio.load_audio",
+            Mock(return_value="pcm"),
+        )
+        monkeypatch.setattr(
+            "buzz.transcriber.whisper_file_transcriber.torch.cuda.is_available",
+            Mock(return_value=False),
+        )
+        monkeypatch.setattr(
+            "buzz.transcriber.whisper_file_transcriber.platform.system",
+            Mock(return_value="Windows"),
+        )
+
+        segments = WhisperFileTranscriber.transcribe_faster_whisper(
+            _detailed_task(
+                ModelType.FASTER_WHISPER,
+                word_level_timings=False,
+            )
+        )
+
+        assert [segment.text for segment in segments] == ["phrase"]
+        options = pipeline.transcribe.call_args.kwargs
+        assert options["temperature"] == 0
+        assert options["word_timestamps"] is False
+        assert "beam_size" not in options
+        assert "best_of" not in options
+        assert "patience" not in options
+
+    def test_detailed_worker_rejects_non_v2_backend(self, monkeypatch) -> None:
+        messages: list[str] = []
+        connection = Mock()
+        connection.send.side_effect = messages.append
+        monkeypatch.setattr(
+            "buzz.transcriber.whisper_file_transcriber.check_file_has_audio_stream",
+            Mock(),
+        )
+
+        task = _detailed_task(ModelType.WHISPER_CPP)
+        with pytest.raises(Exception, match="does not support"):
+            DetailedWhisperFileTranscriber._transcribe_whisper_worker(
+                connection, task, detailed=True
+            )
+
+        assert any(message.startswith("error = ") for message in messages)

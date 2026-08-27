@@ -3,14 +3,24 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PyQt6.QtCore import QCoreApplication
 
 from buzz.meeting.final_transcription import (
     FinalTranscriptionConfig,
+    TrackTranscriptionResult,
 )
 from buzz.meeting.meeting_transcriber_adapter import MeetingTrackTranscriber
+from buzz.model_loader import ModelType, TranscriptionModel, WhisperModelSize
+from buzz.transcriber.transcriber import (
+    DEFAULT_WHISPER_TEMPERATURE,
+    FileTranscriptionTask,
+    Segment,
+    Task,
+)
+from buzz.transcriber.whisper_file_transcriber import DetailedTranscriptionWord
 
 
 @pytest.fixture(scope="module")
@@ -145,3 +155,78 @@ class TestTaskConstruction:
         assert config.whisper_model_size == "SMALL"
         # These are the v1 fixed values the adapter applies
         # (verified by code inspection of meeting_transcriber_adapter.py)
+
+    @staticmethod
+    def _model(model_type: ModelType) -> TranscriptionModel:
+        return TranscriptionModel(
+            model_type=model_type,
+            whisper_model_size=WhisperModelSize.SMALL,
+        )
+
+    @pytest.mark.parametrize("profile_version,word_timings", [(1, False), (2, True)])
+    def test_build_task_freezes_profile_options(
+        self, profile_version: int, word_timings: bool
+    ) -> None:
+        config = FinalTranscriptionConfig(
+            profile_version=profile_version,
+            model_type="FASTER_WHISPER",
+            whisper_model_size="SMALL",
+            language="zh",
+        )
+        task = MeetingTrackTranscriber._build_task(
+            "meeting.wav",
+            config,
+            self._model(ModelType.FASTER_WHISPER),
+            "local-model",
+        )
+
+        options = task.transcription_options
+        assert options.language == "zh"
+        assert options.task is Task.TRANSCRIBE
+        assert options.word_level_timings is word_timings
+        assert options.extract_speech is False
+        assert options.temperature == DEFAULT_WHISPER_TEMPERATURE
+        assert options.initial_prompt == ""
+        assert options.enable_llm_translation is False
+        assert task.file_transcription_options.output_formats == set()
+        assert task.source is FileTranscriptionTask.Source.FILE_IMPORT
+        assert task.delete_source_file is False
+        assert task.model_path == "local-model"
+
+
+class TestRichResultConversion:
+    def test_v1_emits_list_to_track_completed(self, qt_application) -> None:
+        adapter = MeetingTrackTranscriber()
+        emitted: list = []
+        adapter.track_completed.connect(emitted.append)
+        adapter._active_profile_version = 1
+
+        adapter._on_completed([Segment(start=0, end=1000, text="phrase")])
+
+        assert len(emitted) == 1
+        assert isinstance(emitted[0], list)
+        assert emitted[0][0].text == "phrase"
+
+    def test_v2_emits_result_to_track_rich_completed(self, qt_application) -> None:
+        adapter = MeetingTrackTranscriber()
+        emitted: list[TrackTranscriptionResult] = []
+        adapter.track_rich_completed.connect(emitted.append)
+        adapter._active_profile_version = 2
+        adapter._transcriber = SimpleNamespace(
+            detailed_words=[
+                DetailedTranscriptionWord(
+                    source_segment_ordinal=0,
+                    start_ms=10,
+                    end_ms=200,
+                    text="word",
+                )
+            ]
+        )
+
+        adapter._on_completed([Segment(start=0, end=1000, text="phrase")])
+
+        assert len(emitted) == 1
+        assert [segment.text for segment in emitted[0].segments] == ["phrase"]
+        assert len(emitted[0].words) == 1
+        assert emitted[0].words[0].source_segment_ordinal == 0
+        assert emitted[0].words[0].text == "word"

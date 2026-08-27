@@ -14,6 +14,7 @@ from buzz.meeting.final_transcription import (
     FinalTranscriptionConfig,
     FinalTranscriptionConfigError,
     FinalTranscriptionConflictError,
+    FinalTranscriptionDecodeError,
     FinalTranscriptionEligibilityError,
     FinalTranscriptionError,
     FinalTranscriptionGeneration,
@@ -25,6 +26,9 @@ from buzz.meeting.final_transcription import (
     SegmentPersistenceRecord,
     TrackPersistenceRecord,
     TrackTranscriptionInputSegment,
+    TrackTranscriptionInputWord,
+    TrackTranscriptionResult,
+    WordPersistenceRecord,
     check_track_eligibility,
     decode_generation_status,
     decode_role,
@@ -152,6 +156,7 @@ class FakeRepository:
         self._generations: dict[str, GenerationPersistenceRecord] = {}
         self._tracks: dict[str, list[TrackPersistenceRecord]] = {}
         self._segments: dict[tuple[str, str], list[SegmentPersistenceRecord]] = {}
+        self._words: dict[tuple[str, str], list[WordPersistenceRecord]] = {}
         self._fail_complete = False
         self._fail_create = False
 
@@ -212,6 +217,17 @@ class FakeRepository:
         key = (generation_id, role)
         return tuple(self._segments.get(key, []))
 
+    def load_words(
+        self,
+        generation_id: str,
+    ) -> tuple[WordPersistenceRecord, ...]:
+        return tuple(
+            word
+            for (stored_generation_id, _), words in self._words.items()
+            if stored_generation_id == generation_id
+            for word in words
+        )
+
     def begin_track(
         self,
         generation_id: str,
@@ -243,12 +259,19 @@ class FakeRepository:
         role: str,
         segments: tuple[SegmentPersistenceRecord, ...],
         now: str,
+        words: tuple[WordPersistenceRecord, ...] = (),
     ) -> None:
         if self._fail_complete:
             raise RuntimeError("Simulated segment insert failure")
 
         key = (generation_id, role)
-        self._segments[key] = list(segments)
+        self._segments[key] = [
+            replace(segment, generation_id=generation_id, role=role)
+            for segment in segments
+        ]
+        self._words[key] = [
+            replace(word, generation_id=generation_id, role=role) for word in words
+        ]
 
         tracks = self._tracks.get(generation_id, [])
         for i, tr in enumerate(tracks):
@@ -258,6 +281,7 @@ class FakeRepository:
                     status=encode_track_status(FinalTranscriptionTrackStatus.COMPLETED),
                     time_completed=now,
                     segment_count=len(segments),
+                    word_count=len(words),
                 )
                 break
 
@@ -272,6 +296,7 @@ class FakeRepository:
     ) -> None:
         key = (generation_id, role)
         self._segments.pop(key, None)
+        self._words.pop(key, None)
 
         tracks = self._tracks.get(generation_id, [])
         for i, tr in enumerate(tracks):
@@ -282,6 +307,7 @@ class FakeRepository:
                     error_message=error_message[:4096],
                     time_completed=now,
                     segment_count=0,
+                    word_count=0,
                 )
                 break
 
@@ -335,8 +361,10 @@ class FakeRepository:
                 time_started=None,
                 time_completed=None,
                 segment_count=0,
+                word_count=0,
             )
             self._segments.pop((generation_id, tr.role), None)
+            self._words.pop((generation_id, tr.role), None)
 
         self._derive_generation_status(generation_id, now)
         gen = self._generations.get(generation_id)
@@ -380,8 +408,10 @@ class FakeRepository:
                     time_started=None,
                     time_completed=None,
                     segment_count=0,
+                    word_count=0,
                 )
                 self._segments.pop((generation_id, tr.role), None)
+                self._words.pop((generation_id, tr.role), None)
         self._derive_generation_status(generation_id, "2025-01-01T00:00:00+00:00")
 
     def _derive_generation_status(self, generation_id: str, now: str) -> None:
@@ -402,18 +432,20 @@ class FakeRepository:
 
 
 class FakeRunner:
-    """Fake TranscriptionRunner returning predefined segments."""
+    """Fake TranscriptionRunner returning predefined rich results."""
 
     def __init__(self) -> None:
-        self._results: deque[
-            tuple[TrackTranscriptionInputSegment, ...] | Exception
-        ] = deque()
+        self._results: deque[TrackTranscriptionResult | Exception] = deque()
         self._calls: list[tuple[str, int, FinalTranscriptionConfig]] = []
         self._shutdown_called = False
 
     def enqueue_result(
         self,
-        result: tuple[TrackTranscriptionInputSegment, ...] | Exception,
+        result: (
+            TrackTranscriptionResult
+            | tuple[TrackTranscriptionInputSegment, ...]
+            | Exception
+        ),
     ) -> None:
         self._results.append(result)
 
@@ -423,7 +455,7 @@ class FakeRunner:
         sample_rate: int,
         config: FinalTranscriptionConfig,
         on_progress: Optional[Callable[[float], None]] = None,
-    ) -> tuple[TrackTranscriptionInputSegment, ...]:
+    ) -> TrackTranscriptionResult:
         self._calls.append((audio_path, sample_rate, config))
         if not self._results:
             raise RuntimeError("FakeRunner: no more results enqueued")
@@ -1758,3 +1790,862 @@ class TestTimestampCodec:
 
     def test_encode_none_returns_none(self) -> None:
         assert encode_datetime(None) is None
+
+
+# ---------------------------------------------------------------------------
+# PR12 v2 rich-result contracts
+# ---------------------------------------------------------------------------
+
+
+def _v2_config(*, language: Optional[str] = None) -> FinalTranscriptionConfig:
+    return FinalTranscriptionConfig(
+        profile_version=2,
+        model_type="FASTER_WHISPER",
+        whisper_model_size="SMALL",
+        language=language,
+    )
+
+
+def _rich_result(text: str) -> TrackTranscriptionResult:
+    return TrackTranscriptionResult(
+        segments=(
+            TrackTranscriptionInputSegment(
+                start_ms=0,
+                end_ms=1000,
+                text=text,
+            ),
+        ),
+        words=(
+            TrackTranscriptionInputWord(
+                source_segment_ordinal=0,
+                start_ms=100,
+                end_ms=600,
+                text=text,
+            ),
+        ),
+    )
+
+
+def _v2_service() -> (
+    tuple[StoredMeeting, FinalTranscriptionService, FakeRepository, FakeRunner]
+):
+    meeting = _make_stored_meeting()
+    storage = FakeMeetingStorage()
+    storage.add(meeting)
+    repository = FakeRepository()
+    runner = FakeRunner()
+    return (
+        meeting,
+        FinalTranscriptionService(storage, repository, runner),
+        repository,
+        runner,
+    )
+
+
+class TestV2GenerationIdentity:
+    def test_v1_and_v2_coexist(self) -> None:
+        meeting, service, repository, runner = _v2_service()
+        runner.enqueue_result((TrackTranscriptionInputSegment(0, 1000, "v1 mic"),))
+        runner.enqueue_result((TrackTranscriptionInputSegment(0, 1000, "v1 remote"),))
+        v1 = service.request(meeting.session_id, FinalTranscriptionConfig())
+        runner.enqueue_result(_rich_result("v2 mic"))
+        runner.enqueue_result(_rich_result("v2 remote"))
+        v2 = service.request(meeting.session_id, _v2_config())
+
+        assert v1.generation_id != v2.generation_id
+        assert repository.find_generation_by_key(str(meeting.session_id), 1)
+        assert repository.find_generation_by_key(str(meeting.session_id), 2)
+
+    def test_same_v2_is_idempotent_and_different_config_conflicts(self) -> None:
+        meeting, service, _, runner = _v2_service()
+        runner.enqueue_result(_rich_result("mic"))
+        runner.enqueue_result(_rich_result("remote"))
+        config = _v2_config(language=None)
+
+        first = service.request(meeting.session_id, config)
+        second = service.request(meeting.session_id, config)
+
+        assert second.generation_id == first.generation_id
+        with pytest.raises(FinalTranscriptionConflictError):
+            service.request(meeting.session_id, _v2_config(language="zh"))
+
+
+class TestV2WordMapping:
+    def test_words_are_durable_ordered_and_keep_negative_overlap(self) -> None:
+        meeting, service, _, runner = _v2_service()
+        overlapping = TrackTranscriptionResult(
+            segments=(TrackTranscriptionInputSegment(0, 1000, "phrase"),),
+            words=(
+                TrackTranscriptionInputWord(0, 100, 600, "one"),
+                TrackTranscriptionInputWord(0, 500, 900, "two"),
+            ),
+        )
+        runner.enqueue_result(overlapping)
+        runner.enqueue_result(_rich_result("remote"))
+
+        generation = service.request(meeting.session_id, _v2_config())
+        words = service.load_words(generation.generation_id)
+
+        mic_words = [
+            word for word in words if word.source_role is MeetingTrackRole.MICROPHONE
+        ]
+        assert [word.source_word_ordinal for word in mic_words] == [0, 1]
+        assert [word.source_segment_ordinal for word in mic_words] == [0, 0]
+        assert mic_words[0].start_ns == -900_000_000
+        assert mic_words[0].end_ns > mic_words[1].start_ns
+        assert [word.text for word in mic_words] == ["one", "two"]
+
+    def test_parent_crossing_is_allowed(self) -> None:
+        meeting, service, _, runner = _v2_service()
+        crossing = TrackTranscriptionResult(
+            segments=(TrackTranscriptionInputSegment(100, 900, "phrase"),),
+            words=(TrackTranscriptionInputWord(0, 50, 950, "crossing"),),
+        )
+        runner.enqueue_result(crossing)
+        runner.enqueue_result(_rich_result("remote"))
+
+        generation = service.request(meeting.session_id, _v2_config())
+
+        assert len(service.load_words(generation.generation_id)) == 2
+
+
+class TestV2Completeness:
+    def test_empty_phrase_and_words_is_successful(self) -> None:
+        meeting, service, _, runner = _v2_service()
+        empty = TrackTranscriptionResult(segments=(), words=())
+        runner.enqueue_result(empty)
+        runner.enqueue_result(empty)
+
+        generation = service.request(meeting.session_id, _v2_config())
+        loaded = service.load_generation(generation.generation_id)
+
+        assert loaded is not None
+        assert loaded.status is FinalTranscriptionStatus.COMPLETED
+        assert service.load_words(generation.generation_id) == ()
+
+    @pytest.mark.parametrize(
+        "bad_result",
+        [
+            TrackTranscriptionResult(
+                segments=(TrackTranscriptionInputSegment(0, 100, "phrase"),),
+                words=(),
+            ),
+            TrackTranscriptionResult(
+                segments=(TrackTranscriptionInputSegment(0, 100, "phrase"),),
+                words=(TrackTranscriptionInputWord(1, 0, 100, "orphan"),),
+            ),
+            TrackTranscriptionResult(
+                segments=(TrackTranscriptionInputSegment(0, 100, "phrase"),),
+                words=(TrackTranscriptionInputWord(0, 100, 99, "bad"),),
+            ),
+        ],
+    )
+    def test_invalid_v2_result_fails_track(
+        self, bad_result: TrackTranscriptionResult
+    ) -> None:
+        meeting, service, _, runner = _v2_service()
+        runner.enqueue_result(bad_result)
+        runner.enqueue_result(_rich_result("remote"))
+
+        generation = service.request(meeting.session_id, _v2_config())
+        loaded = service.load_generation(generation.generation_id)
+
+        assert loaded is not None
+        assert loaded.status is FinalTranscriptionStatus.PARTIAL
+        assert loaded.tracks[0].status is FinalTranscriptionTrackStatus.FAILED
+
+    def test_v1_rejects_runner_words(self) -> None:
+        meeting, service, _, runner = _v2_service()
+        runner.enqueue_result(_rich_result("unexpected"))
+        runner.enqueue_result((TrackTranscriptionInputSegment(0, 100, "remote"),))
+
+        generation = service.request(meeting.session_id, FinalTranscriptionConfig())
+        loaded = service.load_generation(generation.generation_id)
+
+        assert loaded is not None
+        assert loaded.status is FinalTranscriptionStatus.PARTIAL
+        assert loaded.tracks[0].status is FinalTranscriptionTrackStatus.FAILED
+
+
+class TestV2WordCorruption:
+    @staticmethod
+    def _word(
+        generation_id: str,
+        *,
+        role: str = "MICROPHONE",
+        ordinal: int = 0,
+        segment_ordinal: int = 0,
+    ) -> WordPersistenceRecord:
+        return WordPersistenceRecord(
+            generation_id=generation_id,
+            role=role,
+            ordinal=ordinal,
+            segment_ordinal=segment_ordinal,
+            local_start_ms=0,
+            local_end_ms=100,
+            start_ns=-1_000_000_000,
+            end_ns=-900_000_000,
+            text="word",
+        )
+
+    def test_v1_word_row_is_corruption(self) -> None:
+        meeting, service, repository, runner = _v2_service()
+        runner.enqueue_result(())
+        runner.enqueue_result(())
+        generation = service.request(meeting.session_id, FinalTranscriptionConfig())
+        generation_id = str(generation.generation_id)
+        repository._words[(generation_id, "MICROPHONE")] = [self._word(generation_id)]
+
+        with pytest.raises(FinalTranscriptionDecodeError, match="version 1"):
+            service.load_words(generation.generation_id)
+
+    @pytest.mark.parametrize(
+        "role,ordinal,segment_ordinal",
+        [
+            ("UNKNOWN", 0, 0),
+            ("MICROPHONE", 2, 0),
+            ("MICROPHONE", 0, 9),
+        ],
+    )
+    def test_corrupt_role_gap_or_parent_is_rejected(
+        self, role: str, ordinal: int, segment_ordinal: int
+    ) -> None:
+        meeting, service, repository, runner = _v2_service()
+        runner.enqueue_result(_rich_result("mic"))
+        runner.enqueue_result(_rich_result("remote"))
+        generation = service.request(meeting.session_id, _v2_config())
+        generation_id = str(generation.generation_id)
+        repository._words[(generation_id, "MICROPHONE")] = [
+            self._word(
+                generation_id,
+                role=role,
+                ordinal=ordinal,
+                segment_ordinal=segment_ordinal,
+            )
+        ]
+
+        with pytest.raises(FinalTranscriptionDecodeError):
+            service.load_words(generation.generation_id)
+
+    def test_word_for_missing_generation_is_rejected(self) -> None:
+        _, service, repository, _ = _v2_service()
+        missing = uuid.uuid4()
+        repository._words[(str(missing), "MICROPHONE")] = [self._word(str(missing))]
+
+        with pytest.raises(FinalTranscriptionDecodeError, match="missing generation"):
+            service.load_words(missing)
+
+
+class TestV2RetryRecovery:
+    def test_retry_preserves_completed_role_phrase_and_words(self) -> None:
+        meeting, service, repository, runner = _v2_service()
+        runner.enqueue_result(_rich_result("mic"))
+        runner.enqueue_result(RuntimeError("remote failed"))
+        generation = service.request(meeting.session_id, _v2_config())
+        mic_words_before = tuple(
+            word
+            for word in service.load_words(generation.generation_id)
+            if word.source_role is MeetingTrackRole.MICROPHONE
+        )
+        mic_segments_before = repository.load_segments(
+            str(generation.generation_id), "MICROPHONE"
+        )
+        runner.enqueue_result(_rich_result("remote"))
+
+        service.retry(generation.generation_id)
+
+        mic_words_after = tuple(
+            word
+            for word in service.load_words(generation.generation_id)
+            if word.source_role is MeetingTrackRole.MICROPHONE
+        )
+        assert mic_words_after == mic_words_before
+        assert (
+            repository.load_segments(str(generation.generation_id), "MICROPHONE")
+            == mic_segments_before
+        )
+        assert len(runner._calls) == 3
+
+    def test_recovery_does_not_rerun_completed_v2_role(self) -> None:
+        meeting, service, repository, runner = _v2_service()
+        runner.enqueue_result(_rich_result("mic"))
+        runner.enqueue_result(RuntimeError("remote interrupted"))
+        generation = service.request(meeting.session_id, _v2_config())
+        generation_id = str(generation.generation_id)
+        mic_words_before = tuple(
+            word
+            for word in service.load_words(generation.generation_id)
+            if word.source_role is MeetingTrackRole.MICROPHONE
+        )
+        tracks = repository._tracks[generation_id]
+        for index, track in enumerate(tracks):
+            if track.role == "REMOTE":
+                tracks[index] = replace(
+                    track,
+                    status=encode_track_status(
+                        FinalTranscriptionTrackStatus.IN_PROGRESS
+                    ),
+                    time_completed=None,
+                )
+        repository._generations[generation_id] = replace(
+            repository._generations[generation_id],
+            status=encode_generation_status(FinalTranscriptionStatus.IN_PROGRESS),
+            time_completed=None,
+        )
+        recovered_runner = FakeRunner()
+        recovered_runner.enqueue_result(_rich_result("remote"))
+        recovered_service = FinalTranscriptionService(
+            service._meeting_storage, repository, recovered_runner
+        )
+
+        assert recovered_service.recover_pending() == (generation.generation_id,)
+
+        assert len(recovered_runner._calls) == 1
+        mic_words_after = tuple(
+            word
+            for word in recovered_service.load_words(generation.generation_id)
+            if word.source_role is MeetingTrackRole.MICROPHONE
+        )
+        assert mic_words_after == mic_words_before
+
+
+# ---------------------------------------------------------------------------
+# H3: Legacy v1 runner ABI compatibility
+# ---------------------------------------------------------------------------
+
+
+class TestV1LegacyRunner:
+    def test_strict_tuple_runner_completes_v1(self) -> None:
+        """A strict PR11 runner returning a raw tuple must complete v1."""
+
+        class LegacyV1Runner:
+            def transcribe_track(
+                self, audio_path, sample_rate, config, on_progress=None
+            ):
+                return (
+                    TrackTranscriptionInputSegment(
+                        start_ms=0, end_ms=1000, text="legacy phrase"
+                    ),
+                )
+
+            def shutdown(self):
+                pass
+
+        meeting = _make_stored_meeting()
+        storage = FakeMeetingStorage()
+        storage.add(meeting)
+        repo = FakeRepository()
+        service = FinalTranscriptionService(storage, repo, LegacyV1Runner())
+
+        gen = service.request(meeting.session_id, FinalTranscriptionConfig())
+        loaded = service.load_generation(gen.generation_id)
+
+        assert loaded is not None
+        assert loaded.status is FinalTranscriptionStatus.COMPLETED
+        assert service.load_words(gen.generation_id) == ()
+        mic_track = next(
+            t for t in loaded.tracks if t.role is MeetingTrackRole.MICROPHONE
+        )
+        assert mic_track.segment_count >= 1
+
+
+# ---------------------------------------------------------------------------
+# H1 / M3: v1 word_count invariant and corruption detection
+# ---------------------------------------------------------------------------
+
+
+class TestV1WordCountInvariant:
+    def test_v1_completed_has_word_count_zero(self) -> None:
+        meeting, service, repo, runner = _v2_service()
+        runner.enqueue_result(())
+        runner.enqueue_result(())
+        gen = service.request(meeting.session_id, FinalTranscriptionConfig())
+        tracks = repo.load_tracks(str(gen.generation_id))
+        for tr in tracks:
+            assert tr.word_count == 0
+
+    def test_v1_illegal_word_row_rejected_by_load_generation(self) -> None:
+        meeting, service, repo, runner = _v2_service()
+        runner.enqueue_result(())
+        runner.enqueue_result(())
+        gen = service.request(meeting.session_id, FinalTranscriptionConfig())
+        gen_id = str(gen.generation_id)
+        repo._words[(gen_id, "MICROPHONE")] = [
+            WordPersistenceRecord(
+                generation_id=gen_id,
+                role="MICROPHONE",
+                ordinal=0,
+                segment_ordinal=0,
+                local_start_ms=0,
+                local_end_ms=100,
+                start_ns=-1_000_000_000,
+                end_ns=-900_000_000,
+                text="illegal",
+            )
+        ]
+
+        with pytest.raises(FinalTranscriptionDecodeError, match="version 1"):
+            service.load_generation(gen.generation_id)
+
+    def test_v1_illegal_word_row_rejected_by_load_transcript(self) -> None:
+        meeting, service, repo, runner = _v2_service()
+        runner.enqueue_result(())
+        runner.enqueue_result(())
+        gen = service.request(meeting.session_id, FinalTranscriptionConfig())
+        gen_id = str(gen.generation_id)
+        repo._words[(gen_id, "MICROPHONE")] = [
+            WordPersistenceRecord(
+                generation_id=gen_id,
+                role="MICROPHONE",
+                ordinal=0,
+                segment_ordinal=0,
+                local_start_ms=0,
+                local_end_ms=100,
+                start_ns=-1_000_000_000,
+                end_ns=-900_000_000,
+                text="illegal",
+            )
+        ]
+
+        with pytest.raises(FinalTranscriptionDecodeError, match="version 1"):
+            service.load_transcript(gen.generation_id)
+
+    def test_v1_illegal_word_row_rejected_by_load_words(self) -> None:
+        meeting, service, repo, runner = _v2_service()
+        runner.enqueue_result(())
+        runner.enqueue_result(())
+        gen = service.request(meeting.session_id, FinalTranscriptionConfig())
+        gen_id = str(gen.generation_id)
+        repo._words[(gen_id, "MICROPHONE")] = [
+            WordPersistenceRecord(
+                generation_id=gen_id,
+                role="MICROPHONE",
+                ordinal=0,
+                segment_ordinal=0,
+                local_start_ms=0,
+                local_end_ms=100,
+                start_ns=-1_000_000_000,
+                end_ns=-900_000_000,
+                text="illegal",
+            )
+        ]
+
+        with pytest.raises(FinalTranscriptionDecodeError, match="version 1"):
+            service.load_words(gen.generation_id)
+
+
+# ---------------------------------------------------------------------------
+# H1: v2 word count corruption probes
+# ---------------------------------------------------------------------------
+
+
+class TestV2WordCountIntegrity:
+    @staticmethod
+    def _corrupt_word(
+        gen_id: str, *, ordinal: int, segment_ordinal: int = 0
+    ) -> WordPersistenceRecord:
+        return WordPersistenceRecord(
+            generation_id=gen_id,
+            role="MICROPHONE",
+            ordinal=ordinal,
+            segment_ordinal=segment_ordinal,
+            local_start_ms=0,
+            local_end_ms=100,
+            start_ns=-1_000_000_000,
+            end_ns=-900_000_000,
+            text=f"word{ordinal}",
+        )
+
+    def _create_valid_v2(self, repo) -> tuple[str, FinalTranscriptionService]:
+        """Create a valid v2 generation with 4 words on MICROPHONE."""
+        meeting = _make_stored_meeting()
+        storage = FakeMeetingStorage()
+        storage.add(meeting)
+        runner = FakeRunner()
+        service = FinalTranscriptionService(storage, repo, runner)
+
+        # 4 words all in segment 0
+        words = tuple(
+            TrackTranscriptionInputWord(
+                source_segment_ordinal=0,
+                start_ms=i * 100,
+                end_ms=(i + 1) * 100,
+                text=f"word{i}",
+            )
+            for i in range(4)
+        )
+        result = TrackTranscriptionResult(
+            segments=(TrackTranscriptionInputSegment(0, 500, "phrase"),),
+            words=words,
+        )
+        runner.enqueue_result(result)
+        runner.enqueue_result(TrackTranscriptionResult(segments=(), words=()))
+
+        gen = service.request(meeting.session_id, _v2_config())
+        gen_id = str(gen.generation_id)
+        assert service.load_generation(gen.generation_id) is not None
+        return gen_id, service
+
+    def test_tail_word_deletion_detected(self) -> None:
+        """H1: deleting last word ordinal → DecodeError."""
+        repo = FakeRepository()
+        gen_id, service = self._create_valid_v2(repo)
+        # Remove ordinal 3, leave 0,1,2
+        repo._words[(gen_id, "MICROPHONE")] = [
+            self._corrupt_word(gen_id, ordinal=o) for o in range(3)
+        ]
+        # Track still says word_count=4; clear cache to force re-validation
+        with pytest.raises(FinalTranscriptionDecodeError):
+            service.load_generation(uuid.UUID(gen_id))
+
+    def test_middle_word_deletion_detected(self) -> None:
+        """H1: deleting middle word ordinal → DecodeError."""
+        repo = FakeRepository()
+        gen_id, service = self._create_valid_v2(repo)
+        # Remove ordinal 1, leave 0,2,3
+        repo._words[(gen_id, "MICROPHONE")] = [
+            self._corrupt_word(gen_id, ordinal=o) for o in (0, 2, 3)
+        ]
+        with pytest.raises(FinalTranscriptionDecodeError):
+            service.load_generation(uuid.UUID(gen_id))
+
+    def test_extra_word_without_count_update_detected(self) -> None:
+        """H1: inserting extra word without updating word_count → DecodeError."""
+        repo = FakeRepository()
+        gen_id, service = self._create_valid_v2(repo)
+        # Add ordinal 4 without changing track.word_count
+        repo._words[(gen_id, "MICROPHONE")] = [
+            self._corrupt_word(gen_id, ordinal=o) for o in range(5)
+        ]
+        with pytest.raises(FinalTranscriptionDecodeError):
+            service.load_generation(uuid.UUID(gen_id))
+
+    def test_empty_v2_transcript_valid(self) -> None:
+        """H1: segment_count=0, word_count=0, zero phrases/words → valid."""
+        repo = FakeRepository()
+        meeting = _make_stored_meeting()
+        storage = FakeMeetingStorage()
+        storage.add(meeting)
+        runner = FakeRunner()
+        runner.enqueue_result(TrackTranscriptionResult(segments=(), words=()))
+        runner.enqueue_result(TrackTranscriptionResult(segments=(), words=()))
+        service = FinalTranscriptionService(storage, repo, runner)
+        gen = service.request(meeting.session_id, _v2_config())
+        loaded = service.load_generation(gen.generation_id)
+        assert loaded is not None
+        assert loaded.status is FinalTranscriptionStatus.COMPLETED
+        assert service.load_words(gen.generation_id) == ()
+
+
+# ---------------------------------------------------------------------------
+# H2: Per-phrase word coverage
+# ---------------------------------------------------------------------------
+
+
+class TestV2PhraseCoverage:
+    def test_nonempty_phrase_without_words_rejected_before_persist(self) -> None:
+        """H2: v2 result with phrase but words only for another phrase → FAIL."""
+        meeting, service, _, runner = _v2_service()
+        # Phrase 0 = "hello", Phrase 1 = "world"
+        # Words only reference phrase 0
+        bad_result = TrackTranscriptionResult(
+            segments=(
+                TrackTranscriptionInputSegment(0, 100, "hello"),
+                TrackTranscriptionInputSegment(200, 300, "world"),
+            ),
+            words=(TrackTranscriptionInputWord(0, 10, 90, "hello"),),
+        )
+        runner.enqueue_result(bad_result)
+        runner.enqueue_result(TrackTranscriptionResult(segments=(), words=()))
+
+        gen = service.request(meeting.session_id, _v2_config())
+        loaded = service.load_generation(gen.generation_id)
+        assert loaded is not None
+        mic = next(t for t in loaded.tracks if t.role is MeetingTrackRole.MICROPHONE)
+        assert mic.status is FinalTranscriptionTrackStatus.FAILED
+
+    def test_all_nonempty_phrases_covered_accepted(self) -> None:
+        """H2: v2 result where every nonempty phrase has words → succeeds."""
+        meeting, service, _, runner = _v2_service()
+        good_result = TrackTranscriptionResult(
+            segments=(
+                TrackTranscriptionInputSegment(0, 100, "hello"),
+                TrackTranscriptionInputSegment(200, 300, "world"),
+            ),
+            words=(
+                TrackTranscriptionInputWord(0, 10, 90, "hello"),
+                TrackTranscriptionInputWord(1, 210, 290, "world"),
+            ),
+        )
+        runner.enqueue_result(good_result)
+        runner.enqueue_result(TrackTranscriptionResult(segments=(), words=()))
+
+        gen = service.request(meeting.session_id, _v2_config())
+        loaded = service.load_generation(gen.generation_id)
+        assert loaded is not None
+        assert loaded.status is FinalTranscriptionStatus.COMPLETED
+
+    def test_coverage_corruption_detected_on_load(self) -> None:
+        """H2: start valid, then remove words for phrase 1 → load rejects."""
+        meeting, service, repo, runner = _v2_service()
+        good_result = TrackTranscriptionResult(
+            segments=(
+                TrackTranscriptionInputSegment(0, 100, "hello"),
+                TrackTranscriptionInputSegment(200, 300, "world"),
+            ),
+            words=(
+                TrackTranscriptionInputWord(0, 10, 90, "hello"),
+                TrackTranscriptionInputWord(1, 210, 290, "world"),
+            ),
+        )
+        runner.enqueue_result(good_result)
+        runner.enqueue_result(TrackTranscriptionResult(segments=(), words=()))
+
+        gen = service.request(meeting.session_id, _v2_config())
+        gen_id = str(gen.generation_id)
+        # Valid initially
+        assert service.load_generation(gen.generation_id) is not None
+
+        # Remove all words for phrase 1, keep phrase 0's word
+        repo._words[(gen_id, "MICROPHONE")] = [
+            WordPersistenceRecord(
+                generation_id=gen_id,
+                role="MICROPHONE",
+                ordinal=0,
+                segment_ordinal=0,
+                local_start_ms=10,
+                local_end_ms=90,
+                start_ns=-900_000_000,
+                end_ns=-100_000_000,
+                text="hello",
+            )
+        ]
+        # word_count still 2 but only 1 word → count mismatch
+        with pytest.raises(FinalTranscriptionDecodeError):
+            service.load_generation(gen.generation_id)
+
+
+# ---------------------------------------------------------------------------
+# M2: Phrase tail integrity
+# ---------------------------------------------------------------------------
+
+
+class TestPhraseCountIntegrity:
+    def test_phrase_tail_deletion_detected(self) -> None:
+        """M2: segment_count=3, delete ordinal 2 → DecodeError."""
+        repo = FakeRepository()
+        meeting = _make_stored_meeting()
+        storage = FakeMeetingStorage()
+        storage.add(meeting)
+        runner = FakeRunner()
+        runner.enqueue_result(())
+        runner.enqueue_result(())
+        service = FinalTranscriptionService(storage, repo, runner)
+
+        gen = service.request(meeting.session_id, FinalTranscriptionConfig())
+        gen_id = str(gen.generation_id)
+        # Manually set segment_count=3 and insert 3 segments
+        tracks = repo._tracks[gen_id]
+        for i, tr in enumerate(tracks):
+            if tr.role == "MICROPHONE":
+                tracks[i] = replace(tr, segment_count=3)
+        repo._segments[(gen_id, "MICROPHONE")] = [
+            SegmentPersistenceRecord(
+                generation_id=gen_id,
+                role="MICROPHONE",
+                ordinal=o,
+                local_start_ms=o * 1000,
+                local_end_ms=(o + 1) * 1000,
+                start_ns=o * 1_000_000_000,
+                end_ns=(o + 1) * 1_000_000_000,
+                text=f"seg{o}",
+            )
+            for o in range(3)
+        ]
+        # Valid initially
+        assert service.load_generation(gen.generation_id) is not None
+
+        # Delete ordinal 2, leaving 0,1
+        repo._segments[(gen_id, "MICROPHONE")] = [
+            SegmentPersistenceRecord(
+                generation_id=gen_id,
+                role="MICROPHONE",
+                ordinal=o,
+                local_start_ms=o * 1000,
+                local_end_ms=(o + 1) * 1000,
+                start_ns=o * 1_000_000_000,
+                end_ns=(o + 1) * 1_000_000_000,
+                text=f"seg{o}",
+            )
+            for o in range(2)
+        ]
+
+        with pytest.raises(FinalTranscriptionDecodeError, match="Phrase count"):
+            service.load_generation(gen.generation_id)
+
+    def test_phrase_middle_deletion_detected(self) -> None:
+        """M2: segment_count=3, delete ordinal 1 leaving 0,2 → DecodeError."""
+        repo = FakeRepository()
+        meeting = _make_stored_meeting()
+        storage = FakeMeetingStorage()
+        storage.add(meeting)
+        runner = FakeRunner()
+        runner.enqueue_result(())
+        runner.enqueue_result(())
+        service = FinalTranscriptionService(storage, repo, runner)
+
+        gen = service.request(meeting.session_id, FinalTranscriptionConfig())
+        gen_id = str(gen.generation_id)
+        tracks = repo._tracks[gen_id]
+        for i, tr in enumerate(tracks):
+            if tr.role == "MICROPHONE":
+                tracks[i] = replace(tr, segment_count=3)
+        repo._segments[(gen_id, "MICROPHONE")] = [
+            SegmentPersistenceRecord(
+                generation_id=gen_id,
+                role="MICROPHONE",
+                ordinal=o,
+                local_start_ms=o * 1000,
+                local_end_ms=(o + 1) * 1000,
+                start_ns=o * 1_000_000_000,
+                end_ns=(o + 1) * 1_000_000_000,
+                text=f"seg{o}",
+            )
+            for o in (0, 2)
+        ]
+
+        with pytest.raises(FinalTranscriptionDecodeError, match="Phrase"):
+            service.load_generation(gen.generation_id)
+
+
+# ---------------------------------------------------------------------------
+# M1: v2 must require explicit model size
+# ---------------------------------------------------------------------------
+
+
+class TestV2ExplicitModelSize:
+    def test_v1_default_still_tiny(self) -> None:
+        cfg = FinalTranscriptionConfig()
+        assert cfg.profile_version == 1
+        assert cfg.whisper_model_size == "TINY"
+
+    def test_v1_whisper_omitted_size_still_tiny(self) -> None:
+        cfg = FinalTranscriptionConfig(model_type="WHISPER")
+        assert cfg.whisper_model_size == "TINY"
+
+    def test_v2_whisper_omitted_size_rejected(self) -> None:
+        with pytest.raises(FinalTranscriptionConfigError, match="explicit"):
+            FinalTranscriptionConfig(profile_version=2, model_type="WHISPER")
+
+    def test_v2_faster_omitted_size_rejected(self) -> None:
+        with pytest.raises(FinalTranscriptionConfigError, match="explicit"):
+            FinalTranscriptionConfig(profile_version=2, model_type="FASTER_WHISPER")
+
+    def test_v2_explicit_tiny_accepted(self) -> None:
+        cfg = FinalTranscriptionConfig(
+            profile_version=2,
+            model_type="WHISPER",
+            whisper_model_size="TINY",
+        )
+        assert cfg.whisper_model_size == "TINY"
+
+    def test_v1_hf_omitted_size_preserved(self) -> None:
+        """v1 HUGGING_FACE with omitted whisper_model_size → error (same as before)."""
+        with pytest.raises(FinalTranscriptionConfigError):
+            FinalTranscriptionConfig(
+                model_type="HUGGING_FACE",
+                hugging_face_model_id="org/model",
+            )
+
+    def test_v1_hf_explicit_none_preserved(self) -> None:
+        cfg = FinalTranscriptionConfig(
+            model_type="HUGGING_FACE",
+            whisper_model_size=None,
+            hugging_face_model_id="org/model",
+        )
+        assert cfg.whisper_model_size is None
+
+
+# ---------------------------------------------------------------------------
+# M3: Aggregate corruption consistency across all load APIs
+# ---------------------------------------------------------------------------
+
+
+class TestAggregateValidatorConsistency:
+    def test_word_tail_deletion_rejected_by_all_load_apis(self) -> None:
+        """M3: word corruption → load_generation, load_transcript, load_words
+        all reject."""
+        repo = FakeRepository()
+        meeting = _make_stored_meeting()
+        storage = FakeMeetingStorage()
+        storage.add(meeting)
+        runner = FakeRunner()
+        service = FinalTranscriptionService(storage, repo, runner)
+
+        # v1 empty result
+        runner.enqueue_result(())
+        runner.enqueue_result(())
+        gen = service.request(meeting.session_id, FinalTranscriptionConfig())
+        gen_id = str(gen.generation_id)
+        # Valid
+        assert service.load_generation(gen.generation_id) is not None
+
+        # Inject v1 word corruption
+        repo._words[(gen_id, "MICROPHONE")] = [
+            WordPersistenceRecord(
+                generation_id=gen_id,
+                role="MICROPHONE",
+                ordinal=0,
+                segment_ordinal=0,
+                local_start_ms=0,
+                local_end_ms=100,
+                start_ns=-1_000_000_000,
+                end_ns=-900_000_000,
+                text="illegal",
+            )
+        ]
+
+        with pytest.raises(FinalTranscriptionDecodeError):
+            service.load_generation(gen.generation_id)
+        with pytest.raises(FinalTranscriptionDecodeError):
+            service.load_transcript(gen.generation_id)
+        with pytest.raises(FinalTranscriptionDecodeError):
+            service.load_words(gen.generation_id)
+
+    def test_phrase_tail_deletion_rejected_by_all_load_apis(self) -> None:
+        """M3: phrase corruption → all load APIs reject."""
+        repo = FakeRepository()
+        meeting = _make_stored_meeting()
+        storage = FakeMeetingStorage()
+        storage.add(meeting)
+        runner = FakeRunner()
+        runner.enqueue_result(())
+        runner.enqueue_result(())
+        service = FinalTranscriptionService(storage, repo, runner)
+
+        gen = service.request(meeting.session_id, FinalTranscriptionConfig())
+        gen_id = str(gen.generation_id)
+        # Set segment_count=2, insert 1 segment
+        tracks = repo._tracks[gen_id]
+        for i, tr in enumerate(tracks):
+            if tr.role == "MICROPHONE":
+                tracks[i] = replace(tr, segment_count=2)
+        repo._segments[(gen_id, "MICROPHONE")] = [
+            SegmentPersistenceRecord(
+                generation_id=gen_id,
+                role="MICROPHONE",
+                ordinal=0,
+                local_start_ms=0,
+                local_end_ms=1000,
+                start_ns=0,
+                end_ns=1_000_000_000,
+                text="only_one",
+            )
+        ]
+
+        with pytest.raises(FinalTranscriptionDecodeError):
+            service.load_generation(gen.generation_id)
+        with pytest.raises(FinalTranscriptionDecodeError):
+            service.load_transcript(gen.generation_id)
+        with pytest.raises(FinalTranscriptionDecodeError):
+            service.load_words(gen.generation_id)

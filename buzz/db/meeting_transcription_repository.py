@@ -21,6 +21,7 @@ from buzz.meeting.final_transcription import (
     GenerationPersistenceRecord,
     SegmentPersistenceRecord,
     TrackPersistenceRecord,
+    WordPersistenceRecord,
     decode_track_status,
     encode_config,
     encode_generation_status,
@@ -85,8 +86,9 @@ class QSqlMeetingTranscriptionRepository:
                     """
                     INSERT INTO meeting_final_transcription_track (
                         generation_id, role, status, error_message,
-                        time_started, time_completed, segment_count
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        time_started, time_completed, segment_count,
+                        word_count
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         generation_id,
@@ -96,6 +98,7 @@ class QSqlMeetingTranscriptionRepository:
                         track.time_started,
                         track.time_completed,
                         track.segment_count,
+                        track.word_count,
                     ),
                 )
         except Exception:
@@ -157,7 +160,7 @@ class QSqlMeetingTranscriptionRepository:
         query = self._execute(
             """
             SELECT generation_id, role, status, error_message,
-                   time_started, time_completed, segment_count
+                   time_started, time_completed, segment_count, word_count
             FROM meeting_final_transcription_track
             WHERE generation_id = ?
             ORDER BY CASE role
@@ -193,6 +196,26 @@ class QSqlMeetingTranscriptionRepository:
         while query.next():
             segments.append(self._row_to_segment(query))
         return tuple(segments)
+
+    def load_words(
+        self,
+        generation_id: str,
+    ) -> tuple[WordPersistenceRecord, ...]:
+        """Load words independently so corrupt provenance remains visible."""
+        query = self._execute(
+            """
+            SELECT generation_id, role, ordinal, segment_ordinal,
+                   local_start_ms, local_end_ms, start_ns, end_ns, text
+            FROM meeting_final_transcription_word
+            WHERE generation_id = ?
+            ORDER BY role, ordinal
+            """,
+            (generation_id,),
+        )
+        words: list[WordPersistenceRecord] = []
+        while query.next():
+            words.append(self._row_to_word(query))
+        return tuple(words)
 
     def begin_track(
         self,
@@ -246,12 +269,21 @@ class QSqlMeetingTranscriptionRepository:
         role: str,
         segments: tuple[SegmentPersistenceRecord, ...],
         now: str,
+        words: tuple[WordPersistenceRecord, ...] = (),
     ) -> None:
-        """Atomically replace segments, mark track COMPLETED, derive
-        generation status."""
+        """Atomically replace results, mark COMPLETED, derive generation."""
         if not self._database.transaction():
             raise self._db_error("Could not begin complete_track transaction")
         try:
+            # Delete words before their parent phrase segments.
+            self._execute(
+                """
+                DELETE FROM meeting_final_transcription_word
+                WHERE generation_id = ? AND role = ?
+                """,
+                (generation_id, role),
+            )
+
             # Delete existing segments for this track
             self._execute(
                 """
@@ -282,17 +314,41 @@ class QSqlMeetingTranscriptionRepository:
                     ),
                 )
 
+            # Insert backend-native words after their parent segments.
+            for word in words:
+                self._execute(
+                    """
+                    INSERT INTO meeting_final_transcription_word (
+                        generation_id, role, ordinal, segment_ordinal,
+                        local_start_ms, local_end_ms, start_ns, end_ns, text
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        generation_id,
+                        role,
+                        word.ordinal,
+                        word.segment_ordinal,
+                        word.local_start_ms,
+                        word.local_end_ms,
+                        word.start_ns,
+                        word.end_ns,
+                        word.text,
+                    ),
+                )
+
             # Mark track COMPLETED
             self._execute(
                 """
                 UPDATE meeting_final_transcription_track
-                SET status = ?, time_completed = ?, segment_count = ?
+                SET status = ?, time_completed = ?, segment_count = ?,
+                    word_count = ?
                 WHERE generation_id = ? AND role = ?
                 """,
                 (
                     encode_track_status(FinalTranscriptionTrackStatus.COMPLETED),
                     now,
                     len(segments),
+                    len(words),
                     generation_id,
                     role,
                 ),
@@ -321,6 +377,14 @@ class QSqlMeetingTranscriptionRepository:
         if not self._database.transaction():
             raise self._db_error("Could not begin fail_track transaction")
         try:
+            self._execute(
+                """
+                DELETE FROM meeting_final_transcription_word
+                WHERE generation_id = ? AND role = ?
+                """,
+                (generation_id, role),
+            )
+
             # Delete any partial segments
             self._execute(
                 """
@@ -334,7 +398,7 @@ class QSqlMeetingTranscriptionRepository:
                 """
                 UPDATE meeting_final_transcription_track
                 SET status = ?, error_message = ?, time_completed = ?,
-                    segment_count = 0
+                    segment_count = 0, word_count = 0
                 WHERE generation_id = ? AND role = ?
                 """,
                 (
@@ -426,6 +490,22 @@ class QSqlMeetingTranscriptionRepository:
         if not self._database.transaction():
             raise self._db_error("Could not begin reset_for_retry transaction")
         try:
+            # Delete words for all non-COMPLETED tracks first.
+            self._execute(
+                """
+                DELETE FROM meeting_final_transcription_word
+                WHERE generation_id = ? AND role IN (
+                    SELECT role FROM meeting_final_transcription_track
+                    WHERE generation_id = ? AND status != ?
+                )
+                """,
+                (
+                    generation_id,
+                    generation_id,
+                    encode_track_status(FinalTranscriptionTrackStatus.COMPLETED),
+                ),
+            )
+
             # Delete segments for all non-COMPLETED tracks
             self._execute(
                 """
@@ -449,7 +529,7 @@ class QSqlMeetingTranscriptionRepository:
                     UPDATE meeting_final_transcription_track
                     SET status = ?, error_message = NULL,
                         time_started = NULL, time_completed = NULL,
-                        segment_count = 0
+                        segment_count = 0, word_count = 0
                     WHERE generation_id = ? AND role = ?
                       AND status != ?
                     """,
@@ -533,7 +613,7 @@ class QSqlMeetingTranscriptionRepository:
                 UPDATE meeting_final_transcription_track
                 SET status = ?, error_message = NULL,
                     time_started = NULL, time_completed = NULL,
-                    segment_count = 0
+                    segment_count = 0, word_count = 0
                 WHERE generation_id = ?
                   AND status = ?
                 """,
@@ -541,6 +621,22 @@ class QSqlMeetingTranscriptionRepository:
                     encode_track_status(FinalTranscriptionTrackStatus.QUEUED),
                     generation_id,
                     encode_track_status(FinalTranscriptionTrackStatus.IN_PROGRESS),
+                ),
+            )
+
+            # Delete words for tracks just reset to QUEUED.
+            self._execute(
+                """
+                DELETE FROM meeting_final_transcription_word
+                WHERE generation_id = ? AND role IN (
+                    SELECT role FROM meeting_final_transcription_track
+                    WHERE generation_id = ? AND status = ?
+                )
+                """,
+                (
+                    generation_id,
+                    generation_id,
+                    encode_track_status(FinalTranscriptionTrackStatus.QUEUED),
                 ),
             )
 
@@ -644,6 +740,7 @@ class QSqlMeetingTranscriptionRepository:
             time_started=self._nullable(query, 4),
             time_completed=self._nullable(query, 5),
             segment_count=query.value(6),
+            word_count=query.value(7),
         )
 
     def _row_to_segment(self, query: QSqlQuery) -> SegmentPersistenceRecord:
@@ -656,6 +753,19 @@ class QSqlMeetingTranscriptionRepository:
             start_ns=query.value(5),
             end_ns=query.value(6),
             text=query.value(7),
+        )
+
+    def _row_to_word(self, query: QSqlQuery) -> WordPersistenceRecord:
+        return WordPersistenceRecord(
+            generation_id=query.value(0),
+            role=query.value(1),
+            ordinal=query.value(2),
+            segment_ordinal=query.value(3),
+            local_start_ms=query.value(4),
+            local_end_ms=query.value(5),
+            start_ns=query.value(6),
+            end_ns=query.value(7),
+            text=query.value(8),
         )
 
     @staticmethod

@@ -85,9 +85,27 @@ class FinalTranscriptionTrackStatus(Enum):
 # ---------------------------------------------------------------------------
 
 _PROFILE_VERSION_1 = 1
-_KNOWN_PROFILE_VERSIONS = {_PROFILE_VERSION_1}
+_PROFILE_VERSION_2 = 2
+_KNOWN_PROFILE_VERSIONS = {_PROFILE_VERSION_1, _PROFILE_VERSION_2}
 _WHISPER_MODEL_TYPES = frozenset({"WHISPER", "WHISPER_CPP", "FASTER_WHISPER"})
 _SUPPORTED_MODEL_TYPES = _WHISPER_MODEL_TYPES | {"HUGGING_FACE"}
+_PROFILE_VERSION_2_MODEL_TYPES = frozenset({"WHISPER", "FASTER_WHISPER"})
+_PROFILE_VERSION_2_MODEL_SIZES = frozenset(
+    {
+        "TINY",
+        "TINYEN",
+        "BASE",
+        "BASEEN",
+        "SMALL",
+        "SMALLEN",
+        "MEDIUM",
+        "MEDIUMEN",
+        "LARGE",
+        "LARGEV2",
+        "LARGEV3",
+        "LARGEV3TURBO",
+    }
+)
 _KNOWN_WHISPER_MODEL_SIZES = frozenset(
     {
         "TINY",
@@ -108,6 +126,21 @@ _KNOWN_WHISPER_MODEL_SIZES = frozenset(
 )
 
 
+_OMITTED = object()
+"""Sentinel for fields whose default is profile-version-dependent.
+
+Unlike ``None`` (which is a valid explicit value for ``whisper_model_size``
+in HUGGING_FACE configs), ``_OMITTED`` means "caller did not pass this
+argument".
+"""
+
+
+class _OMITTEDType:
+    """Runtime type of the ``_OMITTED`` singleton."""
+
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class FinalTranscriptionConfig:
     """Immutable, persistable transcription configuration snapshot.
@@ -118,11 +151,21 @@ class FinalTranscriptionConfig:
 
     profile_version: int = _PROFILE_VERSION_1
     model_type: str = "FASTER_WHISPER"
-    whisper_model_size: Optional[str] = "TINY"
+    whisper_model_size: Optional[str] | _OMITTEDType = _OMITTED
     hugging_face_model_id: str = ""
     language: Optional[str] = None
 
     def __post_init__(self) -> None:
+        # Resolve version-dependent defaults for omitted whisper_model_size.
+        if self.whisper_model_size is _OMITTED:
+            if self.profile_version == _PROFILE_VERSION_1:
+                # v1 default unchanged: TINY for whisper types, None for HF
+                # (HF is validated below to require an explicit None).
+                if self.model_type in _WHISPER_MODEL_TYPES:
+                    object.__setattr__(self, "whisper_model_size", "TINY")
+                # else: stays _OMITTED; HF/HF-like paths below will reject.
+            # v2 will be rejected below.
+
         if self.profile_version not in _KNOWN_PROFILE_VERSIONS:
             raise FinalTranscriptionConfigError(
                 f"Unknown profile_version: {self.profile_version}"
@@ -131,6 +174,20 @@ class FinalTranscriptionConfig:
             raise FinalTranscriptionConfigError(
                 f"Unsupported model_type: {self.model_type!r}"
             )
+        if self.profile_version == _PROFILE_VERSION_2:
+            if self.model_type not in _PROFILE_VERSION_2_MODEL_TYPES:
+                raise FinalTranscriptionConfigError(
+                    "profile_version 2 supports only WHISPER and FASTER_WHISPER"
+                )
+            if self.whisper_model_size is _OMITTED or self.whisper_model_size is None:
+                raise FinalTranscriptionConfigError(
+                    "profile_version 2 requires an explicit whisper_model_size"
+                )
+            if self.whisper_model_size not in _PROFILE_VERSION_2_MODEL_SIZES:
+                raise FinalTranscriptionConfigError(
+                    "profile_version 2 requires an explicit standard Whisper "
+                    f"model size, got {self.whisper_model_size!r}"
+                )
         if self.model_type in _WHISPER_MODEL_TYPES:
             if not self.whisper_model_size:
                 raise FinalTranscriptionConfigError(
@@ -218,12 +275,44 @@ class MeetingTranscript:
 
 
 @dataclass(frozen=True, slots=True)
+class MeetingTranscriptWord:
+    """One durable word in the meeting timeline."""
+
+    source_role: MeetingTrackRole
+    source_segment_ordinal: int
+    source_word_ordinal: int
+    local_start_ms: int
+    local_end_ms: int
+    start_ns: int
+    end_ns: int
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class TrackTranscriptionInputSegment:
     """Pure adapter result from FileTranscriber — no Qt types."""
 
     start_ms: int
     end_ms: int
     text: str
+
+
+@dataclass(frozen=True, slots=True)
+class TrackTranscriptionInputWord:
+    """One backend-native word associated with a phrase segment."""
+
+    source_segment_ordinal: int
+    start_ms: int
+    end_ms: int
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class TrackTranscriptionResult:
+    """Pure same-inference result returned by a track runner."""
+
+    segments: tuple[TrackTranscriptionInputSegment, ...]
+    words: tuple[TrackTranscriptionInputWord, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +518,13 @@ class MeetingTranscriptionRepository(Protocol):
         """Load segments for a specific track."""
         ...
 
+    def load_words(
+        self,
+        generation_id: str,
+    ) -> tuple[WordPersistenceRecord, ...]:
+        """Load all word rows without joining away corrupt provenance."""
+        ...
+
     def begin_track(
         self,
         generation_id: str,
@@ -447,9 +543,9 @@ class MeetingTranscriptionRepository(Protocol):
         role: str,
         segments: tuple[SegmentPersistenceRecord, ...],
         now: str,
+        words: tuple[WordPersistenceRecord, ...] = (),
     ) -> None:
-        """Atomically replace segments, mark track COMPLETED, derive
-        generation status."""
+        """Atomically replace results, mark COMPLETED, derive generation."""
         ...
 
     def fail_track(
@@ -512,7 +608,11 @@ class MeetingTranscriptionRepository(Protocol):
 
 
 class TranscriptionRunner(Protocol):
-    """Runs ASR on a single audio file, returning pure segment DTOs."""
+    """Runs ASR on one audio file, returning a pure same-inference result.
+
+    v1 runners may return a plain tuple of ``TrackTranscriptionInputSegment``
+    (legacy PR11 contract).  v2 runners must return ``TrackTranscriptionResult``.
+    """
 
     def transcribe_track(
         self,
@@ -520,8 +620,8 @@ class TranscriptionRunner(Protocol):
         sample_rate: int,
         config: FinalTranscriptionConfig,
         on_progress: Optional[Callable[[float], None]] = None,
-    ) -> tuple[TrackTranscriptionInputSegment, ...]:
-        """Transcribe one audio file. Returns segments. Raises on error."""
+    ) -> TrackTranscriptionResult | tuple[TrackTranscriptionInputSegment, ...]:
+        """Transcribe one audio file. Raises on error."""
         ...
 
     def shutdown(self) -> None:
@@ -563,6 +663,7 @@ class TrackPersistenceRecord:
     time_started: Optional[str]
     time_completed: Optional[str]
     segment_count: int
+    word_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -572,6 +673,21 @@ class SegmentPersistenceRecord:
     generation_id: str
     role: str
     ordinal: int
+    local_start_ms: int
+    local_end_ms: int
+    start_ns: int
+    end_ns: int
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class WordPersistenceRecord:
+    """SQLite-compatible word record."""
+
+    generation_id: str
+    role: str
+    ordinal: int
+    segment_ordinal: int
     local_start_ms: int
     local_end_ms: int
     start_ns: int
@@ -956,10 +1072,10 @@ class FinalTranscriptionService:
         generation_id: uuid.UUID,
     ) -> Optional[FinalTranscriptionGeneration]:
         """Load a generation by ID, or None if not found."""
-        gen_rec = self._repository.load_generation(str(generation_id))
-        if gen_rec is None:
+        result = self._load_validated_aggregate(str(generation_id))
+        if result is None:
             return None
-        track_recs = self._repository.load_tracks(gen_rec.id)
+        gen_rec, track_recs, _, _ = result
         return assemble_generation(gen_rec, track_recs)
 
     def load_transcript(
@@ -971,9 +1087,11 @@ class FinalTranscriptionService:
         Returns None for FAILED/QUEUED/IN_PROGRESS generations, or for
         generations with zero completed tracks.
         """
-        gen_rec = self._repository.load_generation(str(generation_id))
-        if gen_rec is None:
+        result = self._load_validated_aggregate(str(generation_id))
+        if result is None:
             return None
+
+        gen_rec, track_recs, segments_by_role, _ = result
 
         status = decode_generation_status(gen_rec.status)
         if status not in (
@@ -982,8 +1100,6 @@ class FinalTranscriptionService:
         ):
             return None
 
-        track_recs = self._repository.load_tracks(gen_rec.id)
-
         # Collect segments from COMPLETED tracks only
         all_segments: list[MeetingTranscriptSegment] = []
         for tr in track_recs:
@@ -991,8 +1107,7 @@ class FinalTranscriptionService:
             if track_status is not FinalTranscriptionTrackStatus.COMPLETED:
                 continue
             role = decode_role(tr.role)
-            seg_recs = self._repository.load_segments(gen_rec.id, tr.role)
-            for sr in seg_recs:
+            for sr in segments_by_role.get(tr.role, ()):
                 all_segments.append(
                     MeetingTranscriptSegment(
                         merged_ordinal=0,  # assigned below
@@ -1040,6 +1155,77 @@ class FinalTranscriptionService:
             status=status,
             segments=merged,
         )
+
+    def load_words(
+        self,
+        generation_id: uuid.UUID,
+    ) -> tuple[MeetingTranscriptWord, ...]:
+        """Load validated durable words from completed tracks.
+
+        Word rows are queried independently from generations, tracks, and
+        phrase segments so corrupt provenance cannot disappear through a JOIN.
+        """
+        generation_id_str = str(generation_id)
+
+        # Independent orphan detection: word rows without a generation.
+        word_recs_check = self._repository.load_words(generation_id_str)
+        gen_rec_check = self._repository.load_generation(generation_id_str)
+        if gen_rec_check is None and word_recs_check:
+            raise FinalTranscriptionDecodeError(
+                f"Word rows reference missing generation {generation_id}"
+            )
+
+        # Full validated aggregate — reads generation, tracks, segments, words.
+        result = self._load_validated_aggregate(generation_id_str)
+        if result is None:
+            return ()
+
+        gen_rec, track_recs, _, all_words = result
+        tracks_by_role = {tr.role: tr for tr in track_recs}
+
+        words_by_role: dict[str, list[WordPersistenceRecord]] = {}
+        for word in all_words:
+            words_by_role.setdefault(word.role, []).append(word)
+
+        projected: list[MeetingTranscriptWord] = []
+        for role_raw, track_rec in tracks_by_role.items():
+            role = decode_role(role_raw)
+            track_status = decode_track_status(track_rec.status)
+            role_words = words_by_role.get(role_raw, [])
+
+            if track_status is not FinalTranscriptionTrackStatus.COMPLETED:
+                continue
+
+            segment_recs = self._repository.load_segments(generation_id_str, role_raw)
+            segment_ordinals = {segment.ordinal for segment in segment_recs}
+
+            for word in role_words:
+                self._validate_persisted_word(word, segment_ordinals)
+                projected.append(
+                    MeetingTranscriptWord(
+                        source_role=role,
+                        source_segment_ordinal=word.segment_ordinal,
+                        source_word_ordinal=word.ordinal,
+                        local_start_ms=word.local_start_ms,
+                        local_end_ms=word.local_end_ms,
+                        start_ns=word.start_ns,
+                        end_ns=word.end_ns,
+                        text=word.text,
+                    )
+                )
+
+        role_order = {
+            MeetingTrackRole.MICROPHONE: 0,
+            MeetingTrackRole.REMOTE: 1,
+        }
+        projected.sort(
+            key=lambda word: (
+                word.start_ns,
+                role_order.get(word.source_role, 99),
+                word.source_word_ordinal,
+            )
+        )
+        return tuple(projected)
 
     def shutdown(self) -> None:
         """Request graceful shutdown. Does not cancel persisted state."""
@@ -1245,13 +1431,26 @@ class FinalTranscriptionService:
             gen_rec.config_language,
         )
 
-        # Run ASR
+        # Run ASR — normalize legacy tuple result for v1 runners
         try:
-            input_segments = self._runner.transcribe_track(
+            raw_result = self._runner.transcribe_track(
                 str(audio_track.path),
                 audio_track.sample_rate,
                 config,
             )
+            if isinstance(raw_result, tuple):
+                transcription_result = TrackTranscriptionResult(
+                    segments=raw_result, words=()
+                )
+            elif isinstance(raw_result, TrackTranscriptionResult):
+                transcription_result = raw_result
+            else:
+                self._fail_track(
+                    generation_id,
+                    role_str,
+                    "Transcription runner returned an unsupported result type",
+                )
+                return
         except Exception as exc:
             self._fail_track(
                 generation_id,
@@ -1262,8 +1461,9 @@ class FinalTranscriptionService:
 
         # Map segments to meeting timeline
         try:
-            mapped_segments = self._map_segments(
-                input_segments,
+            mapped_segments, mapped_words = self._map_transcription_result(
+                transcription_result,
+                config,
                 audio_track.sample_rate,
                 audio_track.timing_anchors,
             )
@@ -1280,10 +1480,11 @@ class FinalTranscriptionService:
         assert completion_time is not None
         try:
             self._repository.complete_track(
-                generation_id,
-                role_str,
-                mapped_segments,
-                completion_time,
+                generation_id=generation_id,
+                role=role_str,
+                segments=mapped_segments,
+                now=completion_time,
+                words=mapped_words,
             )
         except Exception as exc:
             logger.error(
@@ -1341,6 +1542,295 @@ class FinalTranscriptionService:
 
         return tuple(result)
 
+    def _map_transcription_result(
+        self,
+        transcription_result: TrackTranscriptionResult,
+        config: FinalTranscriptionConfig,
+        sample_rate: int,
+        anchors: tuple[StoredMeetingTimingAnchor, ...],
+    ) -> tuple[
+        tuple[SegmentPersistenceRecord, ...],
+        tuple[WordPersistenceRecord, ...],
+    ]:
+        """Validate and map a same-inference track result."""
+        if not isinstance(transcription_result, TrackTranscriptionResult):
+            raise TimelineMappingError(
+                "Transcription runner returned an invalid result type"
+            )
+        if config.profile_version == _PROFILE_VERSION_1:
+            if transcription_result.words:
+                raise TimelineMappingError(
+                    "profile_version 1 result must not contain words"
+                )
+        elif config.profile_version == _PROFILE_VERSION_2:
+            if transcription_result.segments and not transcription_result.words:
+                raise TimelineMappingError(
+                    "profile_version 2 result contains phrase segments but no words"
+                )
+
+        segments = self._map_segments(
+            transcription_result.segments,
+            sample_rate,
+            anchors,
+        )
+        words = self._map_words(
+            transcription_result.words,
+            len(transcription_result.segments),
+            sample_rate,
+            anchors,
+        )
+
+        # v2 pre-commit coverage check: every nonempty segment must have
+        # at least one persisted word referencing it.
+        if config.profile_version == _PROFILE_VERSION_2:
+            covered_ordinals = {word.segment_ordinal for word in words}
+            for seg in segments:
+                if seg.text.strip() and seg.ordinal not in covered_ordinals:
+                    raise TimelineMappingError(
+                        f"v2 nonempty phrase {seg.ordinal} has no " "covering word rows"
+                    )
+
+        return segments, words
+
+    def _map_words(
+        self,
+        input_words: tuple[TrackTranscriptionInputWord, ...],
+        segment_count: int,
+        sample_rate: int,
+        anchors: tuple[StoredMeetingTimingAnchor, ...],
+    ) -> tuple[WordPersistenceRecord, ...]:
+        """Map words with the unchanged PR11 timeline mapper."""
+        result: list[WordPersistenceRecord] = []
+        for ordinal, word in enumerate(input_words):
+            if not isinstance(word.source_segment_ordinal, int) or isinstance(
+                word.source_segment_ordinal, bool
+            ):
+                raise TimelineMappingError(
+                    f"Word {ordinal} source_segment_ordinal must be int"
+                )
+            if not 0 <= word.source_segment_ordinal < segment_count:
+                raise TimelineMappingError(
+                    f"Word {ordinal} references missing phrase segment "
+                    f"{word.source_segment_ordinal}"
+                )
+            if not isinstance(word.start_ms, int) or isinstance(word.start_ms, bool):
+                raise TimelineMappingError(f"Word {ordinal} start_ms must be int")
+            if not isinstance(word.end_ms, int) or isinstance(word.end_ms, bool):
+                raise TimelineMappingError(f"Word {ordinal} end_ms must be int")
+            if word.start_ms < 0:
+                raise TimelineMappingError(
+                    f"Word {ordinal} start_ms < 0: {word.start_ms}"
+                )
+            if word.end_ms < word.start_ms:
+                raise TimelineMappingError(
+                    f"Word {ordinal} end_ms < start_ms: "
+                    f"{word.end_ms} < {word.start_ms}"
+                )
+            if not isinstance(word.text, str):
+                raise TimelineMappingError(f"Word {ordinal} text must be str")
+
+            start_ns = map_track_time_to_meeting_ns(word.start_ms, sample_rate, anchors)
+            end_ns = map_track_time_to_meeting_ns(word.end_ms, sample_rate, anchors)
+            if end_ns < start_ns:
+                raise TimelineMappingError(
+                    f"Word {ordinal} mapped end_ns < start_ns: "
+                    f"{end_ns} < {start_ns}"
+                )
+
+            result.append(
+                WordPersistenceRecord(
+                    generation_id="",
+                    role="",
+                    ordinal=ordinal,
+                    segment_ordinal=word.source_segment_ordinal,
+                    local_start_ms=word.start_ms,
+                    local_end_ms=word.end_ms,
+                    start_ns=start_ns,
+                    end_ns=end_ns,
+                    text=word.text,
+                )
+            )
+        return tuple(result)
+
+    @staticmethod
+    def _validate_persisted_word(
+        word: WordPersistenceRecord,
+        segment_ordinals: set[int],
+    ) -> None:
+        """Validate word rows even if database constraints were disabled."""
+        int_fields = {
+            "ordinal": word.ordinal,
+            "segment_ordinal": word.segment_ordinal,
+            "local_start_ms": word.local_start_ms,
+            "local_end_ms": word.local_end_ms,
+            "start_ns": word.start_ns,
+            "end_ns": word.end_ns,
+        }
+        for name, value in int_fields.items():
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise FinalTranscriptionDecodeError(
+                    f"Word {name} must be int, got {type(value)}"
+                )
+        if word.ordinal < 0 or word.segment_ordinal < 0:
+            raise FinalTranscriptionDecodeError("Word ordinals must be nonnegative")
+        if word.segment_ordinal not in segment_ordinals:
+            raise FinalTranscriptionDecodeError(
+                f"Word {word.ordinal} references missing phrase segment "
+                f"{word.segment_ordinal}"
+            )
+        if word.local_start_ms < 0 or word.local_end_ms < word.local_start_ms:
+            raise FinalTranscriptionDecodeError(
+                f"Invalid local word interval at ordinal {word.ordinal}"
+            )
+        if word.end_ns < word.start_ns:
+            raise FinalTranscriptionDecodeError(
+                f"Invalid mapped word interval at ordinal {word.ordinal}"
+            )
+        if not isinstance(word.text, str):
+            raise FinalTranscriptionDecodeError(f"Word {word.ordinal} text must be str")
+
+    @staticmethod
+    def _validate_aggregate_result(
+        config: FinalTranscriptionConfig,
+        tracks_by_role: dict[str, TrackPersistenceRecord],
+        segments_by_role: dict[str, tuple[SegmentPersistenceRecord, ...]],
+        words: tuple[WordPersistenceRecord, ...],
+    ) -> None:
+        """Validate the complete persisted aggregate for a terminal generation.
+
+        Called by all public load entry points so corrupt data is rejected
+        consistently.  Raises ``FinalTranscriptionDecodeError`` on any
+        integrity violation.
+        """
+        # ---- Phase 1: word-level structural validation ----
+
+        # Orphan word rows referencing missing generation/track.
+        words_by_role: dict[str, list[WordPersistenceRecord]] = {}
+        for word in words:
+            if word.role not in tracks_by_role:
+                raise FinalTranscriptionDecodeError(
+                    f"Word row references missing track role {word.role!r}"
+                )
+            words_by_role.setdefault(word.role, []).append(word)
+
+        for role_raw, track_rec in tracks_by_role.items():
+            track_status = decode_track_status(track_rec.status)
+            role_words = words_by_role.get(role_raw, [])
+
+            # Non-COMPLETED tracks must not have word rows.
+            if track_status is not FinalTranscriptionTrackStatus.COMPLETED:
+                if role_words:
+                    raise FinalTranscriptionDecodeError(
+                        f"Non-COMPLETED track {role_raw} contains word rows"
+                    )
+                continue
+
+            role_segments = segments_by_role.get(role_raw, ())
+
+            # v1: completed tracks must never contain word rows.
+            if config.profile_version == _PROFILE_VERSION_1:
+                if role_words:
+                    raise FinalTranscriptionDecodeError(
+                        "profile_version 1 generation must not contain word rows"
+                    )
+                if track_rec.word_count != 0:
+                    raise FinalTranscriptionDecodeError(
+                        f"profile_version 1 track {role_raw} has "
+                        f"word_count={track_rec.word_count}"
+                    )
+
+            # v2: word count must match actual persisted rows.
+            if config.profile_version == _PROFILE_VERSION_2:
+                if len(role_words) != track_rec.word_count:
+                    raise FinalTranscriptionDecodeError(
+                        f"Word count mismatch for role {role_raw}: "
+                        f"expected {track_rec.word_count}, "
+                        f"actual {len(role_words)}"
+                    )
+
+            # Word ordinals must be exactly 0..word_count-1.
+            expected_word_ordinals = list(range(track_rec.word_count))
+            actual_word_ordinals = [word.ordinal for word in role_words]
+            if actual_word_ordinals != expected_word_ordinals:
+                raise FinalTranscriptionDecodeError(
+                    f"Word ordinal gap for role {role_raw}: "
+                    f"{actual_word_ordinals!r}"
+                )
+
+            # ---- Phase 2: phrase integrity (v1 and v2) ----
+
+            if track_rec.segment_count != len(role_segments):
+                raise FinalTranscriptionDecodeError(
+                    f"Phrase count mismatch for role {role_raw}: "
+                    f"segment_count={track_rec.segment_count}, "
+                    f"actual={len(role_segments)}"
+                )
+            expected_seg_ordinals = list(range(track_rec.segment_count))
+            actual_seg_ordinals = [seg.ordinal for seg in role_segments]
+            if actual_seg_ordinals != expected_seg_ordinals:
+                raise FinalTranscriptionDecodeError(
+                    f"Phrase ordinal gap for role {role_raw}: "
+                    f"{actual_seg_ordinals!r}"
+                )
+
+            # ---- Phase 3: per-phrase word coverage (v2 only) ----
+
+            if config.profile_version == _PROFILE_VERSION_2:
+                covered_segment_ordinals = {word.segment_ordinal for word in role_words}
+                for seg in role_segments:
+                    if seg.text.strip() and seg.ordinal not in covered_segment_ordinals:
+                        raise FinalTranscriptionDecodeError(
+                            f"v2 nonempty phrase {seg.ordinal} in role "
+                            f"{role_raw} has no covering word rows"
+                        )
+
+    def _load_validated_aggregate(
+        self, generation_id: str
+    ) -> Optional[
+        tuple[
+            GenerationPersistenceRecord,
+            tuple[TrackPersistenceRecord, ...],
+            dict[str, tuple[SegmentPersistenceRecord, ...]],
+            tuple[WordPersistenceRecord, ...],
+        ]
+    ]:
+        """Freshly load and validate the complete persisted aggregate.
+
+        Every call reads from the repository.  Returns ``None`` when the
+        generation does not exist.  For terminal generations the returned
+        data is integrity-checked by ``_validate_aggregate_result``.
+        """
+        gen_rec = self._repository.load_generation(generation_id)
+        if gen_rec is None:
+            return None
+
+        track_recs = self._repository.load_tracks(generation_id)
+        status = decode_generation_status(gen_rec.status)
+        if status in (
+            FinalTranscriptionStatus.COMPLETED,
+            FinalTranscriptionStatus.PARTIAL,
+            FinalTranscriptionStatus.FAILED,
+        ):
+            config = decode_config(
+                gen_rec.profile_version,
+                gen_rec.config_model_type,
+                gen_rec.config_whisper_model_size,
+                gen_rec.config_hugging_face_model_id,
+                gen_rec.config_language,
+            )
+            tracks_by_role = {tr.role: tr for tr in track_recs}
+            segments_by_role: dict[str, tuple[SegmentPersistenceRecord, ...]] = {}
+            for role_raw in tracks_by_role:
+                segs = self._repository.load_segments(generation_id, role_raw)
+                segments_by_role[role_raw] = segs
+            all_words = self._repository.load_words(generation_id)
+            self._validate_aggregate_result(
+                config, tracks_by_role, segments_by_role, all_words
+            )
+            return gen_rec, track_recs, segments_by_role, all_words
+
+        return gen_rec, track_recs, {}, ()
+
     def _fail_track(
         self,
         generation_id: str,
@@ -1382,12 +1872,16 @@ __all__ = [
     "GenerationPersistenceRecord",
     "MeetingTranscript",
     "MeetingTranscriptSegment",
+    "MeetingTranscriptWord",
     "MeetingTranscriptionRepository",
     "SegmentPersistenceRecord",
     "TimelineMappingError",
     "TrackPersistenceRecord",
     "TrackTranscriptionInputSegment",
+    "TrackTranscriptionInputWord",
+    "TrackTranscriptionResult",
     "TranscriptionRunner",
+    "WordPersistenceRecord",
     "check_track_eligibility",
     "decode_generation_status",
     "decode_role",
