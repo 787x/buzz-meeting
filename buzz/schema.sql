@@ -88,3 +88,62 @@ CREATE TABLE meeting_audio_error (
         REFERENCES meeting_audio_track(meeting_id, role)
         ON DELETE CASCADE
 );
+
+CREATE TABLE meeting_final_transcription (
+    id TEXT PRIMARY KEY NOT NULL,
+    meeting_id TEXT NOT NULL,
+    profile_version INTEGER NOT NULL CHECK (profile_version > 0),
+    status TEXT NOT NULL,
+    config_model_type TEXT NOT NULL,
+    config_whisper_model_size TEXT,
+    config_hugging_face_model_id TEXT NOT NULL DEFAULT '',
+    config_language TEXT,
+    error_message TEXT
+        CHECK (
+            error_message IS NULL
+            OR length(error_message) <= 4096
+        ),
+    time_created TEXT NOT NULL,
+    time_started TEXT,
+    time_completed TEXT,
+    UNIQUE (meeting_id, profile_version),
+    FOREIGN KEY (meeting_id)
+        REFERENCES meeting(id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE meeting_final_transcription_track (
+    generation_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error_message TEXT
+        CHECK (
+            error_message IS NULL
+            OR length(error_message) <= 4096
+        ),
+    time_started TEXT,
+    time_completed TEXT,
+    segment_count INTEGER NOT NULL DEFAULT 0
+        CHECK (segment_count >= 0),
+    PRIMARY KEY (generation_id, role),
+    FOREIGN KEY (generation_id)
+        REFERENCES meeting_final_transcription(id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE meeting_final_transcription_segment (
+    generation_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    local_start_ms INTEGER NOT NULL CHECK (local_start_ms >= 0),
+    local_end_ms INTEGER NOT NULL,
+    start_ns INTEGER NOT NULL,
+    end_ns INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    PRIMARY KEY (generation_id, role, ordinal),
+    FOREIGN KEY (generation_id, role)
+        REFERENCES meeting_final_transcription_track(generation_id, role)
+        ON DELETE CASCADE,
+    CHECK (local_end_ms >= local_start_ms),
+    CHECK (end_ns >= start_ns)
+);
