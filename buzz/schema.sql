@@ -172,3 +172,188 @@ CREATE TABLE meeting_final_transcription_word (
     CHECK (local_end_ms >= local_start_ms),
     CHECK (end_ns >= start_ns)
 );
+
+CREATE TABLE meeting_speaker_review (
+    id TEXT PRIMARY KEY NOT NULL,
+    source_generation_id TEXT NOT NULL,
+    source_profile_version INTEGER NOT NULL
+        CHECK (source_profile_version > 0),
+    source_track_count INTEGER NOT NULL CHECK (source_track_count >= 0),
+    mapping_algorithm_version INTEGER NOT NULL
+        CHECK (mapping_algorithm_version > 0),
+    status TEXT NOT NULL
+        CHECK (status IN ('UNREVIEWED', 'IN_PROGRESS', 'COMPLETED')),
+    revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+    next_speaker_ordinal INTEGER NOT NULL DEFAULT 0
+        CHECK (next_speaker_ordinal >= 0),
+    time_created TEXT NOT NULL,
+    time_updated TEXT NOT NULL,
+    time_completed TEXT,
+    UNIQUE (source_generation_id),
+    UNIQUE (id, source_generation_id),
+    FOREIGN KEY (source_generation_id)
+        REFERENCES meeting_final_transcription(id)
+        ON DELETE CASCADE,
+    CHECK (time_updated >= time_created),
+    CHECK (
+        (
+            status = 'UNREVIEWED'
+            AND revision = 0
+            AND time_updated = time_created
+            AND time_completed IS NULL
+        )
+        OR (
+            status = 'IN_PROGRESS'
+            AND revision >= 1
+            AND time_completed IS NULL
+        )
+        OR (
+            status = 'COMPLETED'
+            AND revision >= 1
+            AND time_completed IS NOT NULL
+            AND time_completed = time_updated
+        )
+    )
+);
+
+CREATE TABLE meeting_speaker_review_track (
+    review_id TEXT NOT NULL,
+    source_generation_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('MICROPHONE', 'REMOTE')),
+    source_track_status TEXT NOT NULL
+        CHECK (
+            source_track_status IN (
+                'QUEUED', 'IN_PROGRESS', 'COMPLETED', 'FAILED', 'INELIGIBLE'
+            )
+        ),
+    source_word_count INTEGER NOT NULL CHECK (source_word_count >= 0),
+    analysis_state TEXT NOT NULL
+        CHECK (analysis_state IN ('NOT_PROVIDED', 'COMPLETED')),
+    turn_count INTEGER NOT NULL CHECK (turn_count >= 0),
+    diarization_backend TEXT,
+    diarization_profile_version INTEGER,
+    PRIMARY KEY (review_id, role),
+    FOREIGN KEY (review_id, source_generation_id)
+        REFERENCES meeting_speaker_review(id, source_generation_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (source_generation_id, role)
+        REFERENCES meeting_final_transcription_track(generation_id, role)
+        ON DELETE CASCADE,
+    CHECK (
+        (
+            analysis_state = 'NOT_PROVIDED'
+            AND turn_count = 0
+            AND diarization_backend IS NULL
+            AND diarization_profile_version IS NULL
+        )
+        OR (
+            analysis_state = 'COMPLETED'
+            AND diarization_backend IS NOT NULL
+            AND diarization_profile_version IS NOT NULL
+            AND diarization_profile_version > 0
+        )
+    )
+);
+
+CREATE TABLE meeting_speaker_turn (
+    review_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    speaker_index INTEGER NOT NULL CHECK (speaker_index >= 0),
+    local_start_ms INTEGER NOT NULL CHECK (local_start_ms >= 0),
+    local_end_ms INTEGER NOT NULL,
+    PRIMARY KEY (review_id, role, ordinal),
+    FOREIGN KEY (review_id, role)
+        REFERENCES meeting_speaker_review_track(review_id, role)
+        ON DELETE CASCADE,
+    CHECK (local_end_ms >= local_start_ms)
+);
+
+CREATE TABLE meeting_speaker_cluster (
+    review_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    speaker_index INTEGER NOT NULL CHECK (speaker_index >= 0),
+    PRIMARY KEY (review_id, role, speaker_index),
+    FOREIGN KEY (review_id, role)
+        REFERENCES meeting_speaker_review_track(review_id, role)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE meeting_reviewed_speaker (
+    review_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    display_name TEXT
+        CHECK (
+            display_name IS NULL
+            OR (length(display_name) >= 1 AND length(display_name) <= 256)
+        ),
+    PRIMARY KEY (review_id, id),
+    UNIQUE (id),
+    UNIQUE (review_id, ordinal),
+    FOREIGN KEY (review_id)
+        REFERENCES meeting_speaker_review(id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE meeting_speaker_cluster_assignment (
+    review_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    speaker_index INTEGER NOT NULL,
+    reviewed_speaker_id TEXT NOT NULL,
+    PRIMARY KEY (review_id, role, speaker_index),
+    FOREIGN KEY (review_id, role, speaker_index)
+        REFERENCES meeting_speaker_cluster(review_id, role, speaker_index)
+        ON DELETE CASCADE,
+    FOREIGN KEY (review_id, reviewed_speaker_id)
+        REFERENCES meeting_reviewed_speaker(review_id, id)
+        ON DELETE NO ACTION
+);
+
+CREATE TABLE meeting_speaker_word_attribution (
+    review_id TEXT NOT NULL,
+    source_generation_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    word_ordinal INTEGER NOT NULL CHECK (word_ordinal >= 0),
+    attribution_status TEXT NOT NULL
+        CHECK (
+            attribution_status IN ('ASSIGNED', 'NO_OVERLAP', 'AMBIGUOUS')
+        ),
+    machine_speaker_index INTEGER,
+    PRIMARY KEY (review_id, role, word_ordinal),
+    FOREIGN KEY (review_id, source_generation_id)
+        REFERENCES meeting_speaker_review(id, source_generation_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (review_id, role)
+        REFERENCES meeting_speaker_review_track(review_id, role)
+        ON DELETE CASCADE,
+    FOREIGN KEY (source_generation_id, role, word_ordinal)
+        REFERENCES meeting_final_transcription_word(generation_id, role, ordinal)
+        ON DELETE CASCADE,
+    FOREIGN KEY (review_id, role, machine_speaker_index)
+        REFERENCES meeting_speaker_cluster(review_id, role, speaker_index),
+    CHECK (
+        (
+            attribution_status = 'ASSIGNED'
+            AND machine_speaker_index IS NOT NULL
+        )
+        OR (
+            attribution_status IN ('NO_OVERLAP', 'AMBIGUOUS')
+            AND machine_speaker_index IS NULL
+        )
+    )
+);
+
+CREATE TABLE meeting_speaker_word_override (
+    review_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    word_ordinal INTEGER NOT NULL,
+    reviewed_speaker_id TEXT,
+    PRIMARY KEY (review_id, role, word_ordinal),
+    FOREIGN KEY (review_id, role, word_ordinal)
+        REFERENCES meeting_speaker_word_attribution(review_id, role, word_ordinal)
+        ON DELETE CASCADE,
+    FOREIGN KEY (review_id, reviewed_speaker_id)
+        REFERENCES meeting_reviewed_speaker(review_id, id)
+        ON DELETE NO ACTION
+);
