@@ -32,3 +32,59 @@ CREATE TABLE transcription_segment (
     FOREIGN KEY (transcription_id) REFERENCES transcription(id) ON DELETE CASCADE
 );
 CREATE INDEX idx_transcription_id ON transcription_segment(transcription_id);
+
+CREATE TABLE meeting (
+    id TEXT PRIMARY KEY NOT NULL,
+    remote_source_kind TEXT NOT NULL,
+    session_state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    ended_at TEXT,
+    duration_ns INTEGER
+        CHECK (duration_ns IS NULL OR duration_ns >= 0),
+    audio_state TEXT NOT NULL,
+    audio_outcome TEXT
+);
+
+CREATE TABLE meeting_audio_track (
+    meeting_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    sample_rate INTEGER NOT NULL CHECK (sample_rate > 0),
+    sample_count INTEGER NOT NULL CHECK (sample_count >= 0),
+    recording_state TEXT NOT NULL,
+    published INTEGER NOT NULL CHECK (published IN (0, 1)),
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
+    timing_basis TEXT NOT NULL,
+    PRIMARY KEY (meeting_id, role),
+    UNIQUE (meeting_id, relative_path),
+    FOREIGN KEY (meeting_id)
+        REFERENCES meeting(id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE meeting_audio_timing_anchor (
+    meeting_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    sample_end INTEGER NOT NULL CHECK (sample_end > 0),
+    callback_arrival_offset_ns INTEGER NOT NULL,
+    PRIMARY KEY (meeting_id, role, ordinal),
+    FOREIGN KEY (meeting_id, role)
+        REFERENCES meeting_audio_track(meeting_id, role)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE meeting_audio_error (
+    meeting_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    stage TEXT NOT NULL,
+    exception_module TEXT NOT NULL,
+    exception_name TEXT NOT NULL,
+    message TEXT NOT NULL CHECK (length(message) <= 4096),
+    PRIMARY KEY (meeting_id, role, ordinal),
+    FOREIGN KEY (meeting_id, role)
+        REFERENCES meeting_audio_track(meeting_id, role)
+        ON DELETE CASCADE
+);
