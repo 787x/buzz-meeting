@@ -1,4 +1,3 @@
-import logging
 import platform
 import time
 import uuid
@@ -9,8 +8,12 @@ from buzz.db.entity.transcription import Transcription
 from buzz.db.entity.transcription_segment import TranscriptionSegment
 from buzz.model_loader import ModelType, WhisperModelSize
 from buzz.transcriber.transcriber import Task
+
 # Underlying libs do not support intel Macs or Windows (nemo C extensions crash on Windows CI)
-if not (platform.system() == "Darwin" and platform.machine() == "x86_64") and platform.system() != "Windows":
+if (
+    not (platform.system() == "Darwin" and platform.machine() == "x86_64")
+    and platform.system() != "Windows"
+):
     from buzz.widgets.transcription_viewer.speaker_identification_widget import (
         SpeakerIdentificationWidget,
         IdentificationWorker,
@@ -18,9 +21,11 @@ if not (platform.system() == "Darwin" and platform.machine() == "x86_64") and pl
     )
 from tests.audio import test_audio_path
 
+
 @pytest.mark.skipif(
-    (platform.system() == "Darwin" and platform.machine() == "x86_64") or platform.system() == "Windows",
-    reason="Speaker identification dependencies (nemo/texterrors C extensions) crash on Windows and are unsupported on Intel Mac"
+    (platform.system() == "Darwin" and platform.machine() == "x86_64")
+    or platform.system() == "Windows",
+    reason="Speaker identification dependencies (nemo/texterrors C extensions) crash on Windows and are unsupported on Intel Mac",
 )
 class TestSpeakerIdentificationWidget:
     @pytest.fixture()
@@ -38,14 +43,18 @@ class TestSpeakerIdentificationWidget:
                 whisper_model_size=WhisperModelSize.SMALL.value,
             )
         )
-        transcription_segment_dao.insert(TranscriptionSegment(40, 299, "Bien", "", str(id)))
+        transcription_segment_dao.insert(
+            TranscriptionSegment(40, 299, "Bien", "", str(id))
+        )
         transcription_segment_dao.insert(
             TranscriptionSegment(299, 329, "venue dans", "", str(id))
         )
 
         return transcription_dao.find_by_id(str(id))
 
-    def test_widget_initialization(self, qtbot: QtBot, transcription, transcription_service):
+    def test_widget_initialization(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
         """Test the initialization of SpeakerIdentificationWidget."""
         widget = SpeakerIdentificationWidget(
             transcription=transcription,
@@ -64,10 +73,14 @@ class TestSpeakerIdentificationWidget:
 
     @pytest.mark.skipif(
         platform.system() == "Linux",
-        reason="Skip speaker identification worker test on Linux, CI freezes"
+        reason="Skip speaker identification worker test on Linux, CI freezes",
     )
-    @patch("buzz.widgets.transcription_viewer.speaker_identification_widget.IdentificationWorker")
-    def test_identification_worker_run(self, qtbot: QtBot, transcription, transcription_service):
+    @patch(
+        "buzz.widgets.transcription_viewer.speaker_identification_widget.IdentificationWorker"
+    )
+    def test_identification_worker_run(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
         """Test the IdentificationWorker's run method and capture the finished signal result."""
         worker = IdentificationWorker(
             transcription=transcription,
@@ -81,7 +94,7 @@ class TestSpeakerIdentificationWidget:
 
         worker.finished.connect(capture_result)
 
-        with qtbot.waitSignal(worker.finished, timeout= 300000): #5 min timeout
+        with qtbot.waitSignal(worker.finished, timeout=300000):  # 5 min timeout
             worker.run()
 
         assert worker.transcription == transcription
@@ -98,7 +111,9 @@ class TestSpeakerIdentificationWidget:
         assert normalized_text == "bienvenuedans", segment["text"]
         assert 8000 <= segment["end_time"] <= 9500, segment["end_time"]
 
-    def test_identify_button_toggles_visibility(self, qtbot: QtBot, transcription, transcription_service):
+    def test_identify_button_toggles_visibility(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
         widget = SpeakerIdentificationWidget(
             transcription=transcription,
             transcription_service=transcription_service,
@@ -110,15 +125,17 @@ class TestSpeakerIdentificationWidget:
         assert widget.cancel_button.isHidden()
 
         from PyQt6.QtCore import QThread as RealQThread
+
         mock_thread = MagicMock(spec=RealQThread)
         mock_thread.started = MagicMock()
         mock_thread.started.connect = MagicMock()
 
-        with patch.object(widget, '_cleanup_thread'), \
-             patch('buzz.widgets.transcription_viewer.speaker_identification_widget.QThread', return_value=mock_thread), \
-             patch.object(widget, 'worker', create=True):
+        with patch.object(widget, "_cleanup_thread"), patch(
+            "buzz.widgets.transcription_viewer.speaker_identification_widget.QThread",
+            return_value=mock_thread,
+        ), patch.object(widget, "worker", create=True):
             # patch moveToThread on IdentificationWorker to avoid type error
-            with patch.object(IdentificationWorker, 'moveToThread'):
+            with patch.object(IdentificationWorker, "moveToThread"):
                 widget.on_identify_button_clicked()
 
         # After: identify hidden, cancel visible
@@ -127,7 +144,9 @@ class TestSpeakerIdentificationWidget:
 
         widget.close()
 
-    def test_cancel_button_resets_ui(self, qtbot: QtBot, transcription, transcription_service):
+    def test_cancel_button_resets_ui(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
         widget = SpeakerIdentificationWidget(
             transcription=transcription,
             transcription_service=transcription_service,
@@ -138,7 +157,7 @@ class TestSpeakerIdentificationWidget:
         widget.step_1_button.setVisible(False)
         widget.cancel_button.setVisible(True)
 
-        with patch.object(widget, '_cleanup_thread'):
+        with patch.object(widget, "_cleanup_thread"):
             widget.on_cancel_button_clicked()
 
         assert not widget.step_1_button.isHidden()
@@ -148,7 +167,9 @@ class TestSpeakerIdentificationWidget:
 
         widget.close()
 
-    def test_on_progress_update_sets_label_and_bar(self, qtbot: QtBot, transcription, transcription_service):
+    def test_on_progress_update_sets_label_and_bar(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
         widget = SpeakerIdentificationWidget(
             transcription=transcription,
             transcription_service=transcription_service,
@@ -162,7 +183,9 @@ class TestSpeakerIdentificationWidget:
 
         widget.close()
 
-    def test_on_progress_update_step_8_enables_save(self, qtbot: QtBot, transcription, transcription_service):
+    def test_on_progress_update_step_8_enables_save(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
         widget = SpeakerIdentificationWidget(
             transcription=transcription,
             transcription_service=transcription_service,
@@ -179,7 +202,9 @@ class TestSpeakerIdentificationWidget:
 
         widget.close()
 
-    def test_on_identification_finished_empty_result(self, qtbot: QtBot, transcription, transcription_service):
+    def test_on_identification_finished_empty_result(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
         widget = SpeakerIdentificationWidget(
             transcription=transcription,
             transcription_service=transcription_service,
@@ -196,7 +221,9 @@ class TestSpeakerIdentificationWidget:
 
         widget.close()
 
-    def test_on_identification_finished_populates_speakers(self, qtbot: QtBot, transcription, transcription_service):
+    def test_on_identification_finished_populates_speakers(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
         widget = SpeakerIdentificationWidget(
             transcription=transcription,
             transcription_service=transcription_service,
@@ -204,8 +231,18 @@ class TestSpeakerIdentificationWidget:
         qtbot.addWidget(widget)
 
         result = [
-            {'speaker': 'Speaker 0', 'start_time': 0, 'end_time': 3000, 'text': 'Hello world.'},
-            {'speaker': 'Speaker 1', 'start_time': 3000, 'end_time': 6000, 'text': 'Hi there.'},
+            {
+                "speaker": "Speaker 0",
+                "start_time": 0,
+                "end_time": 3000,
+                "text": "Hello world.",
+            },
+            {
+                "speaker": "Speaker 1",
+                "start_time": 3000,
+                "end_time": 6000,
+                "text": "Hi there.",
+            },
         ]
         widget.on_identification_finished(result)
 
@@ -215,7 +252,9 @@ class TestSpeakerIdentificationWidget:
 
         widget.close()
 
-    def test_on_identification_error_resets_buttons(self, qtbot: QtBot, transcription, transcription_service):
+    def test_on_identification_error_resets_buttons(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
         widget = SpeakerIdentificationWidget(
             transcription=transcription,
             transcription_service=transcription_service,
@@ -241,15 +280,35 @@ class TestSpeakerIdentificationWidget:
         qtbot.addWidget(widget)
 
         result = [
-            {'speaker': 'Speaker 0', 'start_time': 0, 'end_time': 2000, 'text': 'Hello.'},
-            {'speaker': 'Speaker 0', 'start_time': 2000, 'end_time': 4000, 'text': 'World.'},
-            {'speaker': 'Speaker 1', 'start_time': 4000, 'end_time': 6000, 'text': 'Hi.'},
+            {
+                "speaker": "Speaker 0",
+                "start_time": 0,
+                "end_time": 2000,
+                "text": "Hello.",
+            },
+            {
+                "speaker": "Speaker 0",
+                "start_time": 2000,
+                "end_time": 4000,
+                "text": "World.",
+            },
+            {
+                "speaker": "Speaker 1",
+                "start_time": 4000,
+                "end_time": 6000,
+                "text": "Hi.",
+            },
         ]
         widget.on_identification_finished(result)
         widget.merge_speaker_sentences.setChecked(False)
 
-        with patch.object(widget.transcription_service, 'copy_transcription', return_value=uuid.uuid4()) as mock_copy, \
-             patch.object(widget.transcription_service, 'update_transcription_as_completed') as mock_update:
+        with patch.object(
+            widget.transcription_service,
+            "copy_transcription",
+            return_value=uuid.uuid4(),
+        ) as mock_copy, patch.object(
+            widget.transcription_service, "update_transcription_as_completed"
+        ) as mock_update:
             widget.on_save_button_clicked()
 
         mock_copy.assert_called_once()
@@ -260,7 +319,9 @@ class TestSpeakerIdentificationWidget:
 
         widget.close()
 
-    def test_on_save_with_merge(self, qtbot: QtBot, transcription, transcription_service):
+    def test_on_save_with_merge(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
         widget = SpeakerIdentificationWidget(
             transcription=transcription,
             transcription_service=transcription_service,
@@ -268,15 +329,35 @@ class TestSpeakerIdentificationWidget:
         qtbot.addWidget(widget)
 
         result = [
-            {'speaker': 'Speaker 0', 'start_time': 0, 'end_time': 2000, 'text': 'Hello.'},
-            {'speaker': 'Speaker 0', 'start_time': 2000, 'end_time': 4000, 'text': 'World.'},
-            {'speaker': 'Speaker 1', 'start_time': 4000, 'end_time': 6000, 'text': 'Hi.'},
+            {
+                "speaker": "Speaker 0",
+                "start_time": 0,
+                "end_time": 2000,
+                "text": "Hello.",
+            },
+            {
+                "speaker": "Speaker 0",
+                "start_time": 2000,
+                "end_time": 4000,
+                "text": "World.",
+            },
+            {
+                "speaker": "Speaker 1",
+                "start_time": 4000,
+                "end_time": 6000,
+                "text": "Hi.",
+            },
         ]
         widget.on_identification_finished(result)
         widget.merge_speaker_sentences.setChecked(True)
 
-        with patch.object(widget.transcription_service, 'copy_transcription', return_value=uuid.uuid4()), \
-             patch.object(widget.transcription_service, 'update_transcription_as_completed') as mock_update:
+        with patch.object(
+            widget.transcription_service,
+            "copy_transcription",
+            return_value=uuid.uuid4(),
+        ), patch.object(
+            widget.transcription_service, "update_transcription_as_completed"
+        ) as mock_update:
             widget.on_save_button_clicked()
 
         segments = mock_update.call_args[0][1]
@@ -288,7 +369,9 @@ class TestSpeakerIdentificationWidget:
 
         widget.close()
 
-    def test_on_save_emits_transcriptions_updated(self, qtbot: QtBot, transcription, transcription_service):
+    def test_on_save_emits_transcriptions_updated(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
         updated_signal = MagicMock()
         widget = SpeakerIdentificationWidget(
             transcription=transcription,
@@ -297,12 +380,17 @@ class TestSpeakerIdentificationWidget:
         )
         qtbot.addWidget(widget)
 
-        result = [{'speaker': 'Speaker 0', 'start_time': 0, 'end_time': 1000, 'text': 'Hi.'}]
+        result = [
+            {"speaker": "Speaker 0", "start_time": 0, "end_time": 1000, "text": "Hi."}
+        ]
         widget.on_identification_finished(result)
 
         new_id = uuid.uuid4()
-        with patch.object(widget.transcription_service, 'copy_transcription', return_value=new_id), \
-             patch.object(widget.transcription_service, 'update_transcription_as_completed'):
+        with patch.object(
+            widget.transcription_service, "copy_transcription", return_value=new_id
+        ), patch.object(
+            widget.transcription_service, "update_transcription_as_completed"
+        ):
             widget.on_save_button_clicked()
 
         updated_signal.emit.assert_called_once_with(new_id)
@@ -316,31 +404,30 @@ class TestSpeakerIdentificationWidget:
         mock_punct_model.predict.side_effect = lambda batch, chunk_size: [
             (word.strip(), ".") for word in batch
         ]
-        
+
         # Create words list with 201 words (just enough to trigger batch processing)
         words_list = [f"word{i}" for i in range(201)]
-        
+
         # Wrap predict method to match the expected signature
         def predict_wrapper(batch, chunk_size, **kwargs):
             return mock_punct_model.predict(batch, chunk_size=chunk_size)
-        
+
         # Call the generic batch processing function
-        result = process_in_batches(
-            items=words_list,
-            process_func=predict_wrapper
-        )
-        
+        result = process_in_batches(items=words_list, process_func=predict_wrapper)
+
         # Verify that predict was called multiple times (for batches)
-        assert mock_punct_model.predict.call_count >= 2, "Batch processing should split into multiple calls"
-        
+        assert (
+            mock_punct_model.predict.call_count >= 2
+        ), "Batch processing should split into multiple calls"
+
         # Verify that each batch was processed with correct chunk_size
         for call in mock_punct_model.predict.call_args_list:
             args, kwargs = call
             batch = args[0]
-            chunk_size = kwargs.get('chunk_size')
+            chunk_size = kwargs.get("chunk_size")
             assert chunk_size <= 230, "Chunk size should not exceed 230"
             assert len(batch) <= 200, "Batch size should not exceed 200"
-        
+
         # Verify result contains all words
         assert len(result) == 201, "Result should contain all words"
 
@@ -368,14 +455,13 @@ class TestSpeakerIdentificationWidget:
             return mock_punct_model.predict(batch, chunk_size=chunk_size)
 
         # Call the generic batch processing function
-        result = process_in_batches(
-            items=words_list,
-            process_func=predict_wrapper
-        )
+        result = process_in_batches(items=words_list, process_func=predict_wrapper)
 
         # Verify that predict was called multiple times
         # First call fails, then smaller batches succeed
-        assert mock_punct_model.predict.call_count > 1, "Should retry with smaller batches after AssertionError"
+        assert (
+            mock_punct_model.predict.call_count > 1
+        ), "Should retry with smaller batches after AssertionError"
 
         # Verify that smaller batches were used after the error
         call_args_list = mock_punct_model.predict.call_args_list
@@ -383,7 +469,9 @@ class TestSpeakerIdentificationWidget:
         for i, call in enumerate(call_args_list[1:], start=1):  # Skip first failed call
             args, kwargs = call
             batch = args[0]
-            assert len(batch) <= 100, f"After AssertionError, batch size should be <= 100, got {len(batch)}"
+            assert (
+                len(batch) <= 100
+            ), f"After AssertionError, batch size should be <= 100, got {len(batch)}"
 
         # Verify result contains all words
         assert len(result) == 201, "Result should contain all words"
@@ -423,11 +511,17 @@ class TestSpeakerIdentificationWidget:
         # the trailing "Unfinished" word (no terminator) is dropped.
         assert len(result["segments"]) == 1
         assert result["segments"][0]["text"] == "Hello world. "
-        assert [w["word"] for w in result["segments"][0]["words"]] == ["Hello ", "world. "]
+        assert [w["word"] for w in result["segments"][0]["words"]] == [
+            "Hello ",
+            "world. ",
+        ]
 
-    def test_get_transcript_data_joins_segments(self, transcription, transcription_service):
+    def test_get_transcript_data_joins_segments(
+        self, transcription, transcription_service
+    ):
         """_get_transcript_data collapses whitespace and decodes the audio."""
         import numpy as np
+
         worker = IdentificationWorker(transcription, transcription_service)
 
         fake_waveform = np.zeros(10, dtype=np.float32)
@@ -443,9 +537,12 @@ class TestSpeakerIdentificationWidget:
         assert waveform is fake_waveform
         mock_decode.assert_called_once_with(transcription.file)
 
-    def test_setup_device_force_cpu(self, transcription, transcription_service, monkeypatch):
+    def test_setup_device_force_cpu(
+        self, transcription, transcription_service, monkeypatch
+    ):
         """_setup_device honours BUZZ_FORCE_CPU regardless of CUDA availability."""
         import torch
+
         worker = IdentificationWorker(transcription, transcription_service)
         monkeypatch.setenv("BUZZ_FORCE_CPU", "true")
 
@@ -454,9 +551,12 @@ class TestSpeakerIdentificationWidget:
         assert device == "cpu"
         assert torch_dtype == torch.float32
 
-    def test_load_alignment_model_with_retry_success(self, transcription, transcription_service):
+    def test_load_alignment_model_with_retry_success(
+        self, transcription, transcription_service
+    ):
         """Model loads on the first attempt without retrying."""
         import torch
+
         worker = IdentificationWorker(transcription, transcription_service)
         worker._load_alignment_model = MagicMock(return_value=("model", "tokenizer"))
 
@@ -465,27 +565,39 @@ class TestSpeakerIdentificationWidget:
         assert (model, tokenizer) == ("model", "tokenizer")
         assert worker._load_alignment_model.call_count == 1
 
-    def test_load_alignment_model_with_retry_recovers(self, transcription, transcription_service):
+    def test_load_alignment_model_with_retry_recovers(
+        self, transcription, transcription_service
+    ):
         """A first failure is retried and the second attempt succeeds."""
         import torch
+
         worker = IdentificationWorker(transcription, transcription_service)
         worker._load_alignment_model = MagicMock(
             side_effect=[Exception("network"), ("model", "tokenizer")]
         )
 
-        with patch("buzz.widgets.transcription_viewer.speaker_identification_widget.time.sleep"):
-            model, tokenizer = worker._load_alignment_model_with_retry("cpu", torch.float32)
+        with patch(
+            "buzz.widgets.transcription_viewer.speaker_identification_widget.time.sleep"
+        ):
+            model, tokenizer = worker._load_alignment_model_with_retry(
+                "cpu", torch.float32
+            )
 
         assert (model, tokenizer) == ("model", "tokenizer")
         assert worker._load_alignment_model.call_count == 2
 
-    def test_load_alignment_model_with_retry_exhausted_raises(self, transcription, transcription_service):
+    def test_load_alignment_model_with_retry_exhausted_raises(
+        self, transcription, transcription_service
+    ):
         """After all attempts fail a RuntimeError is raised."""
         import torch
+
         worker = IdentificationWorker(transcription, transcription_service)
         worker._load_alignment_model = MagicMock(side_effect=Exception("network"))
 
-        with patch("buzz.widgets.transcription_viewer.speaker_identification_widget.time.sleep"):
+        with patch(
+            "buzz.widgets.transcription_viewer.speaker_identification_widget.time.sleep"
+        ):
             with pytest.raises(RuntimeError):
                 worker._load_alignment_model_with_retry("cpu", torch.float32)
 
@@ -523,7 +635,9 @@ class TestSpeakerIdentificationWidget:
         assert len(errors) == 1
         assert "no module" in errors[0]
 
-    def test_map_speakers_unsupported_language_skips_punctuation(self, transcription, transcription_service):
+    def test_map_speakers_unsupported_language_skips_punctuation(
+        self, transcription, transcription_service
+    ):
         """For an unsupported language, punctuation restoration is skipped."""
         worker = IdentificationWorker(transcription, transcription_service)
 
@@ -537,7 +651,9 @@ class TestSpeakerIdentificationWidget:
         worker._get_sentences_speaker_mapping = MagicMock(return_value=["sentence"])
 
         result = worker._map_speakers_with_punctuation(
-            word_timestamps=[], speaker_ts=[], language="xx",
+            word_timestamps=[],
+            speaker_ts=[],
+            language="xx",
         )
 
         assert result == ["sentence"]
@@ -549,7 +665,9 @@ class TestSpeakerIdentificationWidget:
     # SpeakerIdentificationWidget unit tests
     # ------------------------------------------------------------------
 
-    def test_on_progress_update_invalid_format(self, qtbot: QtBot, transcription, transcription_service):
+    def test_on_progress_update_invalid_format(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
         """A non-numeric progress string updates the label but not the bar."""
         widget = SpeakerIdentificationWidget(
             transcription=transcription,
@@ -566,7 +684,9 @@ class TestSpeakerIdentificationWidget:
 
         widget.close()
 
-    def test_on_speaker_preview_plays_segment(self, qtbot: QtBot, transcription, transcription_service):
+    def test_on_speaker_preview_plays_segment(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
         """on_speaker_preview seeks and plays for a matching speaker."""
         widget = SpeakerIdentificationWidget(
             transcription=transcription,
@@ -575,12 +695,18 @@ class TestSpeakerIdentificationWidget:
         qtbot.addWidget(widget)
 
         widget.identification_result = [
-            {'speaker': 'Speaker 0', 'start_time': 1500, 'end_time': 2000, 'text': 'Hi'},
+            {
+                "speaker": "Speaker 0",
+                "start_time": 1500,
+                "end_time": 2000,
+                "text": "Hi",
+            },
         ]
 
-        with patch.object(widget.player, 'setPosition') as mock_set, \
-             patch.object(widget.player, 'play') as mock_play:
-            widget.on_speaker_preview('Speaker 0')
+        with patch.object(widget.player, "setPosition") as mock_set, patch.object(
+            widget.player, "play"
+        ) as mock_play:
+            widget.on_speaker_preview("Speaker 0")
 
             mock_set.assert_called_once_with(1500)
             mock_play.assert_called_once()
@@ -589,7 +715,9 @@ class TestSpeakerIdentificationWidget:
         widget.player_timer.stop()
         widget.close()
 
-    def test_on_speaker_preview_no_matching_records(self, qtbot: QtBot, transcription, transcription_service):
+    def test_on_speaker_preview_no_matching_records(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
         """on_speaker_preview does nothing when the speaker has no records."""
         widget = SpeakerIdentificationWidget(
             transcription=transcription,
@@ -598,16 +726,18 @@ class TestSpeakerIdentificationWidget:
         qtbot.addWidget(widget)
 
         widget.identification_result = [
-            {'speaker': 'Speaker 0', 'start_time': 0, 'end_time': 1000, 'text': 'Hi'},
+            {"speaker": "Speaker 0", "start_time": 0, "end_time": 1000, "text": "Hi"},
         ]
 
-        with patch.object(widget.player, 'play') as mock_play:
-            widget.on_speaker_preview('Speaker 99')
+        with patch.object(widget.player, "play") as mock_play:
+            widget.on_speaker_preview("Speaker 99")
             mock_play.assert_not_called()
 
         widget.close()
 
-    def test_show_model_selector(self, qtbot: QtBot, transcription, transcription_service):
+    def test_show_model_selector(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
         """_show_model_selector swaps the progress bar back for the model selector."""
         widget = SpeakerIdentificationWidget(
             transcription=transcription,
@@ -625,7 +755,9 @@ class TestSpeakerIdentificationWidget:
 
         widget.close()
 
-    def test_cleanup_thread_when_none(self, qtbot: QtBot, transcription, transcription_service):
+    def test_cleanup_thread_when_none(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
         """_cleanup_thread is safe when there is no active thread/worker."""
         widget = SpeakerIdentificationWidget(
             transcription=transcription,
@@ -644,7 +776,9 @@ class TestSpeakerIdentificationWidget:
 
         widget.close()
 
-    def test_identify_uses_selected_diarizer(self, qtbot: QtBot, transcription, transcription_service):
+    def test_identify_uses_selected_diarizer(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
         """The Sortformer radio selects the sortformer diarizer for the worker."""
         widget = SpeakerIdentificationWidget(
             transcription=transcription,
@@ -655,15 +789,254 @@ class TestSpeakerIdentificationWidget:
         widget.sortformer_radio.setChecked(True)
 
         from PyQt6.QtCore import QThread as RealQThread
+
         mock_thread = MagicMock(spec=RealQThread)
         mock_thread.started = MagicMock()
 
-        with patch.object(widget, '_cleanup_thread'), \
-             patch('buzz.widgets.transcription_viewer.speaker_identification_widget.QThread', return_value=mock_thread), \
-             patch.object(IdentificationWorker, 'moveToThread'):
+        with patch.object(widget, "_cleanup_thread"), patch(
+            "buzz.widgets.transcription_viewer.speaker_identification_widget.QThread",
+            return_value=mock_thread,
+        ), patch.object(IdentificationWorker, "moveToThread"):
             widget.on_identify_button_clicked()
 
         assert widget.worker.diarizer == "sortformer"
 
         widget.close()
 
+    # ------------------------------------------------------------------
+    # Delegation seam tests
+    #
+    # We mock WhisperDiarizationRunner at its source module so the widget's
+    # ``from ... import`` picks up the mock, and verify the constructor
+    # receives the correct backend / device kwargs.
+    # ------------------------------------------------------------------
+
+    def test_run_diarization_chooses_msdd(self, transcription, transcription_service):
+        """_run_diarization uses MSDD backend when self.diarizer == 'msdd'."""
+        import numpy as np
+        from buzz.meeting.speaker_diarization import (
+            SpeakerDiarizationBackend,
+            SpeakerDiarizationService,
+        )
+
+        worker = IdentificationWorker(
+            transcription, transcription_service, diarizer="msdd"
+        )
+        waveform = np.zeros(16_000, dtype=np.float32)
+
+        mock_runner_inst = MagicMock()
+        mock_runner_inst.diarize.return_value = []
+
+        with patch(
+            "buzz.meeting.speaker_diarization_adapter.WhisperDiarizationRunner",
+            return_value=mock_runner_inst,
+        ) as mock_runner_cls, patch.object(
+            SpeakerDiarizationService,
+            "diarize",
+            return_value=(),
+        ):
+            worker._run_diarization(waveform, "cpu")
+
+        _, kwargs = mock_runner_cls.call_args
+        assert kwargs["backend"] == SpeakerDiarizationBackend.MSDD
+
+    def test_run_diarization_chooses_sortformer(
+        self, transcription, transcription_service
+    ):
+        """_run_diarization uses SORTFORMER backend when self.diarizer == 'sortformer'."""
+        import numpy as np
+        from buzz.meeting.speaker_diarization import (
+            SpeakerDiarizationBackend,
+            SpeakerDiarizationService,
+        )
+
+        worker = IdentificationWorker(
+            transcription, transcription_service, diarizer="sortformer"
+        )
+        waveform = np.zeros(16_000, dtype=np.float32)
+
+        mock_runner_inst = MagicMock()
+        mock_runner_inst.diarize.return_value = []
+
+        with patch(
+            "buzz.meeting.speaker_diarization_adapter.WhisperDiarizationRunner",
+            return_value=mock_runner_inst,
+        ) as mock_runner_cls, patch.object(
+            SpeakerDiarizationService,
+            "diarize",
+            return_value=(),
+        ):
+            worker._run_diarization(waveform, "cuda")
+
+        _, kwargs = mock_runner_cls.call_args
+        assert kwargs["backend"] == SpeakerDiarizationBackend.SORTFORMER
+
+    def test_run_diarization_passes_device(self, transcription, transcription_service):
+        """_run_diarization passes the resolved device unchanged to the runner."""
+        import numpy as np
+        from buzz.meeting.speaker_diarization import SpeakerDiarizationService
+
+        worker = IdentificationWorker(
+            transcription, transcription_service, diarizer="msdd"
+        )
+        waveform = np.zeros(16_000, dtype=np.float32)
+
+        mock_runner_inst = MagicMock()
+        mock_runner_inst.diarize.return_value = []
+
+        with patch(
+            "buzz.meeting.speaker_diarization_adapter.WhisperDiarizationRunner",
+            return_value=mock_runner_inst,
+        ) as mock_runner_cls, patch.object(
+            SpeakerDiarizationService,
+            "diarize",
+            return_value=(),
+        ):
+            worker._run_diarization(waveform, "cuda")
+
+        _, kwargs = mock_runner_cls.call_args
+        assert kwargs["device"] == "cuda"
+
+    def test_run_diarization_passes_audio_as_16000hz(
+        self, transcription, transcription_service
+    ):
+        """_run_diarization wraps the waveform as a 16000-Hz SpeakerDiarizationAudio."""
+        import numpy as np
+        from buzz.meeting.speaker_diarization import SpeakerDiarizationService
+
+        worker = IdentificationWorker(
+            transcription, transcription_service, diarizer="msdd"
+        )
+        waveform = np.ones(8_000, dtype=np.float32)
+
+        mock_runner_inst = MagicMock()
+        mock_runner_inst.diarize.return_value = []
+
+        captured_audio = []
+
+        def _capture(self_inner, audio):
+            captured_audio.append(audio)
+            return []
+
+        with patch(
+            "buzz.meeting.speaker_diarization_adapter.WhisperDiarizationRunner",
+            return_value=mock_runner_inst,
+        ), patch.object(SpeakerDiarizationService, "diarize", _capture):
+            worker._run_diarization(waveform, "cpu")
+
+        assert len(captured_audio) == 1
+        audio = captured_audio[0]
+        assert audio.sample_rate == 16_000
+        np.testing.assert_array_equal(audio.waveform, waveform)
+
+    def test_run_diarization_converts_dtos_to_tuples(
+        self, transcription, transcription_service
+    ):
+        """_run_diarization converts DTOs back to (start, end, speaker) tuples."""
+        import numpy as np
+        from buzz.meeting.speaker_diarization import (
+            SpeakerDiarizationService,
+            SpeakerDiarizationTurn,
+        )
+
+        worker = IdentificationWorker(
+            transcription, transcription_service, diarizer="msdd"
+        )
+        waveform = np.zeros(16_000, dtype=np.float32)
+
+        dtos = [
+            SpeakerDiarizationTurn(speaker_index=0, start_ms=0, end_ms=1000),
+            SpeakerDiarizationTurn(speaker_index=1, start_ms=1000, end_ms=2000),
+        ]
+
+        mock_runner_inst = MagicMock()
+        mock_runner_inst.diarize.return_value = []
+
+        with patch(
+            "buzz.meeting.speaker_diarization_adapter.WhisperDiarizationRunner",
+            return_value=mock_runner_inst,
+        ), patch.object(SpeakerDiarizationService, "diarize", return_value=tuple(dtos)):
+            result = worker._run_diarization(waveform, "cpu")
+
+        assert result == [(0, 1000, 0), (1000, 2000, 1)]
+
+    def test_finished_payload_unchanged(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
+        """Legacy finished payload structure remains list-of-dicts with expected keys."""
+        widget = SpeakerIdentificationWidget(
+            transcription=transcription,
+            transcription_service=transcription_service,
+        )
+        qtbot.addWidget(widget)
+
+        result = [
+            {
+                "speaker": "Speaker 0",
+                "start_time": 0,
+                "end_time": 3000,
+                "text": "Hello world.",
+            },
+            {
+                "speaker": "Speaker 1",
+                "start_time": 3000,
+                "end_time": 6000,
+                "text": "Hi there.",
+            },
+        ]
+        widget.on_identification_finished(result)
+
+        assert widget.identification_result == result
+        assert widget.speaker_preview_row.count() == 2
+
+        widget.close()
+
+    def test_save_name_merge_unchanged(
+        self, qtbot: QtBot, transcription, transcription_service
+    ):
+        """Legacy save/name/merge behaviour remains unchanged."""
+        widget = SpeakerIdentificationWidget(
+            transcription=transcription,
+            transcription_service=transcription_service,
+        )
+        qtbot.addWidget(widget)
+
+        result = [
+            {
+                "speaker": "Speaker 0",
+                "start_time": 0,
+                "end_time": 2000,
+                "text": "Hello.",
+            },
+            {
+                "speaker": "Speaker 0",
+                "start_time": 2000,
+                "end_time": 4000,
+                "text": "World.",
+            },
+            {
+                "speaker": "Speaker 1",
+                "start_time": 4000,
+                "end_time": 6000,
+                "text": "Hi.",
+            },
+        ]
+        widget.on_identification_finished(result)
+        widget.merge_speaker_sentences.setChecked(True)
+
+        with patch.object(
+            widget.transcription_service,
+            "copy_transcription",
+            return_value=uuid.uuid4(),
+        ), patch.object(
+            widget.transcription_service, "update_transcription_as_completed"
+        ) as mock_update:
+            widget.on_save_button_clicked()
+
+        segments = mock_update.call_args[0][1]
+        assert len(segments) == 2
+        assert "Speaker 0" in segments[0].text
+        assert "Hello." in segments[0].text
+        assert "World." in segments[0].text
+
+        widget.close()
