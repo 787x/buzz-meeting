@@ -11,11 +11,14 @@ from typing import Optional
 # This must be done before importing libraries that download from Hugging Face
 try:
     import certifi
-    os.environ.setdefault('REQUESTS_CA_BUNDLE', certifi.where())
-    os.environ.setdefault('SSL_CERT_FILE', certifi.where())
-    os.environ.setdefault('SSL_CERT_DIR', os.path.dirname(certifi.where()))
+
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    os.environ.setdefault("SSL_CERT_DIR", os.path.dirname(certifi.where()))
     # Also update the default SSL context for urllib
-    ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
+    ssl._create_default_https_context = lambda: ssl.create_default_context(
+        cafile=certifi.where()
+    )
 except ImportError:
     pass
 
@@ -49,7 +52,6 @@ from buzz.widgets.line_edit import LineEdit
 from buzz.transcriber.transcriber import Segment
 
 
-
 def process_in_batches(
     items,
     process_func,
@@ -57,15 +59,15 @@ def process_in_batches(
     chunk_size=230,
     smaller_batch_size=100,
     exception_types=(AssertionError,),
-    **process_func_kwargs
+    **process_func_kwargs,
 ):
     """
     Process items in batches with automatic fallback to smaller batches on errors.
-    
+
     This is a generic batch processing function that can be used with any processing
     function that has chunk size limitations. It automatically retries with smaller
     batches when specified exceptions occur.
-    
+
     Args:
         items: List of items to process
         process_func: Callable that processes a batch. Should accept (batch, chunk_size, **kwargs)
@@ -76,10 +78,10 @@ def process_in_batches(
         exception_types: Tuple of exception types to catch and retry with smaller batches
                         (default: (AssertionError,))
         **process_func_kwargs: Additional keyword arguments to pass to process_func
-        
+
     Returns:
         List of processed results (concatenated from all batches)
-        
+
     Example:
         >>> def my_predict(batch, chunk_size):
         ...     return [f"processed_{item}" for item in batch]
@@ -92,19 +94,26 @@ def process_in_batches(
     all_results = []
 
     for i in range(0, len(items), batch_size):
-        batch = items[i:i + batch_size]
+        batch = items[i : i + batch_size]
         try:
-            batch_results = process_func(batch, chunk_size=min(chunk_size, len(batch)), **process_func_kwargs)
+            batch_results = process_func(
+                batch, chunk_size=min(chunk_size, len(batch)), **process_func_kwargs
+            )
             all_results.extend(batch_results)
         except exception_types as e:
             # If batch still fails, try with even smaller chunks
             logging.warning(f"Batch processing failed, trying smaller chunks: {e}")
             for j in range(0, len(batch), smaller_batch_size):
-                smaller_batch = batch[j:j + smaller_batch_size]
-                smaller_results = process_func(smaller_batch, chunk_size=min(chunk_size, len(smaller_batch)), **process_func_kwargs)
+                smaller_batch = batch[j : j + smaller_batch_size]
+                smaller_results = process_func(
+                    smaller_batch,
+                    chunk_size=min(chunk_size, len(smaller_batch)),
+                    **process_func_kwargs,
+                )
                 all_results.extend(smaller_results)
 
     return all_results
+
 
 @contextmanager
 def hide_cuda_from_torch(device):
@@ -129,7 +138,8 @@ def hide_cuda_from_torch(device):
         torch.cuda.is_available = original_is_available
 
 
-SENTENCE_END = re.compile(r'.*[.!?。！？]')
+SENTENCE_END = re.compile(r".*[.!?。！？]")
+
 
 class IdentificationWorker(QObject):
     finished = pyqtSignal(list)
@@ -156,25 +166,21 @@ class IdentificationWorker(QObject):
         words = []
         text = ""
         for buzz_segment in buzz_segments:
-            words.append({
-                'word': buzz_segment.text + " ",
-                'start': buzz_segment.start_time / 100,
-                'end': buzz_segment.end_time / 100,
-            })
+            words.append(
+                {
+                    "word": buzz_segment.text + " ",
+                    "start": buzz_segment.start_time / 100,
+                    "end": buzz_segment.end_time / 100,
+                }
+            )
             text += buzz_segment.text + " "
 
             if SENTENCE_END.match(buzz_segment.text):
-                segments.append({
-                    'text': text,
-                    'words': words
-                })
+                segments.append({"text": text, "words": words})
                 words = []
                 text = ""
 
-        return {
-            'language': self.transcription.language,
-            'segments': segments
-        }
+        return {"language": self.transcription.language, "segments": segments}
 
     def _import_libraries(self):
         from ctc_forced_aligner.ctc_forced_aligner import (
@@ -192,8 +198,9 @@ class IdentificationWorker(QObject):
             langs_to_iso,
             punct_model_langs,
         )
-        from deepmultilingualpunctuation.deepmultilingualpunctuation import PunctuationModel
-        from whisper_diarization.diarization import MSDDDiarizer, SortformerDiarizer
+        from deepmultilingualpunctuation.deepmultilingualpunctuation import (
+            PunctuationModel,
+        )
 
         # Store on the instance so the other worker methods can access them.
         # (Local imports here would otherwise be out of scope elsewhere.)
@@ -203,14 +210,14 @@ class IdentificationWorker(QObject):
         self._load_alignment_model = load_alignment_model
         self._postprocess_results = postprocess_results
         self._preprocess_text = preprocess_text
-        self._get_realigned_ws_mapping_with_punctuation = get_realigned_ws_mapping_with_punctuation
+        self._get_realigned_ws_mapping_with_punctuation = (
+            get_realigned_ws_mapping_with_punctuation
+        )
         self._get_sentences_speaker_mapping = get_sentences_speaker_mapping
         self._get_words_speaker_mapping = get_words_speaker_mapping
         self._langs_to_iso = langs_to_iso
         self._punct_model_langs = punct_model_langs
         self._PunctuationModel = PunctuationModel
-        self._MSDDDiarizer = MSDDDiarizer
-        self._SortformerDiarizer = SortformerDiarizer
 
     def _get_transcript_data(self):
         language = self.transcription.language if self.transcription.language else "en"
@@ -220,7 +227,7 @@ class IdentificationWorker(QObject):
         )
 
         full_transcript = " ".join(segment.text for segment in segments)
-        full_transcript = re.sub(r' {2,}', ' ', full_transcript)
+        full_transcript = re.sub(r" {2,}", " ", full_transcript)
 
         audio_waveform = faster_whisper.decode_audio(self.transcription.file)
         return language, full_transcript, audio_waveform
@@ -228,10 +235,9 @@ class IdentificationWorker(QObject):
     def _setup_device(self):
         # "Disable GPU" in Preferences exports BUZZ_FORCE_CPU, but read the setting too
         # so the preference applies even if the environment was not updated.
-        force_cpu = (
-            os.getenv("BUZZ_FORCE_CPU", "false").lower() == "true"
-            or Settings().value(Settings.Key.FORCE_CPU, False)
-        )
+        force_cpu = os.getenv(
+            "BUZZ_FORCE_CPU", "false"
+        ).lower() == "true" or Settings().value(Settings.Key.FORCE_CPU, False)
         use_cuda = torch.cuda.is_available() and not force_cpu
         device = "cuda" if use_cuda else "cpu"
         torch_dtype = torch.float16 if use_cuda else torch.float32
@@ -260,6 +266,7 @@ class IdentificationWorker(QObject):
                     # (env vars are only read at import time)
                     try:
                         import huggingface_hub.constants
+
                         huggingface_hub.constants.HF_HUB_OFFLINE = True
                         logging.debug("Speaker identification: Enabled HF offline mode")
                     except Exception as offline_err:
@@ -267,11 +274,13 @@ class IdentificationWorker(QObject):
                     self.progress_update.emit(
                         _("3/8 Loading alignment model (retrying with cache...)")
                     )
-                    time.sleep(2 ** attempt)  # 1s, 2s backoff
+                    time.sleep(2**attempt)  # 1s, 2s backoff
                 else:
                     raise RuntimeError(
-                        _("Failed to load alignment model. "
-                          "Please check your internet connection and try again.")
+                        _(
+                            "Failed to load alignment model. "
+                            "Please check your internet connection and try again."
+                        )
                     ) from e
         return alignment_model, alignment_tokenizer
 
@@ -289,7 +298,9 @@ class IdentificationWorker(QObject):
             del alignment_model
             torch.cuda.empty_cache()
 
-    def _get_word_timestamps(self, full_transcript, language, emissions, stride, alignment_tokenizer):
+    def _get_word_timestamps(
+        self, full_transcript, language, emissions, stride, alignment_tokenizer
+    ):
         tokens_starred, text_starred = self._preprocess_text(
             full_transcript,
             romanize=True,
@@ -308,34 +319,49 @@ class IdentificationWorker(QObject):
         return word_timestamps
 
     def _run_diarization(self, audio_waveform, device):
+        from buzz.meeting.speaker_diarization import (
+            SpeakerDiarizationAudio,
+            SpeakerDiarizationBackend,
+            SpeakerDiarizationService,
+        )
+        from buzz.meeting.speaker_diarization_adapter import WhisperDiarizationRunner
+
         # Silence NeMo's verbose logging
         logging.getLogger("nemo_logging").setLevel(logging.ERROR)
         try:
             from nemo.utils import logging as nemo_logging
+
             nemo_logging.setLevel(logging.ERROR)
         except (ImportError, AttributeError):
             pass
 
+        backend = (
+            SpeakerDiarizationBackend.SORTFORMER
+            if self.diarizer == "sortformer"
+            else SpeakerDiarizationBackend.MSDD
+        )
+
         logging.debug(
             "Speaker identification worker: Creating diarizer model (%s)", self.diarizer
         )
-        diarizer_model = None
-        try:
-            with hide_cuda_from_torch(device):
-                if self.diarizer == "sortformer":
-                    diarizer_model = self._SortformerDiarizer(device)
-                else:
-                    diarizer_model = self._MSDDDiarizer(device)
-                logging.debug("Speaker identification worker: Running diarization (this may take a while on CPU)")
-                speaker_ts = diarizer_model.diarize(torch.from_numpy(audio_waveform).unsqueeze(0))
-            logging.debug("Speaker identification worker: Diarization complete")
-            return speaker_ts
-        finally:
-            if diarizer_model is not None:
-                del diarizer_model
-            torch.cuda.empty_cache()
+        runner = WhisperDiarizationRunner(backend=backend, device=device)
+        service = SpeakerDiarizationService(runner)
+        audio = SpeakerDiarizationAudio(
+            waveform=audio_waveform,
+            sample_rate=16_000,
+        )
 
-    def _map_speakers_with_punctuation(self, word_timestamps, speaker_ts, language, device=None):
+        logging.debug(
+            "Speaker identification worker: Running diarization (this may take a while on CPU)"
+        )
+        turns = service.diarize(audio)
+        logging.debug("Speaker identification worker: Diarization complete")
+
+        return [(turn.start_ms, turn.end_ms, turn.speaker_index) for turn in turns]
+
+    def _map_speakers_with_punctuation(
+        self, word_timestamps, speaker_ts, language, device=None
+    ):
         wsm = self._get_words_speaker_mapping(word_timestamps, speaker_ts, "start")
 
         if language in self._punct_model_langs:
@@ -351,22 +377,22 @@ class IdentificationWorker(QObject):
                     return punct_model.predict(batch, chunk_size=chunk_size)
 
                 labled_words = process_in_batches(
-                    items=words_list,
-                    process_func=predict_wrapper
+                    items=words_list, process_func=predict_wrapper
                 )
 
             ending_puncts = ".?!。！？"
             model_puncts = ".,;:!?。！？"
 
             # We don't want to punctuate U.S.A. with a period. Right?
-            is_acronym = lambda x: re.fullmatch(r"\b(?:[a-zA-Z]\.){2,}", x)
+            def is_acronym(x):
+                return re.fullmatch(r"\b(?:[a-zA-Z]\.){2,}", x)
 
             for word_dict, labeled_tuple in zip(wsm, labled_words):
                 word = word_dict["word"]
                 if (
-                        word
-                        and labeled_tuple[1] in ending_puncts
-                        and (word[-1] not in model_puncts or is_acronym(word))
+                    word
+                    and labeled_tuple[1] in ending_puncts
+                    and (word[-1] not in model_puncts or is_acronym(word))
                 ):
                     word += labeled_tuple[1]
                     if word.endswith(".."):
@@ -406,6 +432,7 @@ class IdentificationWorker(QObject):
         # Reset offline mode so it doesn't affect other operations
         try:
             import huggingface_hub.constants
+
             huggingface_hub.constants.HF_HUB_OFFLINE = False
         except Exception:
             pass
@@ -414,9 +441,13 @@ class IdentificationWorker(QObject):
         try:
             self._import_libraries()
         except ImportError as e:
-            logging.exception("Failed to import speaker identification libraries: %s", e)
+            logging.exception(
+                "Failed to import speaker identification libraries: %s", e
+            )
             self.error.emit(
-                _("Speaker identification is not available: failed to load required libraries.")
+                _(
+                    "Speaker identification is not available: failed to load required libraries."
+                )
                 + f"\n\n{e}"
             )
             return
@@ -443,8 +474,12 @@ class IdentificationWorker(QObject):
                 return
 
             self.progress_update.emit(_("3/8 Loading alignment model"))
-            alignment_model, alignment_tokenizer = self._load_alignment_model_with_retry(
-                device, torch_dtype,
+            (
+                alignment_model,
+                alignment_tokenizer,
+            ) = self._load_alignment_model_with_retry(
+                device,
+                torch_dtype,
             )
 
             if self._cancel_if_requested("at step 4"):
@@ -453,7 +488,9 @@ class IdentificationWorker(QObject):
             self.progress_update.emit(_("4/8 Processing audio"))
             logging.debug("Speaker identification worker: Generating emissions")
             emissions, stride = self._generate_emissions_and_cleanup(
-                alignment_model, audio_waveform, device,
+                alignment_model,
+                audio_waveform,
+                device,
             )
             alignment_model = None
             logging.debug("Speaker identification worker: Emissions generated")
@@ -463,7 +500,11 @@ class IdentificationWorker(QObject):
 
             self.progress_update.emit(_("5/8 Preparing transcripts"))
             word_timestamps = self._get_word_timestamps(
-                full_transcript, language, emissions, stride, alignment_tokenizer,
+                full_transcript,
+                language,
+                emissions,
+                stride,
+                alignment_tokenizer,
             )
 
             if self._cancel_if_requested("at step 6"):
@@ -477,7 +518,10 @@ class IdentificationWorker(QObject):
 
             self.progress_update.emit(_("7/8 Mapping speakers to transcripts"))
             ssm = self._map_speakers_with_punctuation(
-                word_timestamps, speaker_ts, language, device,
+                word_timestamps,
+                speaker_ts,
+                language,
+                device,
             )
 
             logging.debug("Speaker identification worker: Finished successfully")
@@ -535,7 +579,9 @@ class SpeakerIdentificationWidget(QWidget):
         layout.addRow(step_1_label)
 
         step_1_group_box = QGroupBox(self)
-        step_1_group_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        step_1_group_box.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         step_1_group_box.setMinimumWidth(630)
         step_1_layout = QVBoxLayout(step_1_group_box)
 
@@ -596,7 +642,9 @@ class SpeakerIdentificationWidget(QWidget):
 
         layout.addRow(step_1_group_box)
 
-        spacer = QSpacerItem(0, 10, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        spacer = QSpacerItem(
+            0, 10, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed
+        )
         layout.addItem(spacer)
 
     def _create_step_2_group(self, layout: QFormLayout) -> None:
@@ -607,7 +655,9 @@ class SpeakerIdentificationWidget(QWidget):
         layout.addRow(step_2_label)
 
         self.step_2_group_box = QGroupBox(self)
-        self.step_2_group_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.step_2_group_box.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         self.step_2_group_box.setEnabled(False)
         step_2_layout = QVBoxLayout(self.step_2_group_box)
 
@@ -617,7 +667,9 @@ class SpeakerIdentificationWidget(QWidget):
 
         self.speaker_0_preview_button = QPushButton(_("Play sample"))
         self.speaker_0_preview_button.setMinimumWidth(200)
-        self.speaker_0_preview_button.clicked.connect(lambda: self.on_speaker_preview("Speaker 0"))
+        self.speaker_0_preview_button.clicked.connect(
+            lambda: self.on_speaker_preview("Speaker 0")
+        )
 
         speaker_0_layout = QHBoxLayout()
         speaker_0_layout.addWidget(self.speaker_0_input)
@@ -664,7 +716,9 @@ class SpeakerIdentificationWidget(QWidget):
         # Clean up any existing thread before starting a new one
         self._cleanup_thread()
 
-        logging.debug("Speaker identification: Starting identification thread (%s)", diarizer)
+        logging.debug(
+            "Speaker identification: Starting identification thread (%s)", diarizer
+        )
 
         self.thread = QThread()
         self.worker = IdentificationWorker(
@@ -742,7 +796,7 @@ class SpeakerIdentificationWidget(QWidget):
             logging.debug("Speaker identification: Empty result received")
             return
 
-        unique_speakers = {entry['speaker'] for entry in result}
+        unique_speakers = {entry["speaker"] for entry in result}
 
         while self.speaker_preview_row.count():
             item = self.speaker_preview_row.takeAt(0)
@@ -764,7 +818,9 @@ class SpeakerIdentificationWidget(QWidget):
 
             speaker_preview_button = QPushButton(_("Play sample"))
             speaker_preview_button.setMinimumWidth(200)
-            speaker_preview_button.clicked.connect(lambda checked, s=speaker: self.on_speaker_preview(s))
+            speaker_preview_button.clicked.connect(
+                lambda checked, s=speaker: self.on_speaker_preview(s)
+            )
 
             speaker_layout = QHBoxLayout()
             speaker_layout.addWidget(speaker_input)
@@ -782,13 +838,17 @@ class SpeakerIdentificationWidget(QWidget):
         if self.player_timer:
             self.player_timer.stop()
 
-        speaker_records = [record for record in self.identification_result if record['speaker'] == speaker_id]
+        speaker_records = [
+            record
+            for record in self.identification_result
+            if record["speaker"] == speaker_id
+        ]
 
         if speaker_records:
             random_record = random.choice(speaker_records)
 
-            start_time = random_record['start_time']
-            end_time = random_record['end_time']
+            start_time = random_record["start_time"]
+            end_time = random_record["end_time"]
 
             self.player.setPosition(int(start_time))
             self.player.play()
@@ -809,7 +869,7 @@ class SpeakerIdentificationWidget(QWidget):
                     if isinstance(widget, LineEdit):
                         speaker_names.append(widget.text())
 
-        unique_speakers = {entry['speaker'] for entry in self.identification_result}
+        unique_speakers = {entry["speaker"] for entry in self.identification_result}
         original_speakers = sorted(unique_speakers)
         speaker_mapping = dict(zip(original_speakers, speaker_names))
 
@@ -818,40 +878,40 @@ class SpeakerIdentificationWidget(QWidget):
             previous_segment = None
 
             for entry in self.identification_result:
-                speaker_name = speaker_mapping.get(entry['speaker'], entry['speaker'])
+                speaker_name = speaker_mapping.get(entry["speaker"], entry["speaker"])
 
-                if previous_segment and previous_segment['speaker'] == speaker_name:
-                    previous_segment['end_time'] = entry['end_time']
-                    previous_segment['text'] += " " + entry['text']
+                if previous_segment and previous_segment["speaker"] == speaker_name:
+                    previous_segment["end_time"] = entry["end_time"]
+                    previous_segment["text"] += " " + entry["text"]
                 else:
                     if previous_segment:
                         segment = Segment(
-                            start=previous_segment['start_time'],
-                            end=previous_segment['end_time'],
-                            text=f"{previous_segment['speaker']}: {previous_segment['text']}"
+                            start=previous_segment["start_time"],
+                            end=previous_segment["end_time"],
+                            text=f"{previous_segment['speaker']}: {previous_segment['text']}",
                         )
                         segments.append(segment)
                     previous_segment = {
-                        'start_time': entry['start_time'],
-                        'end_time': entry['end_time'],
-                        'speaker': speaker_name,
-                        'text': entry['text']
+                        "start_time": entry["start_time"],
+                        "end_time": entry["end_time"],
+                        "speaker": speaker_name,
+                        "text": entry["text"],
                     }
 
             if previous_segment:
                 segment = Segment(
-                    start=previous_segment['start_time'],
-                    end=previous_segment['end_time'],
-                    text=f"{previous_segment['speaker']}: {previous_segment['text']}"
+                    start=previous_segment["start_time"],
+                    end=previous_segment["end_time"],
+                    text=f"{previous_segment['speaker']}: {previous_segment['text']}",
                 )
                 segments.append(segment)
         else:
             for entry in self.identification_result:
-                speaker_name = speaker_mapping.get(entry['speaker'], entry['speaker'])
+                speaker_name = speaker_mapping.get(entry["speaker"], entry["speaker"])
                 segment = Segment(
-                    start=entry['start_time'],
-                    end=entry['end_time'],
-                    text=f"{speaker_name}: {entry['text']}"
+                    start=entry["start_time"],
+                    end=entry["end_time"],
+                    text=f"{speaker_name}: {entry['text']}",
                 )
                 segments.append(segment)
 
@@ -859,7 +919,9 @@ class SpeakerIdentificationWidget(QWidget):
             self.transcription.id_as_uuid
         )
 
-        self.transcription_service.update_transcription_as_completed(new_transcript_id, segments)
+        self.transcription_service.update_transcription_as_completed(
+            new_transcript_id, segments
+        )
 
         # TODO - See if we can get rows in the transcription viewer to be of variable height
         #        If text is longer they should expand
@@ -905,7 +967,9 @@ class SpeakerIdentificationWidget(QWidget):
             logging.debug("Speaker identification: Stopping running thread")
             self.thread.quit()
             if not self.thread.wait(10000):  # Wait up to 10 seconds
-                logging.warning("Speaker identification: Thread did not quit, terminating")
+                logging.warning(
+                    "Speaker identification: Thread did not quit, terminating"
+                )
                 self.thread.terminate()
                 if not self.thread.wait(2000):
                     logging.error("Speaker identification: Thread failed to terminate")
