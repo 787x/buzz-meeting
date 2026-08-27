@@ -17,10 +17,13 @@ from buzz.db.meeting_transcription_repository import (
 )
 from buzz.meeting.final_transcription import (
     FinalTranscriptionConfig,
+    FinalTranscriptionDecodeError,
+    FinalTranscriptionService,
     FinalTranscriptionStatus,
     FinalTranscriptionTrackStatus,
     SegmentPersistenceRecord,
     TrackPersistenceRecord,
+    WordPersistenceRecord,
     encode_generation_status,
     encode_track_status,
 )
@@ -136,6 +139,33 @@ def meeting_repo(qsql_database):
 def _insert_meeting(meeting_repo, meeting_id: str) -> None:
     bundle = _make_meeting_bundle(meeting_id)
     meeting_repo.atomic_replace(bundle, validate_existing=lambda e: None)
+
+
+def _segment(gen_id: str, role: str, text: str = "phrase") -> SegmentPersistenceRecord:
+    return SegmentPersistenceRecord(
+        generation_id=gen_id,
+        role=role,
+        ordinal=0,
+        local_start_ms=0,
+        local_end_ms=1000,
+        start_ns=-1_000_000_000,
+        end_ns=0,
+        text=text,
+    )
+
+
+def _word(gen_id: str, role: str, text: str = "word") -> WordPersistenceRecord:
+    return WordPersistenceRecord(
+        generation_id=gen_id,
+        role=role,
+        ordinal=0,
+        segment_ordinal=0,
+        local_start_ms=100,
+        local_end_ms=500,
+        start_ns=-900_000_000,
+        end_ns=-500_000_000,
+        text=text,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +380,7 @@ class TestTrackLifecycle:
         mic = next(t for t in tracks if t.role == "MICROPHONE")
         assert mic.status == encode_track_status(FinalTranscriptionTrackStatus.FAILED)
         assert mic.error_message == "ASR failed"
+        assert mic.word_count == 0
 
     def test_complete_track_atomicity(self, repo, meeting_repo) -> None:
         """Segments + track status + generation status are atomic."""
@@ -386,6 +417,321 @@ class TestTrackLifecycle:
             FinalTranscriptionStatus.COMPLETED
         )
         assert gen.time_completed == "2025-01-01T00:05:00+00:00"
+
+
+class TestV2AtomicPhraseWordCompletion:
+    @staticmethod
+    def _create_v2(repo, meeting_repo) -> str:
+        meeting_id = str(uuid.uuid4())
+        _insert_meeting(meeting_repo, meeting_id)
+        gen_id = str(uuid.uuid4())
+        tracks = tuple(
+            TrackPersistenceRecord(
+                generation_id=gen_id,
+                role=role,
+                status=encode_track_status(FinalTranscriptionTrackStatus.QUEUED),
+                error_message=None,
+                time_started=None,
+                time_completed=None,
+                segment_count=0,
+            )
+            for role in ("MICROPHONE", "REMOTE")
+        )
+        repo.create_generation(
+            gen_id,
+            meeting_id,
+            FinalTranscriptionConfig(
+                profile_version=2,
+                model_type="FASTER_WHISPER",
+                whisper_model_size="SMALL",
+            ),
+            encode_generation_status(FinalTranscriptionStatus.QUEUED),
+            "2025-01-01T00:00:00+00:00",
+            None,
+            tracks,
+        )
+        return gen_id
+
+    def test_success_persists_phrase_words_and_status_atomically(
+        self, repo, meeting_repo
+    ) -> None:
+        gen_id = self._create_v2(repo, meeting_repo)
+        repo.begin_track(gen_id, "MICROPHONE", "2025-01-01T00:01:00+00:00")
+
+        repo.complete_track(
+            gen_id,
+            "MICROPHONE",
+            (_segment(gen_id, "MICROPHONE"),),
+            "2025-01-01T00:02:00+00:00",
+            (_word(gen_id, "MICROPHONE"),),
+        )
+
+        assert len(repo.load_segments(gen_id, "MICROPHONE")) == 1
+        assert repo.load_words(gen_id) == (_word(gen_id, "MICROPHONE"),)
+        mic = next(
+            track for track in repo.load_tracks(gen_id) if track.role == "MICROPHONE"
+        )
+        assert mic.status == encode_track_status(
+            FinalTranscriptionTrackStatus.COMPLETED
+        )
+        assert mic.segment_count == 1
+        assert mic.word_count == 1
+
+    @pytest.mark.parametrize(
+        "table,trigger_name",
+        [
+            ("meeting_final_transcription_segment", "fail_phrase_insert"),
+            ("meeting_final_transcription_word", "fail_word_insert"),
+        ],
+    )
+    def test_insert_failure_rolls_back_everything(
+        self,
+        repo,
+        meeting_repo,
+        qsql_database,
+        table: str,
+        trigger_name: str,
+    ) -> None:
+        database, _ = qsql_database
+        gen_id = self._create_v2(repo, meeting_repo)
+        repo.begin_track(gen_id, "MICROPHONE", "2025-01-01T00:01:00+00:00")
+        before_generation = repo.load_generation(gen_id)
+        trigger = QSqlQuery(database)
+        assert trigger.exec(
+            f"CREATE TRIGGER {trigger_name} BEFORE INSERT ON {table} "
+            "BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END"
+        )
+        trigger.finish()
+
+        with pytest.raises(Exception, match="complete_track failed"):
+            repo.complete_track(
+                gen_id,
+                "MICROPHONE",
+                (_segment(gen_id, "MICROPHONE"),),
+                "2025-01-01T00:02:00+00:00",
+                (_word(gen_id, "MICROPHONE"),),
+            )
+
+        assert repo.load_segments(gen_id, "MICROPHONE") == ()
+        assert repo.load_words(gen_id) == ()
+        mic = next(
+            track for track in repo.load_tracks(gen_id) if track.role == "MICROPHONE"
+        )
+        assert mic.status == encode_track_status(
+            FinalTranscriptionTrackStatus.IN_PROGRESS
+        )
+        assert mic.segment_count == 0
+        assert repo.load_generation(gen_id) == before_generation
+
+    def test_retry_preserves_completed_words_and_clears_failed_role(
+        self, repo, meeting_repo, qsql_database
+    ) -> None:
+        database, _ = qsql_database
+        gen_id = self._create_v2(repo, meeting_repo)
+        repo.begin_track(gen_id, "MICROPHONE", "2025-01-01T00:01:00+00:00")
+        repo.complete_track(
+            gen_id,
+            "MICROPHONE",
+            (_segment(gen_id, "MICROPHONE", "kept phrase"),),
+            "2025-01-01T00:02:00+00:00",
+            (_word(gen_id, "MICROPHONE", "kept word"),),
+        )
+        repo.begin_track(gen_id, "REMOTE", "2025-01-01T00:03:00+00:00")
+
+        stale = QSqlQuery(database)
+        stale.prepare(
+            "INSERT INTO meeting_final_transcription_segment "
+            "(generation_id, role, ordinal, local_start_ms, local_end_ms, "
+            "start_ns, end_ns, text) VALUES (?, ?, 0, 0, 1000, 0, 1000, ?)"
+        )
+        stale.addBindValue(gen_id)
+        stale.addBindValue("REMOTE")
+        stale.addBindValue("stale phrase")
+        assert stale.exec()
+        stale.prepare(
+            "INSERT INTO meeting_final_transcription_word "
+            "(generation_id, role, ordinal, segment_ordinal, local_start_ms, "
+            "local_end_ms, start_ns, end_ns, text) "
+            "VALUES (?, ?, 0, 0, 0, 1000, 0, 1000, ?)"
+        )
+        stale.addBindValue(gen_id)
+        stale.addBindValue("REMOTE")
+        stale.addBindValue("stale word")
+        assert stale.exec()
+        stale.finish()
+
+        repo.reset_for_retry(
+            gen_id,
+            {
+                "MICROPHONE": encode_track_status(FinalTranscriptionTrackStatus.QUEUED),
+                "REMOTE": encode_track_status(FinalTranscriptionTrackStatus.QUEUED),
+            },
+            "2025-01-01T00:04:00+00:00",
+        )
+
+        assert [word.text for word in repo.load_words(gen_id)] == ["kept word"]
+        assert [
+            segment.text for segment in repo.load_segments(gen_id, "MICROPHONE")
+        ] == ["kept phrase"]
+        assert repo.load_segments(gen_id, "REMOTE") == ()
+
+    def test_recovery_reset_clears_stale_phrase_and_words(
+        self, repo, meeting_repo, qsql_database
+    ) -> None:
+        database, _ = qsql_database
+        gen_id = self._create_v2(repo, meeting_repo)
+        repo.begin_track(gen_id, "MICROPHONE", "2025-01-01T00:01:00+00:00")
+        stale = QSqlQuery(database)
+        assert stale.exec(
+            "INSERT INTO meeting_final_transcription_segment VALUES "
+            f"('{gen_id}', 'MICROPHONE', 0, 0, 1000, 0, 1000, 'stale')"
+        )
+        assert stale.exec(
+            "INSERT INTO meeting_final_transcription_word VALUES "
+            f"('{gen_id}', 'MICROPHONE', 0, 0, 0, 1000, 0, 1000, 'stale')"
+        )
+        stale.finish()
+
+        repo.reset_in_progress_tracks(gen_id)
+
+        assert repo.load_segments(gen_id, "MICROPHONE") == ()
+        assert repo.load_words(gen_id) == ()
+        mic = next(
+            track for track in repo.load_tracks(gen_id) if track.role == "MICROPHONE"
+        )
+        assert mic.status == encode_track_status(FinalTranscriptionTrackStatus.QUEUED)
+
+
+class TestWordCorruptionProbes:
+    @staticmethod
+    def _create_generation(
+        repo,
+        meeting_repo,
+        *,
+        profile_version: int,
+    ) -> str:
+        meeting_id = str(uuid.uuid4())
+        _insert_meeting(meeting_repo, meeting_id)
+        gen_id = str(uuid.uuid4())
+        repo.create_generation(
+            gen_id,
+            meeting_id,
+            FinalTranscriptionConfig(
+                profile_version=profile_version,
+                model_type="FASTER_WHISPER",
+                whisper_model_size="SMALL",
+            ),
+            encode_generation_status(FinalTranscriptionStatus.QUEUED),
+            "2025-01-01T00:00:00+00:00",
+            None,
+            (
+                TrackPersistenceRecord(
+                    generation_id=gen_id,
+                    role="MICROPHONE",
+                    status=encode_track_status(FinalTranscriptionTrackStatus.QUEUED),
+                    error_message=None,
+                    time_started=None,
+                    time_completed=None,
+                    segment_count=0,
+                ),
+            ),
+        )
+        repo.begin_track(gen_id, "MICROPHONE", "2025-01-01T00:01:00+00:00")
+        repo.complete_track(
+            gen_id,
+            "MICROPHONE",
+            (_segment(gen_id, "MICROPHONE"),),
+            "2025-01-01T00:02:00+00:00",
+            (_word(gen_id, "MICROPHONE"),) if profile_version == 2 else (),
+        )
+        return gen_id
+
+    @staticmethod
+    def _service(repo) -> FinalTranscriptionService:
+        return FinalTranscriptionService(object(), repo, object())  # type: ignore
+
+    def test_v1_word_row_is_detected_with_foreign_keys_off(
+        self, repo, meeting_repo, qsql_database
+    ) -> None:
+        _, database_path = qsql_database
+        gen_id = self._create_generation(repo, meeting_repo, profile_version=1)
+        raw = sqlite3.connect(database_path)
+        raw.execute("PRAGMA foreign_keys = OFF")
+        raw.execute(
+            "INSERT INTO meeting_final_transcription_word VALUES "
+            "(?, 'MICROPHONE', 0, 0, 0, 100, -1000000000, -900000000, 'bad')",
+            (gen_id,),
+        )
+        raw.commit()
+        raw.close()
+
+        with pytest.raises(FinalTranscriptionDecodeError, match="version 1"):
+            self._service(repo).load_words(uuid.UUID(gen_id))
+
+    @pytest.mark.parametrize(
+        "mutation",
+        ["unknown_role", "orphan_track", "orphan_parent", "ordinal_gap", "bad_time"],
+    )
+    def test_v2_corruption_is_not_hidden_by_joins(
+        self, repo, meeting_repo, qsql_database, mutation: str
+    ) -> None:
+        _, database_path = qsql_database
+        gen_id = self._create_generation(repo, meeting_repo, profile_version=2)
+        raw = sqlite3.connect(database_path)
+        raw.execute("PRAGMA foreign_keys = OFF")
+        if mutation == "unknown_role":
+            raw.execute(
+                "INSERT INTO meeting_final_transcription_word VALUES "
+                "(?, 'ALIEN', 0, 0, 0, 100, 0, 100, 'bad')",
+                (gen_id,),
+            )
+        elif mutation == "orphan_track":
+            raw.execute(
+                "INSERT INTO meeting_final_transcription_word VALUES "
+                "(?, 'REMOTE', 0, 0, 0, 100, 0, 100, 'bad')",
+                (gen_id,),
+            )
+        elif mutation == "orphan_parent":
+            raw.execute(
+                "UPDATE meeting_final_transcription_word "
+                "SET segment_ordinal = 9 WHERE generation_id = ?",
+                (gen_id,),
+            )
+        elif mutation == "ordinal_gap":
+            raw.execute(
+                "UPDATE meeting_final_transcription_word "
+                "SET ordinal = 2 WHERE generation_id = ?",
+                (gen_id,),
+            )
+        else:
+            raw.execute("PRAGMA ignore_check_constraints = ON")
+            raw.execute(
+                "UPDATE meeting_final_transcription_word "
+                "SET local_end_ms = -1, end_ns = start_ns - 1 "
+                "WHERE generation_id = ?",
+                (gen_id,),
+            )
+        raw.commit()
+        raw.close()
+
+        with pytest.raises(FinalTranscriptionDecodeError):
+            self._service(repo).load_words(uuid.UUID(gen_id))
+
+    def test_orphan_generation_word_is_detected(self, repo, qsql_database) -> None:
+        _, database_path = qsql_database
+        missing = uuid.uuid4()
+        raw = sqlite3.connect(database_path)
+        raw.execute("PRAGMA foreign_keys = OFF")
+        raw.execute(
+            "INSERT INTO meeting_final_transcription_word VALUES "
+            "(?, 'MICROPHONE', 0, 0, 0, 100, 0, 100, 'bad')",
+            (str(missing),),
+        )
+        raw.commit()
+        raw.close()
+
+        with pytest.raises(FinalTranscriptionDecodeError, match="missing generation"):
+            self._service(repo).load_words(missing)
 
 
 # ---------------------------------------------------------------------------

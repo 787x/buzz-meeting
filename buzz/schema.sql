@@ -125,6 +125,8 @@ CREATE TABLE meeting_final_transcription_track (
     time_completed TEXT,
     segment_count INTEGER NOT NULL DEFAULT 0
         CHECK (segment_count >= 0),
+    word_count INTEGER NOT NULL DEFAULT 0
+        CHECK (word_count >= 0),
     PRIMARY KEY (generation_id, role),
     FOREIGN KEY (generation_id)
         REFERENCES meeting_final_transcription(id)
@@ -143,6 +145,29 @@ CREATE TABLE meeting_final_transcription_segment (
     PRIMARY KEY (generation_id, role, ordinal),
     FOREIGN KEY (generation_id, role)
         REFERENCES meeting_final_transcription_track(generation_id, role)
+        ON DELETE CASCADE,
+    CHECK (local_end_ms >= local_start_ms),
+    CHECK (end_ns >= start_ns)
+);
+
+CREATE TABLE meeting_final_transcription_word (
+    generation_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    segment_ordinal INTEGER NOT NULL CHECK (segment_ordinal >= 0),
+    local_start_ms INTEGER NOT NULL CHECK (local_start_ms >= 0),
+    local_end_ms INTEGER NOT NULL,
+    start_ns INTEGER NOT NULL,
+    end_ns INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    PRIMARY KEY (generation_id, role, ordinal),
+    FOREIGN KEY (generation_id, role)
+        REFERENCES meeting_final_transcription_track(generation_id, role)
+        ON DELETE CASCADE,
+    FOREIGN KEY (generation_id, role, segment_ordinal)
+        REFERENCES meeting_final_transcription_segment(
+            generation_id, role, ordinal
+        )
         ON DELETE CASCADE,
     CHECK (local_end_ms >= local_start_ms),
     CHECK (end_ns >= start_ns)

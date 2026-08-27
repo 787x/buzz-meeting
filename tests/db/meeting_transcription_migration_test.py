@@ -102,6 +102,63 @@ CREATE TABLE meeting_audio_error (
 """
 
 
+PR11_SCHEMA = (
+    PR10_SCHEMA
+    + """
+CREATE TABLE meeting_final_transcription (
+    id TEXT PRIMARY KEY NOT NULL,
+    meeting_id TEXT NOT NULL,
+    profile_version INTEGER NOT NULL CHECK (profile_version > 0),
+    status TEXT NOT NULL,
+    config_model_type TEXT NOT NULL,
+    config_whisper_model_size TEXT,
+    config_hugging_face_model_id TEXT NOT NULL DEFAULT '',
+    config_language TEXT,
+    error_message TEXT CHECK (
+        error_message IS NULL OR length(error_message) <= 4096
+    ),
+    time_created TEXT NOT NULL,
+    time_started TEXT,
+    time_completed TEXT,
+    UNIQUE (meeting_id, profile_version),
+    FOREIGN KEY (meeting_id) REFERENCES meeting(id) ON DELETE CASCADE
+);
+
+CREATE TABLE meeting_final_transcription_track (
+    generation_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error_message TEXT CHECK (
+        error_message IS NULL OR length(error_message) <= 4096
+    ),
+    time_started TEXT,
+    time_completed TEXT,
+    segment_count INTEGER NOT NULL DEFAULT 0 CHECK (segment_count >= 0),
+    PRIMARY KEY (generation_id, role),
+    FOREIGN KEY (generation_id)
+        REFERENCES meeting_final_transcription(id) ON DELETE CASCADE
+);
+
+CREATE TABLE meeting_final_transcription_segment (
+    generation_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    local_start_ms INTEGER NOT NULL CHECK (local_start_ms >= 0),
+    local_end_ms INTEGER NOT NULL,
+    start_ns INTEGER NOT NULL,
+    end_ns INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    PRIMARY KEY (generation_id, role, ordinal),
+    FOREIGN KEY (generation_id, role)
+        REFERENCES meeting_final_transcription_track(generation_id, role)
+        ON DELETE CASCADE,
+    CHECK (local_end_ms >= local_start_ms),
+    CHECK (end_ns >= start_ns)
+);
+"""
+)
+
+
 def test_migration_from_pr10_preserves_rows(tmp_path: Path) -> None:
     """Migrating from PR10 schema to PR11 schema preserves all existing
     rows and adds the three new final-transcription tables."""
@@ -226,6 +283,7 @@ def test_migration_from_pr10_preserves_rows(tmp_path: Path) -> None:
     assert "meeting_final_transcription" in tables
     assert "meeting_final_transcription_track" in tables
     assert "meeting_final_transcription_segment" in tables
+    assert "meeting_final_transcription_word" in tables
 
     # Verify FK integrity
     assert database.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -235,6 +293,134 @@ def test_migration_from_pr10_preserves_rows(tmp_path: Path) -> None:
     assert database.execute("SELECT * FROM transcription").fetchone() == transcription
     assert database.execute("SELECT * FROM transcription_segment").fetchone() == segment
 
+    database.close()
+
+
+def test_migration_from_pr11_adds_empty_word_table_and_preserves_v1(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "pr11-to-pr12.sqlite"
+    database = sqlite3.connect(database_path)
+    database.execute("PRAGMA foreign_keys = ON")
+    database.executescript(PR11_SCHEMA)
+
+    meeting_id = "pr11-meeting"
+    database.execute(
+        "INSERT INTO meeting VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            meeting_id,
+            "SYSTEM",
+            "COMPLETED",
+            "2025-01-01T00:00:00+00:00",
+            None,
+            None,
+            None,
+            "STOPPED",
+            "COMPLETE",
+        ),
+    )
+    database.execute(
+        """INSERT INTO meeting_final_transcription
+        (id, meeting_id, profile_version, status, config_model_type,
+         config_whisper_model_size, config_hugging_face_model_id,
+         config_language, time_created, time_completed)
+        VALUES (?, ?, 1, 'COMPLETED', 'WHISPER_CPP', 'CUSTOM', '', NULL, ?, ?)""",
+        (
+            "pr11-v1",
+            meeting_id,
+            "2025-01-01T00:00:00+00:00",
+            "2025-01-01T00:01:00+00:00",
+        ),
+    )
+    for role in ("MICROPHONE", "REMOTE"):
+        database.execute(
+            """INSERT INTO meeting_final_transcription_track
+            (generation_id, role, status, time_completed, segment_count)
+            VALUES ('pr11-v1', ?, 'COMPLETED', ?, 1)""",
+            (role, "2025-01-01T00:01:00+00:00"),
+        )
+        database.execute(
+            """INSERT INTO meeting_final_transcription_segment
+            VALUES ('pr11-v1', ?, 0, 0, 1000, -1000000000, 0, ?)""",
+            (role, f"old {role}"),
+        )
+    old_generation = database.execute(
+        "SELECT * FROM meeting_final_transcription WHERE id = 'pr11-v1'"
+    ).fetchone()
+    old_tracks = database.execute(
+        "SELECT * FROM meeting_final_transcription_track ORDER BY role"
+    ).fetchall()
+    old_segments = database.execute(
+        "SELECT * FROM meeting_final_transcription_segment ORDER BY role, ordinal"
+    ).fetchall()
+    database.commit()
+
+    schema = Path("buzz/schema.sql").read_text()
+    assert dumb_migrate_db(database, schema)
+
+    assert (
+        database.execute(
+            "SELECT * FROM meeting_final_transcription WHERE id = 'pr11-v1'"
+        ).fetchone()
+        == old_generation
+    )
+    migrated_tracks = database.execute(
+        "SELECT * FROM meeting_final_transcription_track ORDER BY role"
+    ).fetchall()
+    # Old tracks had no word_count column; migrated tracks have word_count=0
+    assert len(migrated_tracks) == len(old_tracks)
+    for migrated, old in zip(migrated_tracks, old_tracks):
+        assert migrated[:7] == old  # original columns preserved
+        assert migrated[7] == 0  # word_count defaults to 0
+    assert (
+        database.execute(
+            "SELECT * FROM meeting_final_transcription_segment ORDER BY role, ordinal"
+        ).fetchall()
+        == old_segments
+    )
+    assert (
+        database.execute("SELECT * FROM meeting_final_transcription_word").fetchall()
+        == []
+    )
+
+    # word_count defaults to 0 for migrated PR11 rows
+    for row in database.execute(
+        "SELECT word_count FROM meeting_final_transcription_track "
+        "WHERE generation_id = 'pr11-v1'"
+    ).fetchall():
+        assert row[0] == 0
+
+    database.execute(
+        """INSERT INTO meeting_final_transcription
+        (id, meeting_id, profile_version, status, config_model_type,
+         config_whisper_model_size, config_hugging_face_model_id,
+         config_language, time_created)
+        VALUES ('pr12-v2', ?, 2, 'IN_PROGRESS', 'FASTER_WHISPER',
+                'SMALL', '', NULL, ?)""",
+        (meeting_id, "2025-01-02T00:00:00+00:00"),
+    )
+    database.execute(
+        """INSERT INTO meeting_final_transcription_track
+        (generation_id, role, status, segment_count)
+        VALUES ('pr12-v2', 'MICROPHONE', 'IN_PROGRESS', 0)"""
+    )
+    database.execute(
+        """INSERT INTO meeting_final_transcription_segment
+        VALUES ('pr12-v2', 'MICROPHONE', 0, 0, 1000,
+                -1000000000, 0, 'phrase')"""
+    )
+    database.execute(
+        """INSERT INTO meeting_final_transcription_word
+        VALUES ('pr12-v2', 'MICROPHONE', 0, 0, 100, 500,
+                -900000000, -500000000, 'word')"""
+    )
+    database.commit()
+
+    assert database.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert not dumb_migrate_db(database, schema)
+    assert database.execute(
+        "SELECT text FROM meeting_final_transcription_word"
+    ).fetchone() == ("word",)
     database.close()
 
 
