@@ -4,13 +4,7 @@ from typing import Tuple, List, Optional
 from uuid import UUID
 
 from PyQt6 import QtGui
-from PyQt6.QtCore import (
-    Qt,
-    QThread,
-    QThreadPool,
-    QModelIndex,
-    pyqtSignal
-)
+from PyQt6.QtCore import Qt, QThread, QThreadPool, QModelIndex, pyqtSignal
 
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
@@ -24,6 +18,7 @@ from buzz.db.entity.transcription import Transcription
 from buzz.db.service.transcription_service import TranscriptionService
 from buzz.file_transcriber_queue_worker import FileTranscriberQueueWorker
 from buzz.locale import _
+from buzz.meeting.meeting_library import MeetingLibraryService
 from buzz.plugins.manager import PluginManager
 from buzz.plugins.post_processing import FnRunnable
 from buzz.settings.settings import APP_NAME, Settings
@@ -42,6 +37,7 @@ from buzz.widgets.icon import BUZZ_ICON_PATH
 from buzz.widgets.import_url_dialog import ImportURLDialog
 from buzz.widgets.main_window_toolbar import MainWindowToolbar
 from buzz.widgets.menu_bar import MenuBar
+from buzz.widgets.meetings_library_widget import MeetingsLibraryWidget
 from buzz.widgets.preferences_dialog.models.preferences import Preferences
 from buzz.widgets.transcriber.file_transcriber_widget import FileTranscriberWidget
 from buzz.widgets.transcription_task_folder_watcher import (
@@ -60,7 +56,11 @@ class MainWindow(QMainWindow):
     table_widget: TranscriptionTasksTableWidget
     transcriptions_updated = pyqtSignal(UUID)
 
-    def __init__(self, transcription_service: TranscriptionService):
+    def __init__(
+        self,
+        transcription_service: TranscriptionService,
+        meeting_library_service: MeetingLibraryService,
+    ):
         super().__init__(flags=Qt.WindowType.Window)
 
         self.setWindowTitle(APP_NAME)
@@ -74,6 +74,8 @@ class MainWindow(QMainWindow):
 
         self.quit_on_complete = False
         self.transcription_service = transcription_service
+        self.meeting_library_service = meeting_library_service
+        self.meetings_library_widget = None
 
         self.plugin_manager = PluginManager(self.transcription_service, self.settings)
         try:
@@ -81,7 +83,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             logging.error(f"Failed to initialize plugins: {exc}", exc_info=True)
 
-        #update checker
+        # update checker
         self._update_info: Optional[UpdateInfo] = None
 
         self.toolbar = MainWindowToolbar(shortcuts=self.shortcuts, parent=self)
@@ -120,6 +122,9 @@ class MainWindow(QMainWindow):
         self.menu_bar.import_folder_action_triggered.connect(
             self.on_import_folder_action_triggered
         )
+        self.menu_bar.meetings_action_triggered.connect(
+            self.on_meetings_action_triggered
+        )
         self.menu_bar.shortcuts_changed.connect(self.on_shortcuts_changed)
         self.menu_bar.openai_api_key_changed.connect(
             self.on_openai_access_token_changed
@@ -131,13 +136,13 @@ class MainWindow(QMainWindow):
         self.table_widget.transcription_service = self.transcription_service
         self.table_widget.doubleClicked.connect(self.on_table_double_clicked)
         self.table_widget.return_clicked.connect(self.open_transcript_viewer)
-        self.table_widget.delete_requested.connect(self.on_clear_history_action_triggered)
+        self.table_widget.delete_requested.connect(
+            self.on_clear_history_action_triggered
+        )
         self.table_widget.selectionModel().selectionChanged.connect(
             self.on_table_selection_changed
         )
-        self.transcriptions_updated.connect(
-            self.on_transcriptions_updated
-        )
+        self.transcriptions_updated.connect(self.on_transcriptions_updated)
 
         self.setCentralWidget(self.table_widget)
 
@@ -173,7 +178,7 @@ class MainWindow(QMainWindow):
 
         self.transcription_viewer_widget = None
 
-        #Initialize and run update checker
+        # Initialize and run update checker
         self._init_update_checker()
 
     def on_preferences_changed(self, preferences: Preferences):
@@ -287,9 +292,7 @@ class MainWindow(QMainWindow):
 
     def on_import_folder_action_triggered(self):
         last_folder = self.settings.value(Settings.Key.LAST_IMPORT_FOLDER, "")
-        folder = QFileDialog.getExistingDirectory(
-            self, _("Select folder"), last_folder
-        )
+        folder = QFileDialog.getExistingDirectory(self, _("Select folder"), last_folder)
         if not folder:
             return
         self.settings.set_value(Settings.Key.LAST_IMPORT_FOLDER, folder)
@@ -302,6 +305,18 @@ class MainWindow(QMainWindow):
         if not file_paths:
             return
         self.open_file_transcriber_widget(file_paths)
+
+    def on_meetings_action_triggered(self):
+        if self.meetings_library_widget is None:
+            self.meetings_library_widget = MeetingsLibraryWidget(
+                service=self.meeting_library_service,
+                parent=self,
+                flags=Qt.WindowType.Window,
+            )
+        self.meetings_library_widget.refresh()
+        self.meetings_library_widget.show()
+        self.meetings_library_widget.raise_()
+        self.meetings_library_widget.activateWindow()
 
     def open_file_transcriber_widget(
         self, file_paths: Optional[List[str]] = None, url: Optional[str] = None
@@ -435,7 +450,9 @@ class MainWindow(QMainWindow):
     def on_task_completed(self, task: FileTranscriptionTask, segments: List[Segment]):
         # Handle skipped tasks (e.g. plugin detected file already transcribed)
         if task.status == FileTranscriptionTask.Status.SKIPPED:
-            self.transcription_service.update_transcription_as_skipped(task.uid, segments)
+            self.transcription_service.update_transcription_as_skipped(
+                task.uid, segments
+            )
             self.table_widget.refresh_row(task.uid)
             if self.quit_on_complete:
                 self.close()
@@ -448,7 +465,9 @@ class MainWindow(QMainWindow):
             # Use the file basename (video title) as the display name
             basename = os.path.basename(task.file_path)
             name = os.path.splitext(basename)[0]  # Remove .wav extension
-            self.transcription_service.update_transcription_file_and_name(task.uid, task.file_path, name)
+            self.transcription_service.update_transcription_file_and_name(
+                task.uid, task.file_path, name
+            )
 
         # When plugins are enabled, run the after_transcription / save / on_complete
         # pipeline on a background thread so slow plugin work (e.g. network calls)
@@ -473,13 +492,14 @@ class MainWindow(QMainWindow):
             self.plugin_manager.process_completed(task, segments)
             self.table_widget.refresh_row(task.uid)
         else:
-            self.transcription_service.update_transcription_as_completed(task.uid, segments)
+            self.transcription_service.update_transcription_as_completed(
+                task.uid, segments
+            )
             self.table_widget.refresh_row(task.uid)
 
         if self.quit_on_complete:
             self.close()
             QApplication.quit()
-
 
     def on_task_error(self, task: FileTranscriptionTask, error: str):
         self.transcription_service.update_transcription_as_failed(task.uid, error)
@@ -522,7 +542,9 @@ class MainWindow(QMainWindow):
 
         if self.transcriber_thread.isRunning():
             if not self.transcriber_thread.wait(10000):
-                logging.warning("Transcriber thread did not finish within 10s timeout, terminating")
+                logging.warning(
+                    "Transcriber thread did not finish within 10s timeout, terminating"
+                )
                 self.transcriber_thread.terminate()
                 if not self.transcriber_thread.wait(2000):
                     logging.error("Transcriber thread could not be terminated")
@@ -532,8 +554,9 @@ class MainWindow(QMainWindow):
 
         try:
             from buzz.widgets.application import Application
+
             app = Application.instance()
-            if app and hasattr(app, 'close_database'):
+            if app and hasattr(app, "close_database"):
                 app.close_database()
         except Exception as e:
             logging.warning(f"Error closing database: {e}")
@@ -583,8 +606,5 @@ class MainWindow(QMainWindow):
         if self._update_info is None:
             return
 
-        dialog = UpdateDialog(
-            update_info=self._update_info,
-            parent=self
-        )
+        dialog = UpdateDialog(update_info=self._update_info, parent=self)
         dialog.exec()

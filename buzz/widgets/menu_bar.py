@@ -21,6 +21,7 @@ class MenuBar(QMenuBar):
     import_action_triggered = pyqtSignal()
     import_url_action_triggered = pyqtSignal()
     import_folder_action_triggered = pyqtSignal()
+    meetings_action_triggered = pyqtSignal()
     shortcuts_changed = pyqtSignal()
     openai_api_key_changed = pyqtSignal(str)
     preferences_changed = pyqtSignal(Preferences)
@@ -48,8 +49,11 @@ class MenuBar(QMenuBar):
         self.import_folder_action = QAction(_("Import Folder..."), self)
         self.import_folder_action.triggered.connect(self.import_folder_action_triggered)
 
+        self.meetings_action = QAction(_("Meetings"), self)
+        self.meetings_action.triggered.connect(self.meetings_action_triggered)
+
         about_label = _("About")
-        about_action = QAction(f'{about_label} {APP_NAME}', self)
+        about_action = QAction(f"{about_label} {APP_NAME}", self)
         about_action.triggered.connect(self.on_about_action_triggered)
         about_action.setMenuRole(QAction.MenuRole.AboutRole)
 
@@ -58,7 +62,7 @@ class MenuBar(QMenuBar):
         self.preferences_action.setMenuRole(QAction.MenuRole.PreferencesRole)
 
         help_label = _("Help")
-        help_action = QAction(f'{help_label}', self)
+        help_action = QAction(f"{help_label}", self)
         help_action.triggered.connect(self.on_help_action_triggered)
 
         self.plugins_action = QAction(_("Plugins..."), self)
@@ -71,7 +75,12 @@ class MenuBar(QMenuBar):
         file_menu.addAction(self.import_url_action)
         file_menu.addAction(self.import_folder_action)
 
-        help_menu_title = _("Help") + ("\u200B" if platform.system() == "Darwin" else "")
+        view_menu = self.addMenu(_("View"))
+        view_menu.addAction(self.meetings_action)
+
+        help_menu_title = _("Help") + (
+            "\u200B" if platform.system() == "Darwin" else ""
+        )
         help_menu = self.addMenu(help_menu_title)
         help_menu.addAction(about_action)
         help_menu.addAction(help_action)

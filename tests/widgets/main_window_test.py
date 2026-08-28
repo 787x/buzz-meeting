@@ -5,9 +5,11 @@ from typing import List
 from unittest.mock import patch, Mock
 
 import pytest
-from PyQt6.QtCore import QSize, Qt
+from PyQt6 import sip
+from PyQt6.QtCore import QEvent, QSize, Qt
 from PyQt6.QtGui import QKeyEvent, QAction
 from PyQt6.QtWidgets import (
+    QApplication,
     QMessageBox,
     QPushButton,
     QToolBar,
@@ -17,19 +19,39 @@ from PyQt6.QtWidgets import (
 from pytestqt.qtbot import QtBot
 
 from buzz.locale import _
+from buzz.meeting.meeting_library import MeetingLibraryService
 from buzz.db.entity.transcription import Transcription
 from buzz.db.service.transcription_service import TranscriptionService
 from buzz.model_loader import TranscriptionModel, ModelType, WhisperModelSize
 from buzz.transcriber.transcriber import Task, OutputFormat
 from buzz.widgets.main_window import MainWindow
-from buzz.widgets.preferences_dialog.models.file_transcription_preferences import FileTranscriptionPreferences
+from buzz.widgets.meetings_library_widget import MeetingsLibraryWidget
+from buzz.widgets.preferences_dialog.models.file_transcription_preferences import (
+    FileTranscriptionPreferences,
+)
 from buzz.widgets.transcriber.file_transcriber_widget import FileTranscriberWidget
+from buzz.widgets.transcription_tasks_table_widget import (
+    TranscriptionTasksTableWidget,
+)
 
 mock_transcriptions: List[Transcription] = [
     Transcription(status="completed"),
     Transcription(status="canceled"),
     Transcription(status="failed", error_message=_("Error")),
 ]
+fake_meeting_library_service = Mock(spec=MeetingLibraryService)
+
+
+@pytest.fixture(scope="session")
+def qapp_cls():
+    return QApplication
+
+
+@pytest.fixture(autouse=True)
+def disable_plugin_initialization(monkeypatch):
+    monkeypatch.setattr(
+        "buzz.widgets.main_window.PluginManager.initialize", lambda self: None
+    )
 
 
 def get_test_asset(filename: str):
@@ -37,8 +59,105 @@ def get_test_asset(filename: str):
 
 
 class TestMainWindow:
+    def test_meetings_action_reuses_one_window_and_refreshes_once_per_trigger(
+        self, qtbot, transcription_service
+    ):
+        meeting_service = Mock(spec=MeetingLibraryService)
+        library_window = Mock()
+        with patch(
+            "buzz.widgets.main_window.MeetingsLibraryWidget",
+            return_value=library_window,
+        ) as library_widget_type:
+            window = MainWindow(transcription_service, meeting_service)
+            qtbot.add_widget(window)
+
+            window.menu_bar.meetings_action.trigger()
+
+            library_widget_type.assert_called_once_with(
+                service=meeting_service,
+                parent=window,
+                flags=Qt.WindowType.Window,
+            )
+            assert window.meetings_library_widget is library_window
+            library_window.refresh.assert_called_once_with()
+            library_window.show.assert_called_once_with()
+            library_window.raise_.assert_called_once_with()
+            library_window.activateWindow.assert_called_once_with()
+
+            window.menu_bar.meetings_action.trigger()
+
+            library_widget_type.assert_called_once()
+            assert library_window.refresh.call_count == 2
+            assert library_window.show.call_count == 2
+            assert library_window.raise_.call_count == 2
+            assert library_window.activateWindow.call_count == 2
+
+            library_window.close()
+            window.menu_bar.meetings_action.trigger()
+
+            library_widget_type.assert_called_once()
+            assert window.meetings_library_widget is library_window
+            assert library_window.refresh.call_count == 3
+            window.close()
+
+    def test_real_meetings_window_survives_close_and_is_reused(
+        self, qtbot, transcription_service
+    ):
+        application = QApplication.instance()
+        assert application is not None
+        meeting_service = Mock(spec=MeetingLibraryService)
+        meeting_service.list_meetings.return_value = ()
+
+        with (
+            patch(
+                "buzz.widgets.application.setup_app_db",
+                side_effect=AssertionError("real app database must not be opened"),
+            ) as setup_app_db,
+            patch(
+                "buzz.widgets.application.Posthog",
+                side_effect=AssertionError("telemetry must not be initialized"),
+            ) as posthog,
+        ):
+            window = MainWindow(transcription_service, meeting_service)
+            qtbot.add_widget(window)
+
+            window.on_meetings_action_triggered()
+
+            widget = window.meetings_library_widget
+            assert isinstance(widget, MeetingsLibraryWidget)
+            assert meeting_service.list_meetings.call_count == 1
+            assert widget.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose) is False
+            original_identity = widget
+
+            widget.close()
+            QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            QApplication.processEvents()
+
+            assert not sip.isdeleted(widget)
+            assert widget.table_model.rowCount() == 0
+
+            window.on_meetings_action_triggered()
+
+            assert window.meetings_library_widget is original_identity
+            assert meeting_service.list_meetings.call_count == 2
+            assert not sip.isdeleted(widget)
+            assert widget.table_model.rowCount() == 0
+            assert QApplication.instance() is application
+            setup_app_db.assert_not_called()
+            posthog.assert_not_called()
+            window.close()
+
+    def test_meetings_library_does_not_replace_legacy_central_widget(
+        self, qtbot, transcription_service
+    ):
+        window = MainWindow(transcription_service, fake_meeting_library_service)
+        qtbot.add_widget(window)
+        assert window.centralWidget() is window.table_widget
+        assert isinstance(window.centralWidget(), TranscriptionTasksTableWidget)
+        window.close()
+
     def test_should_set_window_title_and_icon(self, qtbot, transcription_service):
-        window = MainWindow(transcription_service)
+        window = MainWindow(transcription_service, fake_meeting_library_service)
         qtbot.add_widget(window)
         assert window.windowTitle() == "Buzz"
         assert window.windowIcon().pixmap(QSize(64, 64)).isNull() is False
@@ -47,7 +166,7 @@ class TestMainWindow:
     def test_should_run_file_transcription_task(
         self, qtbot: QtBot, transcription_service
     ):
-        window = MainWindow(transcription_service)
+        window = MainWindow(transcription_service, fake_meeting_library_service)
 
         self._import_file_and_start_transcription(window)
 
@@ -71,7 +190,7 @@ class TestMainWindow:
     def test_should_run_url_import_file_transcription_task(
         self, qtbot: QtBot, db, transcription_service
     ):
-        window = MainWindow(transcription_service)
+        window = MainWindow(transcription_service, fake_meeting_library_service)
         menu: QMenuBar = window.menuBar()
         file_action = menu.actions()[0]
         import_url_action: QAction = file_action.menu().actions()[1]
@@ -100,7 +219,7 @@ class TestMainWindow:
     def test_should_run_and_cancel_transcription_task(
         self, qtbot, db, transcription_service
     ):
-        window = MainWindow(transcription_service)
+        window = MainWindow(transcription_service, fake_meeting_library_service)
         qtbot.add_widget(window)
 
         self._import_file_and_start_transcription(window, long_audio=True)
@@ -119,12 +238,12 @@ class TestMainWindow:
         logging.debug("Will cancel transcription task")
 
         table_widget.selectRow(0)
-        
+
         # Force immediate processing of pending events before triggering cancellation
         qtbot.wait(100)
-        
+
         window.toolbar.stop_transcription_action.trigger()
-        
+
         # Give some time for the cancellation to be processed
         qtbot.wait(500)
 
@@ -140,7 +259,9 @@ class TestMainWindow:
             final_status = self._get_status(table_widget, 0)
             logging.error(f"Task status after timeout: {final_status}")
             if "canceled" not in final_status.lower():
-                assert False, f"Task did not cancel as expected. Final status: {final_status}"
+                assert (
+                    False
+                ), f"Task did not cancel as expected. Final status: {final_status}"
 
         logging.debug("Task canceled")
 
@@ -167,11 +288,15 @@ class TestMainWindow:
         mock_queue_worker.cancel_task = Mock()
         mock_queue_worker.add_task = Mock()
         mock_queue_worker.stop = Mock()
-        
-        monkeypatch.setattr("buzz.widgets.main_window.FileTranscriberQueueWorker", Mock(return_value=mock_queue_worker))
-        
+
+        monkeypatch.setattr(
+            "buzz.widgets.main_window.FileTranscriberQueueWorker",
+            Mock(return_value=mock_queue_worker),
+        )
+
         window = MainWindow(
-            TranscriptionService(transcription_dao, transcription_segment_dao)
+            TranscriptionService(transcription_dao, transcription_segment_dao),
+            fake_meeting_library_service,
         )
         qtbot.add_widget(window)
 
@@ -181,7 +306,9 @@ class TestMainWindow:
         # Get all statuses and verify they match expected values
         statuses = [self._get_status(table_widget, i) for i in range(3)]
         expected_statuses = {"completed", "canceled", "failed"}
-        assert set(statuses) == expected_statuses, f"Expected {expected_statuses}, got {statuses}"
+        assert (
+            set(statuses) == expected_statuses
+        ), f"Expected {expected_statuses}, got {statuses}"
 
         # Test that completed transcriptions enable the open action, others don't
         for i in range(3):
@@ -198,7 +325,8 @@ class TestMainWindow:
         self, qtbot, transcription_dao, transcription_segment_dao
     ):
         window = MainWindow(
-            TranscriptionService(transcription_dao, transcription_segment_dao)
+            TranscriptionService(transcription_dao, transcription_segment_dao),
+            fake_meeting_library_service,
         )
         qtbot.add_widget(window)
 
@@ -217,7 +345,8 @@ class TestMainWindow:
         self, qtbot, transcription_dao, transcription_segment_dao
     ):
         window = MainWindow(
-            TranscriptionService(transcription_dao, transcription_segment_dao)
+            TranscriptionService(transcription_dao, transcription_segment_dao),
+            fake_meeting_library_service,
         )
         qtbot.add_widget(window)
 
@@ -229,7 +358,8 @@ class TestMainWindow:
         self, qtbot, transcription_dao, transcription_segment_dao
     ):
         window = MainWindow(
-            TranscriptionService(transcription_dao, transcription_segment_dao)
+            TranscriptionService(transcription_dao, transcription_segment_dao),
+            fake_meeting_library_service,
         )
         qtbot.add_widget(window)
 
@@ -256,7 +386,8 @@ class TestMainWindow:
         self, qtbot, transcription_dao, transcription_segment_dao
     ):
         window = MainWindow(
-            TranscriptionService(transcription_dao, transcription_segment_dao)
+            TranscriptionService(transcription_dao, transcription_segment_dao),
+            fake_meeting_library_service,
         )
         qtbot.add_widget(window)
 
@@ -290,7 +421,8 @@ class TestMainWindow:
         self, qtbot, transcription_dao, transcription_segment_dao
     ):
         window = MainWindow(
-            TranscriptionService(transcription_dao, transcription_segment_dao)
+            TranscriptionService(transcription_dao, transcription_segment_dao),
+            fake_meeting_library_service,
         )
         qtbot.add_widget(window)
 
@@ -300,7 +432,7 @@ class TestMainWindow:
     def test_import_folder_opens_file_transcriber_with_supported_files(
         self, qtbot, transcription_service
     ):
-        window = MainWindow(transcription_service)
+        window = MainWindow(transcription_service, fake_meeting_library_service)
         qtbot.add_widget(window)
 
         with tempfile.TemporaryDirectory() as folder:
@@ -315,25 +447,36 @@ class TestMainWindow:
                 open(os.path.join(folder, name), "w").close()
             open(os.path.join(subdir, nested), "w").close()
 
-            with patch("PyQt6.QtWidgets.QFileDialog.getExistingDirectory") as mock_dir, \
-                 patch.object(window, "open_file_transcriber_widget") as mock_open:
+            with patch(
+                "PyQt6.QtWidgets.QFileDialog.getExistingDirectory"
+            ) as mock_dir, patch.object(
+                window, "open_file_transcriber_widget"
+            ) as mock_open:
                 mock_dir.return_value = folder
                 window.on_import_folder_action_triggered()
 
             collected = mock_open.call_args[0][0]
             collected_names = {os.path.basename(p) for p in collected}
-            assert collected_names == {"audio.mp3", "video.mp4", "clip.wav", "nested.flac"}
+            assert collected_names == {
+                "audio.mp3",
+                "video.mp4",
+                "clip.wav",
+                "nested.flac",
+            }
 
         window.close()
 
     def test_import_folder_does_nothing_when_cancelled(
         self, qtbot, transcription_service
     ):
-        window = MainWindow(transcription_service)
+        window = MainWindow(transcription_service, fake_meeting_library_service)
         qtbot.add_widget(window)
 
-        with patch("PyQt6.QtWidgets.QFileDialog.getExistingDirectory") as mock_dir, \
-             patch.object(window, "open_file_transcriber_widget") as mock_open:
+        with patch(
+            "PyQt6.QtWidgets.QFileDialog.getExistingDirectory"
+        ) as mock_dir, patch.object(
+            window, "open_file_transcriber_widget"
+        ) as mock_open:
             mock_dir.return_value = ""
             window.on_import_folder_action_triggered()
 
@@ -343,15 +486,18 @@ class TestMainWindow:
     def test_import_folder_does_nothing_when_no_supported_files(
         self, qtbot, transcription_service
     ):
-        window = MainWindow(transcription_service)
+        window = MainWindow(transcription_service, fake_meeting_library_service)
         qtbot.add_widget(window)
 
         with tempfile.TemporaryDirectory() as folder:
             open(os.path.join(folder, "readme.txt"), "w").close()
             open(os.path.join(folder, "image.jpg"), "w").close()
 
-            with patch("PyQt6.QtWidgets.QFileDialog.getExistingDirectory") as mock_dir, \
-                 patch.object(window, "open_file_transcriber_widget") as mock_open:
+            with patch(
+                "PyQt6.QtWidgets.QFileDialog.getExistingDirectory"
+            ) as mock_dir, patch.object(
+                window, "open_file_transcriber_widget"
+            ) as mock_open:
                 mock_dir.return_value = folder
                 window.on_import_folder_action_triggered()
 
@@ -363,7 +509,7 @@ class TestMainWindow:
     ):
         from buzz.settings.settings import Settings
 
-        window = MainWindow(transcription_service)
+        window = MainWindow(transcription_service, fake_meeting_library_service)
         qtbot.add_widget(window)
 
         with tempfile.TemporaryDirectory() as folder:
@@ -372,9 +518,7 @@ class TestMainWindow:
 
             with patch(
                 "PyQt6.QtWidgets.QFileDialog.getOpenFileNames"
-            ) as mock_dialog, patch.object(
-                window, "open_file_transcriber_widget"
-            ):
+            ) as mock_dialog, patch.object(window, "open_file_transcriber_widget"):
                 mock_dialog.return_value = ([file_path], "")
                 window.on_new_transcription_action_triggered()
 
@@ -386,9 +530,7 @@ class TestMainWindow:
             # On the next open, the dialog should be pre-pointed at that folder
             with patch(
                 "PyQt6.QtWidgets.QFileDialog.getOpenFileNames"
-            ) as mock_dialog, patch.object(
-                window, "open_file_transcriber_widget"
-            ):
+            ) as mock_dialog, patch.object(window, "open_file_transcriber_widget"):
                 mock_dialog.return_value = ([], "")
                 window.on_new_transcription_action_triggered()
                 assert mock_dialog.call_args[0][2] == os.path.dirname(file_path)
@@ -401,7 +543,7 @@ class TestMainWindow:
     ):
         from buzz.settings.settings import Settings
 
-        window = MainWindow(transcription_service)
+        window = MainWindow(transcription_service, fake_meeting_library_service)
         qtbot.add_widget(window)
 
         with tempfile.TemporaryDirectory() as folder:
