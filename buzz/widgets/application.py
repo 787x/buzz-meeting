@@ -16,11 +16,22 @@ from buzz.__version__ import VERSION
 from buzz.db.dao.transcription_dao import TranscriptionDAO
 from buzz.db.dao.transcription_segment_dao import TranscriptionSegmentDAO
 from buzz.db.db import setup_app_db
+from buzz.db.meeting_library_repository import QSqlMeetingLibraryRepository
 from buzz.db.service.transcription_service import TranscriptionService
+from buzz.meeting.meeting_library import MeetingLibraryService
 from buzz.settings.settings import APP_NAME, Settings
 
 from buzz.transcriber.transcriber import FileTranscriptionTask
 from buzz.widgets.main_window import MainWindow
+
+
+def _build_main_window(database) -> MainWindow:
+    transcription_service = TranscriptionService(
+        TranscriptionDAO(database), TranscriptionSegmentDAO(database)
+    )
+    meeting_library_repository = QSqlMeetingLibraryRepository(database)
+    meeting_library_service = MeetingLibraryService(meeting_library_repository)
+    return MainWindow(transcription_service, meeting_library_service)
 
 
 class Application(QApplication):
@@ -46,7 +57,7 @@ class Application(QApplication):
 
         self.settings = Settings()
         logging.debug(f"Settings filename: {self.settings.settings.fileName()}")
-        
+
         # Set BUZZ_FORCE_CPU environment variable if Force CPU setting is enabled
         force_cpu_enabled = self.settings.value(
             key=Settings.Key.FORCE_CPU, default_value=False
@@ -60,7 +71,7 @@ class Application(QApplication):
         )
         if reduce_gpu_memory_enabled:
             os.environ["BUZZ_REDUCE_GPU_MEMORY"] = "true"
-        
+
         font_size = self.settings.value(
             key=Settings.Key.FONT_SIZE, default_value=self.font().pointSize()
         )
@@ -71,33 +82,37 @@ class Application(QApplication):
             self.setFont(QFont(self.font().family(), font_size))
 
         self.db = setup_app_db()
-        transcription_service = TranscriptionService(
-            TranscriptionDAO(self.db), TranscriptionSegmentDAO(self.db)
-        )
-
-        self.window = MainWindow(transcription_service)
+        self.window = _build_main_window(self.db)
 
         disable_telemetry = os.getenv("BUZZ_DISABLE_TELEMETRY", None)
 
         if not disable_telemetry:
-            posthog = Posthog(project_api_key='phc_NqZQUw8NcxfSXsbtk5eCFylmCQpp4FuNnd6ocPAzg2f',
-                              host='https://us.i.posthog.com')
-            posthog.capture(distinct_id=self.settings.get_user_identifier(), event="app_launched", properties={
-                "app": VERSION,
-                "locale": locale.getlocale(),
-                "system": platform.system(),
-                "release": platform.release(),
-                "machine": platform.machine(),
-                "version": platform.version(),
-            })
+            posthog = Posthog(
+                project_api_key="phc_NqZQUw8NcxfSXsbtk5eCFylmCQpp4FuNnd6ocPAzg2f",
+                host="https://us.i.posthog.com",
+            )
+            posthog.capture(
+                distinct_id=self.settings.get_user_identifier(),
+                event="app_launched",
+                properties={
+                    "app": VERSION,
+                    "locale": locale.getlocale(),
+                    "system": platform.system(),
+                    "release": platform.release(),
+                    "machine": platform.machine(),
+                    "version": platform.version(),
+                },
+            )
             threading.Thread(target=posthog.shutdown, daemon=True).start()
 
-        logging.debug(f"Launching Buzz: {VERSION}, " 
-                      f"locale: {locale.getlocale()}, "
-                      f"system: {platform.system()}, "
-                      f"release: {platform.release()}, "
-                      f"machine: {platform.machine()}, "
-                      f"version: {platform.version()}, ")
+        logging.debug(
+            f"Launching Buzz: {VERSION}, "
+            f"locale: {locale.getlocale()}, "
+            f"system: {platform.system()}, "
+            f"release: {platform.release()}, "
+            f"machine: {platform.machine()}, "
+            f"version: {platform.version()}, "
+        )
 
     def show_main_window(self):
         if not self.hide_main_window:
@@ -109,4 +124,5 @@ class Application(QApplication):
 
     def close_database(self):
         from buzz.db.db import close_app_db
+
         close_app_db()
