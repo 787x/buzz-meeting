@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import datetime
+import inspect
 import json
 import math
 import uuid
@@ -14,6 +16,11 @@ from typing import Any
 import pytest
 import requests
 
+from buzz.meeting.meeting_summary_prompt import (
+    MEETING_SUMMARY_PROMPT_INSTRUCTIONS,
+    MEETING_SUMMARY_PROMPT_VERSION,
+    render_meeting_summary_request_json,
+)
 from buzz.meeting.meeting_summary import (
     ActionItem,
     Decision,
@@ -379,11 +386,17 @@ class TestConfigTimeoutAndShape:
 
 class TestRequestAndPrompt:
     def test_prompt_version_constant(self) -> None:
+        assert (
+            OPENAI_COMPATIBLE_SUMMARY_PROMPT_VERSION == MEETING_SUMMARY_PROMPT_VERSION
+        )
         assert OPENAI_COMPATIBLE_SUMMARY_PROMPT_VERSION == 1
 
     def test_unsupported_prompt_rejected_before_http(self) -> None:
-        with pytest.raises(SummaryProviderRequestError):
+        with pytest.raises(SummaryProviderRequestError) as caught:
             _provider().summarize(_request(prompt_version=2))
+        assert str(caught.value) == (
+            "Unsupported OpenAI-compatible summary prompt version"
+        )
 
     def test_exact_prompt_and_deterministic_body(
         self, monkeypatch: pytest.MonkeyPatch
@@ -401,6 +414,52 @@ class TestRequestAndPrompt:
             "role": "system",
             "content": _EXPECTED_SYSTEM_PROMPT_V1,
         }
+        assert first_body["messages"][0]["content"] == (  # type: ignore[index]
+            MEETING_SUMMARY_PROMPT_INSTRUCTIONS
+        )
+        assert MEETING_SUMMARY_PROMPT_INSTRUCTIONS == _EXPECTED_SYSTEM_PROMPT_V1
+
+    def test_system_message_consumes_shared_instruction_symbol(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sentinel = "SHARED_INSTRUCTIONS_SENTINEL"
+        monkeypatch.setattr(
+            "buzz.meeting.openai_compatible_provider."
+            "MEETING_SUMMARY_PROMPT_INSTRUCTIONS",
+            sentinel,
+        )
+        calls = _install_response(monkeypatch)
+
+        _provider().summarize(_request())
+
+        body = calls[0][1]["json"]
+        assert body["messages"][0]["content"] == sentinel  # type: ignore[index]
+
+    def test_user_message_consumes_shared_renderer_symbol(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rendered_requests: list[MeetingSummaryRequest] = []
+
+        def fake_render(request: MeetingSummaryRequest) -> str:
+            rendered_requests.append(request)
+            return "SHARED_RENDERER_SENTINEL"
+
+        monkeypatch.setattr(
+            "buzz.meeting.openai_compatible_provider."
+            "render_meeting_summary_request_json",
+            fake_render,
+        )
+        calls = _install_response(monkeypatch)
+        request = _request()
+
+        _provider().summarize(request)
+
+        assert len(rendered_requests) == 1
+        assert rendered_requests[0] is request
+        body = calls[0][1]["json"]
+        assert body["messages"][1]["content"] == (  # type: ignore[index]
+            "SHARED_RENDERER_SENTINEL"
+        )
 
     def test_user_json_exact_and_preserves_untrusted_text(
         self, monkeypatch: pytest.MonkeyPatch
@@ -471,7 +530,55 @@ class TestRequestAndPrompt:
             allow_nan=False,
         )
         assert user_content == expected
+        assert user_content == render_meeting_summary_request_json(request)
         assert json.loads(user_content)["transcript"][0]["text"] == untrusted
+
+
+class TestSharedPromptArchitecture:
+    def test_version_constant_is_structural_alias(self) -> None:
+        import buzz.meeting.openai_compatible_provider as module
+
+        tree = ast.parse(inspect.getsource(module))
+        assignments = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "OPENAI_COMPATIBLE_SUMMARY_PROMPT_VERSION"
+                for target in node.targets
+            )
+        ]
+
+        assert len(assignments) == 1
+        assert isinstance(assignments[0].value, ast.Name)
+        assert assignments[0].value.id == "MEETING_SUMMARY_PROMPT_VERSION"
+
+    def test_no_local_prompt_or_request_renderer_duplicate(self) -> None:
+        import buzz.meeting.openai_compatible_provider as module
+
+        tree = ast.parse(inspect.getsource(module))
+        assigned_names = {
+            target.id
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        function_names = {
+            node.name for node in tree.body if isinstance(node, ast.FunctionDef)
+        }
+        assigned_values = [
+            node.value for node in tree.body if isinstance(node, ast.Assign)
+        ]
+
+        assert "_SYSTEM_PROMPT_V1" not in assigned_names
+        assert "_render_request" not in function_names
+        assert not any(
+            isinstance(value, ast.Constant)
+            and value.value == _EXPECTED_SYSTEM_PROMPT_V1
+            for value in assigned_values
+        )
 
 
 class TestHttpCall:
