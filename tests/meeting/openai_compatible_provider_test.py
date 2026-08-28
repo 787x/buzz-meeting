@@ -32,6 +32,9 @@ from buzz.meeting.meeting_summary import (
     meeting_summary_to_dict,
     meeting_summary_to_json,
 )
+from buzz.meeting.meeting_summary_provenance import (
+    MeetingSummaryTimestampProvenanceError,
+)
 from buzz.meeting.openai_compatible_provider import (
     OPENAI_COMPATIBLE_SUMMARY_PROMPT_VERSION,
     OpenAICompatibleProvider,
@@ -786,6 +789,44 @@ class TestStrictSummaryContent:
         _install_response(monkeypatch, text=_envelope(meeting_summary_to_json(result)))
         assert _provider().summarize(_request()) == result
 
+    def test_shared_timestamp_provenance_wiring_and_public_error_mapping(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import buzz.meeting.openai_compatible_provider as module
+
+        request = _request()
+        decoded = _summary()
+        calls: list[tuple[object, object]] = []
+
+        _install_response(monkeypatch)
+        monkeypatch.setattr(module, "meeting_summary_from_json", lambda _: decoded)
+
+        def reject(request_arg: object, result_arg: object) -> None:
+            calls.append((request_arg, result_arg))
+            raise MeetingSummaryTimestampProvenanceError("private detail")
+
+        monkeypatch.setattr(
+            module,
+            "validate_meeting_summary_timestamp_provenance",
+            reject,
+        )
+
+        with pytest.raises(
+            SummaryProviderResponseError,
+            match=(
+                "^OpenAI-compatible summary response used a timestamp outside "
+                "the supplied transcript boundaries$"
+            ),
+        ) as caught:
+            _provider().summarize(request)
+
+        assert calls == [(request, decoded)]
+        assert calls[0][0] is request
+        assert calls[0][1] is decoded
+        assert isinstance(
+            caught.value.__cause__, MeetingSummaryTimestampProvenanceError
+        )
+
 
 class TestHttpAndTransportErrors:
     @pytest.mark.parametrize("status", [300, 400, 401, 403, 429, 500, 503])
@@ -900,6 +941,28 @@ def test_public_api() -> None:
         "OpenAICompatibleProvider",
         "OpenAICompatibleProviderConfig",
     ]
+
+
+def test_no_local_timestamp_provenance_implementation() -> None:
+    import buzz.meeting.openai_compatible_provider as module
+
+    tree = ast.parse(inspect.getsource(module))
+    local_function_names = {
+        node.name for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    timestamp_set_comprehensions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.SetComp)
+        and any(
+            isinstance(child, ast.Attribute)
+            and child.attr in {"source_start_ns", "source_end_ns"}
+            for child in ast.walk(node)
+        )
+    ]
+
+    assert "_validate_timestamp_provenance" not in local_function_names
+    assert timestamp_set_comprehensions == []
 
 
 def test_no_forbidden_generation_options(monkeypatch: pytest.MonkeyPatch) -> None:
