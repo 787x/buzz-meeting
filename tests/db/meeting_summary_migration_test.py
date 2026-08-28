@@ -1,3 +1,14 @@
+"""Additive migration from the explicit PR17 schema to PR18."""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+from buzz.db.migrator import dumb_migrate_db
+
+
+PR17_SCHEMA = """
 CREATE TABLE transcription (
     id TEXT PRIMARY KEY,
     error_message TEXT,
@@ -40,8 +51,7 @@ CREATE TABLE meeting (
     created_at TEXT NOT NULL,
     started_at TEXT,
     ended_at TEXT,
-    duration_ns INTEGER
-        CHECK (duration_ns IS NULL OR duration_ns >= 0),
+    duration_ns INTEGER CHECK (duration_ns IS NULL OR duration_ns >= 0),
     audio_state TEXT NOT NULL,
     audio_outcome TEXT
 );
@@ -58,9 +68,7 @@ CREATE TABLE meeting_audio_track (
     timing_basis TEXT NOT NULL,
     PRIMARY KEY (meeting_id, role),
     UNIQUE (meeting_id, relative_path),
-    FOREIGN KEY (meeting_id)
-        REFERENCES meeting(id)
-        ON DELETE CASCADE
+    FOREIGN KEY (meeting_id) REFERENCES meeting(id) ON DELETE CASCADE
 );
 
 CREATE TABLE meeting_audio_timing_anchor (
@@ -71,8 +79,7 @@ CREATE TABLE meeting_audio_timing_anchor (
     callback_arrival_offset_ns INTEGER NOT NULL,
     PRIMARY KEY (meeting_id, role, ordinal),
     FOREIGN KEY (meeting_id, role)
-        REFERENCES meeting_audio_track(meeting_id, role)
-        ON DELETE CASCADE
+        REFERENCES meeting_audio_track(meeting_id, role) ON DELETE CASCADE
 );
 
 CREATE TABLE meeting_audio_error (
@@ -85,8 +92,7 @@ CREATE TABLE meeting_audio_error (
     message TEXT NOT NULL CHECK (length(message) <= 4096),
     PRIMARY KEY (meeting_id, role, ordinal),
     FOREIGN KEY (meeting_id, role)
-        REFERENCES meeting_audio_track(meeting_id, role)
-        ON DELETE CASCADE
+        REFERENCES meeting_audio_track(meeting_id, role) ON DELETE CASCADE
 );
 
 CREATE TABLE meeting_final_transcription (
@@ -98,39 +104,26 @@ CREATE TABLE meeting_final_transcription (
     config_whisper_model_size TEXT,
     config_hugging_face_model_id TEXT NOT NULL DEFAULT '',
     config_language TEXT,
-    error_message TEXT
-        CHECK (
-            error_message IS NULL
-            OR length(error_message) <= 4096
-        ),
+    error_message TEXT CHECK (error_message IS NULL OR length(error_message) <= 4096),
     time_created TEXT NOT NULL,
     time_started TEXT,
     time_completed TEXT,
     UNIQUE (meeting_id, profile_version),
-    FOREIGN KEY (meeting_id)
-        REFERENCES meeting(id)
-        ON DELETE CASCADE
+    FOREIGN KEY (meeting_id) REFERENCES meeting(id) ON DELETE CASCADE
 );
 
 CREATE TABLE meeting_final_transcription_track (
     generation_id TEXT NOT NULL,
     role TEXT NOT NULL,
     status TEXT NOT NULL,
-    error_message TEXT
-        CHECK (
-            error_message IS NULL
-            OR length(error_message) <= 4096
-        ),
+    error_message TEXT CHECK (error_message IS NULL OR length(error_message) <= 4096),
     time_started TEXT,
     time_completed TEXT,
-    segment_count INTEGER NOT NULL DEFAULT 0
-        CHECK (segment_count >= 0),
-    word_count INTEGER NOT NULL DEFAULT 0
-        CHECK (word_count >= 0),
+    segment_count INTEGER NOT NULL DEFAULT 0 CHECK (segment_count >= 0),
+    word_count INTEGER NOT NULL DEFAULT 0 CHECK (word_count >= 0),
     PRIMARY KEY (generation_id, role),
     FOREIGN KEY (generation_id)
-        REFERENCES meeting_final_transcription(id)
-        ON DELETE CASCADE
+        REFERENCES meeting_final_transcription(id) ON DELETE CASCADE
 );
 
 CREATE TABLE meeting_final_transcription_segment (
@@ -165,9 +158,7 @@ CREATE TABLE meeting_final_transcription_word (
         REFERENCES meeting_final_transcription_track(generation_id, role)
         ON DELETE CASCADE,
     FOREIGN KEY (generation_id, role, segment_ordinal)
-        REFERENCES meeting_final_transcription_segment(
-            generation_id, role, ordinal
-        )
+        REFERENCES meeting_final_transcription_segment(generation_id, role, ordinal)
         ON DELETE CASCADE,
     CHECK (local_end_ms >= local_start_ms),
     CHECK (end_ns >= start_ns)
@@ -357,39 +348,164 @@ CREATE TABLE meeting_speaker_word_override (
         REFERENCES meeting_reviewed_speaker(review_id, id)
         ON DELETE NO ACTION
 );
+"""
 
-CREATE TABLE meeting_summary (
-    id TEXT PRIMARY KEY NOT NULL,
-    meeting_id TEXT NOT NULL,
-    source_generation_id TEXT NOT NULL,
-    source_profile_version INTEGER NOT NULL
-        CHECK (source_profile_version > 0),
-    source_review_id TEXT NULL,
-    source_review_revision INTEGER NULL,
-    schema_version INTEGER NOT NULL
-        CHECK (schema_version > 0),
-    prompt_version INTEGER NOT NULL
-        CHECK (prompt_version > 0),
-    created_at TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    FOREIGN KEY (meeting_id)
-        REFERENCES meeting(id)
-        ON DELETE CASCADE,
-    FOREIGN KEY (source_generation_id)
-        REFERENCES meeting_final_transcription(id)
-        ON DELETE CASCADE,
-    CHECK (
-        (source_review_id IS NULL AND source_review_revision IS NULL)
-        OR (
-            source_review_id IS NOT NULL
-            AND source_review_revision IS NOT NULL
-            AND source_review_revision >= 0
-        )
+
+NEW_TABLE = "meeting_summary"
+NEW_INDEXES = (
+    "idx_meeting_summary_meeting_created",
+    "idx_meeting_summary_source_generation",
+)
+
+
+def test_pr17_to_pr18_migration_is_additive_idempotent_and_fk_clean(tmp_path):
+    database = sqlite3.connect(tmp_path / "pr17.sqlite")
+    database.execute("PRAGMA foreign_keys = ON")
+    database.executescript(PR17_SCHEMA)
+
+    # Insert representative PR17 data
+    meeting_id = "00000000-0000-0000-0000-000000000101"
+    generation_id = "00000000-0000-0000-0000-000000000102"
+    database.execute(
+        """
+        INSERT INTO meeting (
+            id, remote_source_kind, session_state, created_at,
+            started_at, ended_at, duration_ns, audio_state, audio_outcome
+        ) VALUES (?, 'SYSTEM', 'COMPLETED', ?, ?, ?, 1000000000,
+                  'STOPPED', 'COMPLETE')
+        """,
+        (
+            meeting_id,
+            "2026-01-01T00:00:00+00:00",
+            "2026-01-01T00:00:01+00:00",
+            "2026-01-01T00:00:02+00:00",
+        ),
     )
-);
+    database.execute(
+        """
+        INSERT INTO meeting_audio_track (
+            meeting_id, role, relative_path, sample_rate, sample_count,
+            recording_state, published, complete, timing_basis
+        ) VALUES (?, 'MICROPHONE', 'meeting/mic.wav', 16000, 16000,
+                  'STOPPED', 1, 1, 'host_callback_arrival')
+        """,
+        (meeting_id,),
+    )
+    database.execute(
+        """
+        INSERT INTO meeting_final_transcription (
+            id, meeting_id, profile_version, status, config_model_type,
+            config_whisper_model_size, config_hugging_face_model_id,
+            config_language, error_message, time_created, time_started,
+            time_completed
+        ) VALUES (?, ?, 2, 'COMPLETED', 'FASTER_WHISPER', 'LARGE', '',
+                  NULL, NULL, ?, ?, ?)
+        """,
+        (
+            generation_id,
+            meeting_id,
+            "2026-01-01T00:00:03+00:00",
+            "2026-01-01T00:00:04+00:00",
+            "2026-01-01T00:00:05+00:00",
+        ),
+    )
+    database.execute(
+        """
+        INSERT INTO meeting_final_transcription_track (
+            generation_id, role, status, error_message, time_started,
+            time_completed, segment_count, word_count
+        ) VALUES (?, 'MICROPHONE', 'COMPLETED', NULL, ?, ?, 1, 1)
+        """,
+        (
+            generation_id,
+            "2026-01-01T00:00:04+00:00",
+            "2026-01-01T00:00:05+00:00",
+        ),
+    )
+    database.execute(
+        """
+        INSERT INTO meeting_final_transcription_segment (
+            generation_id, role, ordinal, local_start_ms, local_end_ms,
+            start_ns, end_ns, text
+        ) VALUES (?, 'MICROPHONE', 0, 0, 500, 0, 500000000, 'hello')
+        """,
+        (generation_id,),
+    )
+    database.execute(
+        """
+        INSERT INTO meeting_final_transcription_word (
+            generation_id, role, ordinal, segment_ordinal, local_start_ms,
+            local_end_ms, start_ns, end_ns, text
+        ) VALUES (?, 'MICROPHONE', 0, 0, 0, 400, 0, 400000000, 'hello')
+        """,
+        (generation_id,),
+    )
+    review_id = "00000000-0000-0000-0000-000000000103"
+    database.execute(
+        """
+        INSERT INTO meeting_speaker_review (
+            id, source_generation_id, source_profile_version,
+            source_track_count, mapping_algorithm_version,
+            status, revision, next_speaker_ordinal,
+            time_created, time_updated, time_completed
+        ) VALUES (?, ?, 2, 1, 1, 'UNREVIEWED', 0, 0,
+                  '2026-01-01T00:00:06+00:00',
+                  '2026-01-01T00:00:06+00:00', NULL)
+        """,
+        (review_id, generation_id),
+    )
+    database.commit()
 
-CREATE INDEX idx_meeting_summary_meeting_created
-    ON meeting_summary (meeting_id, created_at, id);
+    # Snapshot all old rows
+    old_rows = {
+        table: database.execute(f"SELECT * FROM {table}").fetchall()
+        for table in (
+            "meeting",
+            "meeting_audio_track",
+            "meeting_final_transcription",
+            "meeting_final_transcription_track",
+            "meeting_final_transcription_segment",
+            "meeting_final_transcription_word",
+            "meeting_speaker_review",
+        )
+    }
 
-CREATE INDEX idx_meeting_summary_source_generation
-    ON meeting_summary (source_generation_id);
+    latest_schema = Path("buzz/schema.sql").read_text()
+
+    # Migrate
+    assert dumb_migrate_db(database, latest_schema)
+
+    # All old rows unchanged
+    for table, expected in old_rows.items():
+        assert database.execute(f"SELECT * FROM {table}").fetchall() == expected
+
+    # meeting_summary table exists
+    existing_tables = {
+        row[0]
+        for row in database.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    assert NEW_TABLE in existing_tables
+
+    # Both indexes exist
+    existing_indexes = {
+        row[0]
+        for row in database.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'"
+        )
+    }
+    for idx in NEW_INDEXES:
+        assert idx in existing_indexes, f"Missing index: {idx}"
+
+    # meeting_summary initially empty
+    assert database.execute("SELECT COUNT(*) FROM meeting_summary").fetchone()[0] == 0
+
+    # foreign_key_check clean
+    assert database.execute("PRAGMA foreign_key_check").fetchall() == []
+
+    # Second migration is a no-op
+    assert not dumb_migrate_db(database, latest_schema)
+    assert database.execute("PRAGMA foreign_key_check").fetchall() == []
+
+    database.close()
