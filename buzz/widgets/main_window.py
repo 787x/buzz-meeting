@@ -18,7 +18,9 @@ from buzz.db.entity.transcription import Transcription
 from buzz.db.service.transcription_service import TranscriptionService
 from buzz.file_transcriber_queue_worker import FileTranscriberQueueWorker
 from buzz.locale import _
+from buzz.meeting.meeting_detail import MeetingDetailService
 from buzz.meeting.meeting_library import MeetingLibraryService
+from buzz.meeting.speaker_review import MeetingSpeakerReviewService
 from buzz.plugins.manager import PluginManager
 from buzz.plugins.post_processing import FnRunnable
 from buzz.settings.settings import APP_NAME, Settings
@@ -37,6 +39,7 @@ from buzz.widgets.icon import BUZZ_ICON_PATH
 from buzz.widgets.import_url_dialog import ImportURLDialog
 from buzz.widgets.main_window_toolbar import MainWindowToolbar
 from buzz.widgets.menu_bar import MenuBar
+from buzz.widgets.meeting_detail_widget import MeetingDetailWidget
 from buzz.widgets.meetings_library_widget import MeetingsLibraryWidget
 from buzz.widgets.preferences_dialog.models.preferences import Preferences
 from buzz.widgets.transcriber.file_transcriber_widget import FileTranscriberWidget
@@ -60,6 +63,9 @@ class MainWindow(QMainWindow):
         self,
         transcription_service: TranscriptionService,
         meeting_library_service: MeetingLibraryService,
+        meeting_detail_service: MeetingDetailService,
+        meeting_speaker_review_service: MeetingSpeakerReviewService,
+        preview_player_factory,
     ):
         super().__init__(flags=Qt.WindowType.Window)
 
@@ -75,7 +81,11 @@ class MainWindow(QMainWindow):
         self.quit_on_complete = False
         self.transcription_service = transcription_service
         self.meeting_library_service = meeting_library_service
+        self.meeting_detail_service = meeting_detail_service
+        self.meeting_speaker_review_service = meeting_speaker_review_service
+        self.preview_player_factory = preview_player_factory
         self.meetings_library_widget = None
+        self.meeting_detail_widget = None
 
         self.plugin_manager = PluginManager(self.transcription_service, self.settings)
         try:
@@ -313,10 +323,27 @@ class MainWindow(QMainWindow):
                 parent=self,
                 flags=Qt.WindowType.Window,
             )
+            self.meetings_library_widget.meeting_open_requested.connect(
+                self.on_meeting_open_requested
+            )
         self.meetings_library_widget.refresh()
         self.meetings_library_widget.show()
         self.meetings_library_widget.raise_()
         self.meetings_library_widget.activateWindow()
+
+    def on_meeting_open_requested(self, meeting_id: UUID) -> None:
+        if self.meeting_detail_widget is None:
+            self.meeting_detail_widget = MeetingDetailWidget(
+                detail_service=self.meeting_detail_service,
+                speaker_review_service=self.meeting_speaker_review_service,
+                preview_player_factory=self.preview_player_factory,
+                parent=self,
+                flags=Qt.WindowType.Window,
+            )
+        self.meeting_detail_widget.open_meeting(meeting_id)
+        self.meeting_detail_widget.show()
+        self.meeting_detail_widget.raise_()
+        self.meeting_detail_widget.activateWindow()
 
     def open_file_transcriber_widget(
         self, file_paths: Optional[List[str]] = None, url: Optional[str] = None
@@ -551,6 +578,9 @@ class MainWindow(QMainWindow):
 
         if self.transcription_viewer_widget is not None:
             self.transcription_viewer_widget.close()
+
+        if self.meeting_detail_widget is not None:
+            self.meeting_detail_widget.close()
 
         try:
             from buzz.widgets.application import Application

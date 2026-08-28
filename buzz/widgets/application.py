@@ -17,11 +17,19 @@ from buzz.db.dao.transcription_dao import TranscriptionDAO
 from buzz.db.dao.transcription_segment_dao import TranscriptionSegmentDAO
 from buzz.db.db import setup_app_db
 from buzz.db.meeting_library_repository import QSqlMeetingLibraryRepository
+from buzz.db.meeting_speaker_repository import QSqlMeetingSpeakerRepository
+from buzz.db.meeting_storage_repository import QSqlMeetingRepository
+from buzz.db.meeting_transcription_repository import QSqlMeetingTranscriptionRepository
 from buzz.db.service.transcription_service import TranscriptionService
+from buzz.meeting.final_transcription import FinalTranscriptionReadService
+from buzz.meeting.meeting_detail import MeetingDetailService
 from buzz.meeting.meeting_library import MeetingLibraryService
+from buzz.meeting.meeting_storage import MeetingStorage
+from buzz.meeting.speaker_review import MeetingSpeakerReviewService
 from buzz.settings.settings import APP_NAME, Settings
 
 from buzz.transcriber.transcriber import FileTranscriptionTask
+from buzz.widgets.audio_player import AudioPlayer
 from buzz.widgets.main_window import MainWindow
 
 
@@ -31,7 +39,25 @@ def _build_main_window(database) -> MainWindow:
     )
     meeting_library_repository = QSqlMeetingLibraryRepository(database)
     meeting_library_service = MeetingLibraryService(meeting_library_repository)
-    return MainWindow(transcription_service, meeting_library_service)
+    meeting_storage = MeetingStorage(QSqlMeetingRepository(database))
+    final_transcription_reader = FinalTranscriptionReadService(
+        QSqlMeetingTranscriptionRepository(database)
+    )
+    speaker_review_service = MeetingSpeakerReviewService(
+        QSqlMeetingSpeakerRepository(database), final_transcription_reader
+    )
+    meeting_detail_service = MeetingDetailService(
+        meeting_storage,
+        final_transcription_reader,
+        speaker_review_service,
+    )
+    return MainWindow(
+        transcription_service,
+        meeting_library_service,
+        meeting_detail_service,
+        speaker_review_service,
+        AudioPlayer,
+    )
 
 
 class Application(QApplication):
