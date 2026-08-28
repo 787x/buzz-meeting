@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Callable
 from typing import Any
 
-from PyQt6.QtCore import QAbstractTableModel, QModelIndex, Qt
+from PyQt6.QtCore import QAbstractTableModel, QModelIndex, Qt, pyqtSignal
+from PyQt6.QtGui import QKeyEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QLabel,
@@ -17,68 +17,18 @@ from PyQt6.QtWidgets import (
 )
 
 from buzz.locale import _
-from buzz.meeting.meeting_audio_tracks import (
-    MeetingAudioTracksOutcome,
-    MeetingAudioTracksState,
-)
 from buzz.meeting.meeting_library import (
     MeetingLibraryEntry,
     MeetingLibraryError,
     MeetingLibraryService,
 )
-from buzz.meeting.meeting_session import (
-    MeetingRemoteSourceKind,
-    MeetingSessionState,
+from buzz.widgets.meeting_presentation import (
+    format_audio_status,
+    format_duration,
+    format_meeting_datetime,
+    format_meeting_state,
+    format_remote_source,
 )
-
-
-def _format_date(entry: MeetingLibraryEntry) -> str:
-    return entry.display_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _format_duration(entry: MeetingLibraryEntry) -> str:
-    if entry.duration_seconds is None:
-        return ""
-    seconds = int(entry.duration_seconds)
-    if seconds < 60:
-        return f"{seconds}s"
-    if seconds < 3600:
-        minutes, remaining_seconds = divmod(seconds, 60)
-        return f"{minutes}m {remaining_seconds:02d}s"
-    hours, remaining_seconds = divmod(seconds, 3600)
-    minutes = remaining_seconds // 60
-    return f"{hours}h {minutes:02d}m"
-
-
-_SOURCE_LABELS: dict[MeetingRemoteSourceKind, Callable[[], str]] = {
-    MeetingRemoteSourceKind.SYSTEM: lambda: _("System audio"),
-    MeetingRemoteSourceKind.APPLICATION: lambda: _("Application audio"),
-}
-
-_MEETING_STATUS_LABELS: dict[MeetingSessionState, Callable[[], str]] = {
-    MeetingSessionState.CREATED: lambda: _("Created"),
-    MeetingSessionState.STARTING: lambda: _("Starting"),
-    MeetingSessionState.ACTIVE: lambda: _("Active"),
-    MeetingSessionState.STOPPING: lambda: _("Stopping"),
-    MeetingSessionState.COMPLETED: lambda: _("Completed"),
-    MeetingSessionState.FAILED: lambda: _("Failed"),
-}
-
-_AUDIO_STATE_LABELS: dict[MeetingAudioTracksState, Callable[[], str]] = {
-    MeetingAudioTracksState.CREATED: lambda: _("Created"),
-    MeetingAudioTracksState.STARTING: lambda: _("Starting"),
-    MeetingAudioTracksState.RUNNING: lambda: _("Running"),
-    MeetingAudioTracksState.DEGRADED: lambda: _("Degraded"),
-    MeetingAudioTracksState.STOPPING: lambda: _("Stopping"),
-    MeetingAudioTracksState.STOPPED: lambda: _("Stopped"),
-    MeetingAudioTracksState.FAILED: lambda: _("Failed"),
-}
-
-_AUDIO_OUTCOME_LABELS: dict[MeetingAudioTracksOutcome, Callable[[], str]] = {
-    MeetingAudioTracksOutcome.COMPLETE: lambda: _("Complete"),
-    MeetingAudioTracksOutcome.PARTIAL: lambda: _("Partial"),
-    MeetingAudioTracksOutcome.FAILED: lambda: _("Failed"),
-}
 
 
 class MeetingLibraryTableModel(QAbstractTableModel):
@@ -135,21 +85,32 @@ class MeetingLibraryTableModel(QAbstractTableModel):
             return None
         entry = self.meeting_at(index.row())
         values = (
-            _format_date(entry),
-            _format_duration(entry),
-            _SOURCE_LABELS[entry.remote_source_kind](),
-            _MEETING_STATUS_LABELS[entry.session_state](),
-            (
-                _AUDIO_OUTCOME_LABELS[entry.audio_outcome]()
-                if entry.audio_outcome is not None
-                else _AUDIO_STATE_LABELS[entry.audio_state]()
-            ),
+            format_meeting_datetime(entry.display_at),
+            format_duration(entry.duration_seconds),
+            format_remote_source(entry.remote_source_kind),
+            format_meeting_state(entry.session_state),
+            format_audio_status(entry.audio_state, entry.audio_outcome),
         )
         return values[index.column()]
 
 
+class _MeetingTableView(QTableView):
+    open_requested = pyqtSignal(QModelIndex)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() in (Qt.Key.Key_Enter, Qt.Key.Key_Return):
+            selected_rows = self.selectionModel().selectedRows()
+            if selected_rows:
+                self.open_requested.emit(selected_rows[0])
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class MeetingsLibraryWidget(QWidget):
     """Reusable meetings window whose caller owns refresh timing."""
+
+    meeting_open_requested = pyqtSignal(object)
 
     def __init__(
         self,
@@ -162,7 +123,7 @@ class MeetingsLibraryWidget(QWidget):
         self.setWindowTitle(_("Meetings"))
 
         self.table_model = MeetingLibraryTableModel(self)
-        self.table_view = QTableView(self)
+        self.table_view = _MeetingTableView(self)
         self.table_view.setModel(self.table_model)
         self.table_view.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -172,6 +133,8 @@ class MeetingsLibraryWidget(QWidget):
         )
         self.table_view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table_view.setSortingEnabled(False)
+        self.table_view.doubleClicked.connect(self._request_open)
+        self.table_view.open_requested.connect(self._request_open)
 
         self.state_label = QLabel(self)
         self.state_label.hide()
@@ -185,6 +148,15 @@ class MeetingsLibraryWidget(QWidget):
         if not selected_rows:
             return None
         return self.table_model.meeting_at(selected_rows[0].row()).session_id
+
+    def _request_open(self, index: QModelIndex) -> None:
+        if not index.isValid() or index.model() is not self.table_model:
+            return
+        try:
+            entry = self.table_model.meeting_at(index.row())
+        except IndexError:
+            return
+        self.meeting_open_requested.emit(entry.session_id)
 
     def refresh(self) -> None:
         selected_id = self.selected_meeting_id()

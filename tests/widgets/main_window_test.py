@@ -1,8 +1,10 @@
 import logging
 import os
 import tempfile
+from functools import partial
 from typing import List
-from unittest.mock import patch, Mock
+from unittest.mock import Mock, call, patch
+from uuid import UUID
 
 import pytest
 from PyQt6 import sip
@@ -20,11 +22,13 @@ from pytestqt.qtbot import QtBot
 
 from buzz.locale import _
 from buzz.meeting.meeting_library import MeetingLibraryService
+from buzz.meeting.meeting_detail import MeetingDetailNotFoundError, MeetingDetailService
+from buzz.meeting.speaker_review import MeetingSpeakerReviewService
 from buzz.db.entity.transcription import Transcription
 from buzz.db.service.transcription_service import TranscriptionService
 from buzz.model_loader import TranscriptionModel, ModelType, WhisperModelSize
 from buzz.transcriber.transcriber import Task, OutputFormat
-from buzz.widgets.main_window import MainWindow
+from buzz.widgets.main_window import MainWindow as ProductionMainWindow
 from buzz.widgets.meetings_library_widget import MeetingsLibraryWidget
 from buzz.widgets.preferences_dialog.models.file_transcription_preferences import (
     FileTranscriptionPreferences,
@@ -40,6 +44,15 @@ mock_transcriptions: List[Transcription] = [
     Transcription(status="failed", error_message=_("Error")),
 ]
 fake_meeting_library_service = Mock(spec=MeetingLibraryService)
+fake_meeting_detail_service = Mock(spec=MeetingDetailService)
+fake_speaker_review_service = Mock(spec=MeetingSpeakerReviewService)
+fake_preview_player_factory = Mock()
+MainWindow = partial(
+    ProductionMainWindow,
+    meeting_detail_service=fake_meeting_detail_service,
+    meeting_speaker_review_service=fake_speaker_review_service,
+    preview_player_factory=fake_preview_player_factory,
+)
 
 
 @pytest.fixture(scope="session")
@@ -154,6 +167,66 @@ class TestMainWindow:
         qtbot.add_widget(window)
         assert window.centralWidget() is window.table_widget
         assert isinstance(window.centralWidget(), TranscriptionTasksTableWidget)
+        window.close()
+
+    def test_meeting_library_uuid_opens_and_reuses_one_detail_window(
+        self, qtbot, transcription_service
+    ):
+        detail_window = Mock()
+        first = UUID(int=1)
+        second = UUID(int=2)
+        with patch(
+            "buzz.widgets.main_window.MeetingDetailWidget",
+            return_value=detail_window,
+        ) as detail_widget_type:
+            window = MainWindow(transcription_service, fake_meeting_library_service)
+            qtbot.add_widget(window)
+
+            window.on_meeting_open_requested(first)
+            window.on_meeting_open_requested(second)
+
+        detail_widget_type.assert_called_once_with(
+            detail_service=fake_meeting_detail_service,
+            speaker_review_service=fake_speaker_review_service,
+            preview_player_factory=fake_preview_player_factory,
+            parent=window,
+            flags=Qt.WindowType.Window,
+        )
+        assert window.meeting_detail_widget is detail_window
+        assert detail_window.open_meeting.call_args_list == [call(first), call(second)]
+        assert detail_window.show.call_count == 2
+        assert detail_window.raise_.call_count == 2
+        assert detail_window.activateWindow.call_count == 2
+        window.close()
+
+    def test_real_meeting_detail_widget_close_reopen_keeps_same_qt_object(
+        self, qtbot, transcription_service
+    ):
+        detail_service = Mock(spec=MeetingDetailService)
+        detail_service.load.side_effect = MeetingDetailNotFoundError("missing")
+        review_service = Mock(spec=MeetingSpeakerReviewService)
+        window = ProductionMainWindow(
+            transcription_service,
+            fake_meeting_library_service,
+            detail_service,
+            review_service,
+            Mock(),
+        )
+        qtbot.add_widget(window)
+        meeting_id = UUID(int=3)
+
+        window.on_meeting_open_requested(meeting_id)
+        detail = window.meeting_detail_widget
+        assert detail is not None
+        assert not detail.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        detail.close()
+        QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        QApplication.processEvents()
+        assert not sip.isdeleted(detail)
+
+        window.on_meeting_open_requested(UUID(int=4))
+        assert window.meeting_detail_widget is detail
+        assert not sip.isdeleted(detail)
         window.close()
 
     def test_should_set_window_title_and_icon(self, qtbot, transcription_service):

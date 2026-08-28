@@ -18,6 +18,7 @@ from buzz.meeting.final_transcription import (
     FinalTranscriptionEligibilityError,
     FinalTranscriptionError,
     FinalTranscriptionGeneration,
+    FinalTranscriptionReadService,
     FinalTranscriptionService,
     FinalTranscriptionStateError,
     FinalTranscriptionStatus,
@@ -2611,6 +2612,95 @@ class TestAggregateValidatorConsistency:
             service.load_transcript(gen.generation_id)
         with pytest.raises(FinalTranscriptionDecodeError):
             service.load_words(gen.generation_id)
+
+
+class TestFinalTranscriptionReadService:
+    def test_repository_only_reader_and_existing_service_delegate(self) -> None:
+        meeting, service, repository, runner = _v2_service()
+        runner.enqueue_result(_rich_result("mic"))
+        runner.enqueue_result(_rich_result("remote"))
+        generation = service.request(meeting.session_id, _v2_config())
+        reader = FinalTranscriptionReadService(repository)
+
+        assert reader.load_generation(
+            generation.generation_id
+        ) == service.load_generation(generation.generation_id)
+        assert reader.load_transcript(
+            generation.generation_id
+        ) == service.load_transcript(generation.generation_id)
+        assert reader.load_words(generation.generation_id) == service.load_words(
+            generation.generation_id
+        )
+
+    def test_discovery_uses_exact_key_then_reloads_full_aggregate(self) -> None:
+        meeting, service, repository, runner = _v2_service()
+        runner.enqueue_result(_rich_result("mic"))
+        runner.enqueue_result(_rich_result("remote"))
+        generation = service.request(meeting.session_id, _v2_config())
+        calls: list[tuple[str, int]] = []
+        original_find = repository.find_generation_by_key
+
+        def find(meeting_id: str, profile_version: int):
+            calls.append((meeting_id, profile_version))
+            return original_find(meeting_id, profile_version)
+
+        repository.find_generation_by_key = find
+        reader = FinalTranscriptionReadService(repository)
+        loaded = reader.load_generation_for_meeting(meeting.session_id, 2)
+
+        assert loaded is not None
+        assert loaded.generation_id == generation.generation_id
+        assert calls == [(str(meeting.session_id), 2)]
+
+        generation_id = str(generation.generation_id)
+        repository._segments[(generation_id, "MICROPHONE")].pop()
+        with pytest.raises(FinalTranscriptionDecodeError):
+            reader.load_generation_for_meeting(meeting.session_id, 2)
+
+    def test_discovery_not_found_is_none(self) -> None:
+        assert (
+            FinalTranscriptionReadService(FakeRepository()).load_generation_for_meeting(
+                uuid.uuid4(), 2
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize("mismatch", ["meeting", "profile"])
+    def test_discovered_identity_mismatch_is_decode_error(self, mismatch) -> None:
+        meeting, service, repository, runner = _v2_service()
+        runner.enqueue_result(_rich_result("mic"))
+        runner.enqueue_result(_rich_result("remote"))
+        generation = service.request(meeting.session_id, _v2_config())
+        generation_id = str(generation.generation_id)
+        discovered = repository._generations[generation_id]
+        repository.find_generation_by_key = lambda *_: discovered
+        repository._generations[generation_id] = replace(
+            discovered,
+            meeting_id=(
+                str(uuid.uuid4()) if mismatch == "meeting" else discovered.meeting_id
+            ),
+            profile_version=(
+                1 if mismatch == "profile" else discovered.profile_version
+            ),
+        )
+
+        with pytest.raises(FinalTranscriptionDecodeError):
+            FinalTranscriptionReadService(repository).load_generation_for_meeting(
+                meeting.session_id, 2
+            )
+
+    def test_fresh_second_read_sees_mutation_without_cache(self) -> None:
+        meeting, service, repository, runner = _v2_service()
+        runner.enqueue_result(_rich_result("mic"))
+        runner.enqueue_result(_rich_result("remote"))
+        generation = service.request(meeting.session_id, _v2_config())
+        reader = FinalTranscriptionReadService(repository)
+
+        assert reader.load_generation(generation.generation_id) is not None
+        generation_id = str(generation.generation_id)
+        repository._words[(generation_id, "MICROPHONE")].pop()
+        with pytest.raises(FinalTranscriptionDecodeError):
+            reader.load_generation(generation.generation_id)
 
     def test_phrase_tail_deletion_rejected_by_all_load_apis(self) -> None:
         """M3: phrase corruption → all load APIs reject."""

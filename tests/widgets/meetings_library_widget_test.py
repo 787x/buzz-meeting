@@ -326,13 +326,53 @@ def test_widget_has_no_context_detail_or_mutation_features(qtbot) -> None:
     widget = make_widget(qtbot, FakeService())
     assert widget.actions() == []
     for name in (
-        "meeting_open_requested",
         "delete_meeting",
         "rename_meeting",
         "open_detail",
         "open_transcript",
     ):
         assert not hasattr(widget, name)
+    assert hasattr(widget, "meeting_open_requested")
+
+
+def test_valid_double_click_emits_one_uuid(qtbot) -> None:
+    entry = make_entry()
+    widget = make_widget(qtbot, FakeService([(entry,)]))
+    widget.refresh()
+    received = []
+    widget.meeting_open_requested.connect(received.append)
+    index = widget.table_model.index(0, 0)
+
+    widget.table_view.doubleClicked.emit(index)
+
+    assert received == [entry.session_id]
+
+
+@pytest.mark.parametrize("key", [Qt.Key.Key_Enter, Qt.Key.Key_Return])
+def test_enter_and_return_emit_selected_uuid_once(qtbot, key) -> None:
+    entry = make_entry()
+    widget = make_widget(qtbot, FakeService([(entry,)]))
+    widget.refresh()
+    widget.table_view.selectRow(0)
+    received = []
+    widget.meeting_open_requested.connect(received.append)
+
+    qtbot.keyClick(widget.table_view, key)
+
+    assert received == [entry.session_id]
+
+
+def test_open_paths_ignore_no_selection_and_invalid_index(qtbot) -> None:
+    entry = make_entry()
+    widget = make_widget(qtbot, FakeService([(entry,)]))
+    widget.refresh()
+    received = []
+    widget.meeting_open_requested.connect(received.append)
+
+    qtbot.keyClick(widget.table_view, Qt.Key.Key_Return)
+    widget.table_view.doubleClicked.emit(widget.table_model.index(99, 0))
+
+    assert received == []
 
 
 def test_widget_module_has_no_qsql_dependency() -> None:
