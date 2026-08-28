@@ -139,6 +139,7 @@ a = Analysis(
         "soundfile",
         "_soundfile_data",
         "lhotse",
+        "buzz.transcriber.docx_writer",
     ],
     hookspath=[],
     hooksconfig={},
