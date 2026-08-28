@@ -20,6 +20,10 @@ from buzz.meeting.meeting_summary import (
     MeetingSummaryError,
     meeting_summary_from_json,
 )
+from buzz.meeting.meeting_summary_provenance import (
+    MeetingSummaryTimestampProvenanceError,
+    validate_meeting_summary_timestamp_provenance,
+)
 from buzz.meeting.summary_provider import (
     MeetingSummaryRequest,
     SummaryProviderConfigurationError,
@@ -132,7 +136,13 @@ class OpenAICompatibleProvider:
             ) from exc
 
         result = validate_summary_provider_result(request, result)
-        _validate_timestamp_provenance(request, result)
+        try:
+            validate_meeting_summary_timestamp_provenance(request, result)
+        except MeetingSummaryTimestampProvenanceError as exc:
+            raise SummaryProviderResponseError(
+                "OpenAI-compatible summary response used a timestamp outside "
+                "the supplied transcript boundaries"
+            ) from exc
         return result
 
 
@@ -211,32 +221,6 @@ def _extract_content(response_text: str) -> str:
             "OpenAI-compatible summary response envelope was invalid"
         )
     return content
-
-
-def _validate_timestamp_provenance(
-    request: MeetingSummaryRequest,
-    result: MeetingSummary,
-) -> None:
-    allowed_starts = {entry.source_start_ns for entry in request.transcript}
-    allowed_ends = {entry.source_end_ns for entry in request.transcript}
-    timestamped_items = (
-        *result.topics,
-        *result.decisions,
-        *result.action_items,
-        *result.open_questions,
-        *result.risks,
-    )
-    for item in timestamped_items:
-        if item.source_start_ns is None:
-            continue
-        if (
-            item.source_start_ns not in allowed_starts
-            or item.source_end_ns not in allowed_ends
-        ):
-            raise SummaryProviderResponseError(
-                "OpenAI-compatible summary response used a timestamp outside "
-                "the supplied transcript boundaries"
-            )
 
 
 __all__ = [
