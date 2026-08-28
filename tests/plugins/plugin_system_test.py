@@ -387,6 +387,50 @@ def test_export_docx_writes_file(tmp_path):
     assert "Hello world." in document
 
 
+def test_export_docx_delegates_with_persisted_segments(tmp_path, monkeypatch):
+    import logging
+
+    from buzz.plugins.base import PluginContext
+    from buzz.plugins.export_docx import plugin as ed
+    from buzz.transcriber import docx_writer
+
+    persisted_segments = [object(), object()]
+    hook_segments = [object()]
+    calls = []
+
+    class _Service:
+        def get_transcription_segments(self, transcription_id):
+            assert transcription_id == "tid"
+            return persisted_segments
+
+    class _Task:
+        file_path = "/temporary/capture_speech.wav"
+        original_file_path = "/source/Original meeting.mp3"
+
+    def _record_write(out_path, title, segments, include_timestamps):
+        calls.append((out_path, title, segments, include_timestamps))
+
+    monkeypatch.setattr(docx_writer, "write_plain_docx", _record_write)
+    context = PluginContext(
+        config={"output_folder": str(tmp_path), "include_timestamps": "true"},
+        transcription_service=_Service(),
+        settings=None,
+        logger=logging.getLogger("test"),
+    )
+
+    ed.ExportDocxPlugin().on_complete("tid", _Task(), hook_segments, context)
+
+    assert calls == [
+        (
+            os.path.join(str(tmp_path), "Original meeting.docx"),
+            "Original meeting",
+            persisted_segments,
+            True,
+        )
+    ]
+    assert calls[0][2] is not hook_segments
+
+
 def test_plugins_dialog_builds_and_wraps(qtbot):
     from PyQt6.QtCore import Qt
     from buzz.widgets.plugins_dialog.plugins_dialog import PluginsDialog
