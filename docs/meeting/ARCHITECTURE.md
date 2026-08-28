@@ -159,6 +159,12 @@ versioned `MeetingSummary`. API providers receive transcript text by default,
 not meeting audio. The manual provider packages prompt, transcript, schema, and
 version metadata for export, then validates an imported or pasted response.
 
+The `SummaryProvider` runtime protocol is for executable one-call providers
+that synchronously produce a `MeetingSummary` from a request.  Manual AI
+Round Trip reuses the same normalized `MeetingSummaryRequest` and
+`MeetingSummary` schema but is not required to implement that synchronous
+runtime protocol.
+
 `DocumentExport` reads meeting source metadata, reviewed transcript/speakers,
 and the selected structured summary. It writes DOCX, Markdown, or TXT artifacts
 without mutating any of those inputs.
