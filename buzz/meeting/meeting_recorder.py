@@ -392,6 +392,8 @@ class MeetingRecorder:
                 raise MeetingRecorderStateError(
                     f"Cannot enqueue meeting audio in state {self._state.name}"
                 )
+            if sample_count == 0:
+                return True
             if sample_count > self.max_buffered_samples:
                 error = MeetingRecorderOperationalError(
                     "Incoming audio block exceeds the entire meeting recorder buffer: "
