@@ -1,3 +1,4 @@
+import threading
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -7,7 +8,10 @@ from sounddevice import PortAudioError
 from buzz.audio_capture.source import AudioSourceError
 from buzz.model_loader import TranscriptionModel, ModelType, WhisperModelSize
 from buzz.settings.recording_transcriber_mode import RecordingTranscriberMode
-from buzz.transcriber.recording_transcriber import RecordingTranscriber
+from buzz.transcriber.recording_transcriber import (
+    RecordingTranscriber,
+    _WHISPER_CPP_STDERR_TAIL_MAX_BYTES,
+)
 from buzz.transcriber.transcriber import TranscriptionOptions, Task
 
 
@@ -38,6 +42,105 @@ def make_transcriber(
     return transcriber
 
 
+def diagnostic_bytes(start: int, length: int) -> bytes:
+    return bytes(
+        0x0A if (index + 1) % 128 == 0 else index % 251
+        for index in range(start, start + length)
+    )
+
+
+class TrackingStderr:
+    line_bytes = 128
+
+    def __init__(self, total_bytes: int, transcriber: RecordingTranscriber):
+        self.total_bytes = total_bytes
+        self.transcriber = transcriber
+        self.yielded_count = 0
+        self.tail_lengths = []
+
+    def __iter__(self):
+        offset = 0
+        while offset < self.total_bytes:
+            length = min(self.line_bytes, self.total_bytes - offset)
+            line = diagnostic_bytes(offset, length)
+            self.yielded_count += 1
+            yield line
+            self.tail_lengths.append(len(self.transcriber._stderr_tail))
+            offset += length
+
+
+class TrackingChunks:
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.yielded_count = 0
+
+    def __iter__(self):
+        for chunk in self.chunks:
+            self.yielded_count += 1
+            yield chunk
+
+
+class BlockingStderr:
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.blocked = threading.Event()
+        self.release = threading.Event()
+        self.reached_eof = threading.Event()
+        self.yielded_count = 0
+
+    def __iter__(self):
+        self.blocked.set()
+        if not self.release.wait(timeout=5):
+            raise AssertionError("blocked stderr source was not released")
+
+        try:
+            for chunk in self.chunks:
+                self.yielded_count += 1
+                yield chunk
+        finally:
+            self.reached_eof.set()
+
+
+class _ObservableLock:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.acquire_attempted = threading.Event()
+
+    def acquire(self):
+        self.acquire_attempted.set()
+        return self._lock.acquire()
+
+    def release(self):
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.release()
+
+
+def run_failed_whisper_server(
+    transcriber: RecordingTranscriber,
+    stderr,
+) -> None:
+    process = MagicMock()
+    process.poll.return_value = 1
+    process.stderr = stderr
+
+    with (
+        patch(
+            "buzz.transcriber.recording_transcriber.subprocess.Popen",
+            return_value=process,
+        ),
+        patch("buzz.transcriber.recording_transcriber.time.sleep"),
+        patch("buzz.transcriber.recording_transcriber._", lambda s: s),
+    ):
+        transcriber.is_running = True
+        transcriber.start_local_whisper_server()
+
+
 class TestRecordingTranscriberInit:
     def test_default_max_utterance_is_12_seconds(self):
         t = make_transcriber(mode_index=0)
@@ -65,6 +168,14 @@ class TestRecordingTranscriberInit:
     def test_pending_pcm_is_bounded_to_15_seconds(self):
         t = make_transcriber()
         assert t.max_pending_samples == 15 * t.sample_rate
+
+    def test_stderr_diagnostics_start_empty(self):
+        t = make_transcriber()
+
+        assert t._stderr_tail == bytearray()
+        assert t._stderr_out_of_device_memory is False
+        assert t._stderr_lock is not None
+        assert t._stderr_generation == 0
 
 
 class TestAmplitude:
@@ -379,6 +490,272 @@ class TestEffectivePrompt:
             t._transcribe_hugging_face(np.ones(100, dtype=np.float32), model)
 
         assert "initial_prompt" not in model.transcribe.call_args.kwargs
+
+
+class TestWhisperServerStderr:
+    @pytest.mark.parametrize(
+        "total_bytes",
+        [
+            _WHISPER_CPP_STDERR_TAIL_MAX_BYTES // 2,
+            _WHISPER_CPP_STDERR_TAIL_MAX_BYTES,
+            _WHISPER_CPP_STDERR_TAIL_MAX_BYTES + 1,
+            2 * _WHISPER_CPP_STDERR_TAIL_MAX_BYTES,
+            10 * _WHISPER_CPP_STDERR_TAIL_MAX_BYTES,
+        ],
+        ids=["half-cap", "exact-cap", "cap-plus-one", "two-caps", "ten-caps"],
+    )
+    def test_drain_retains_exact_bounded_tail_and_consumes_all_lines(
+        self,
+        total_bytes,
+    ):
+        t = make_transcriber()
+        stderr = TrackingStderr(total_bytes, t)
+        process = MagicMock()
+        process.stderr = stderr
+        t.process = process
+
+        t._drain_stderr(process, t._stderr_generation)
+
+        retained_bytes = min(total_bytes, _WHISPER_CPP_STDERR_TAIL_MAX_BYTES)
+        expected_tail = diagnostic_bytes(total_bytes - retained_bytes, retained_bytes)
+        expected_line_count = (total_bytes + stderr.line_bytes - 1) // stderr.line_bytes
+        assert stderr.yielded_count == expected_line_count
+        assert max(stderr.tail_lengths) <= _WHISPER_CPP_STDERR_TAIL_MAX_BYTES
+        assert len(t._stderr_tail) == retained_bytes
+        assert bytes(t._stderr_tail) == expected_tail
+
+    def test_single_huge_line_is_bounded_without_losing_its_tail(self):
+        t = make_transcriber()
+        line = b"discarded-prefix-" + (
+            b"0123456789" * (_WHISPER_CPP_STDERR_TAIL_MAX_BYTES // 2)
+        )
+        stderr = TrackingChunks([line])
+        process = MagicMock()
+        process.stderr = stderr
+        t.process = process
+
+        t._drain_stderr(process, t._stderr_generation)
+
+        assert stderr.yielded_count == 1
+        assert len(t._stderr_tail) == _WHISPER_CPP_STDERR_TAIL_MAX_BYTES
+        assert bytes(t._stderr_tail) == line[-_WHISPER_CPP_STDERR_TAIL_MAX_BYTES:]
+
+    def test_blocked_stale_drainer_does_not_contaminate_current_generation(self):
+        t = make_transcriber()
+        with t._stderr_lock:
+            t._stderr_generation += 1
+            old_generation = t._stderr_generation
+            t._stderr_tail.clear()
+            t._stderr_out_of_device_memory = False
+
+        old_stderr = BlockingStderr(
+            [b"old ErrorOutOfDeviceMemory\n", b"old trailing diagnostics\n"]
+        )
+        old_process = MagicMock()
+        old_process.stderr = old_stderr
+        old_thread = threading.Thread(
+            target=t._drain_stderr,
+            args=(old_process, old_generation),
+        )
+        old_thread.start()
+
+        try:
+            assert old_stderr.blocked.wait(timeout=5)
+            assert old_thread.is_alive()
+
+            with t._stderr_lock:
+                t._stderr_generation += 1
+                current_generation = t._stderr_generation
+                t._stderr_tail.clear()
+                t._stderr_out_of_device_memory = False
+            t._append_stderr_chunk(b"current diagnostics\n", current_generation)
+        finally:
+            old_stderr.release.set()
+            old_thread.join(timeout=5)
+
+        assert not old_thread.is_alive()
+        assert old_stderr.reached_eof.is_set()
+        assert old_stderr.yielded_count == 2
+        assert bytes(t._stderr_tail) == b"current diagnostics\n"
+        assert t._stderr_out_of_device_memory is False
+
+    def test_stale_stderr_append_rechecks_generation_after_acquiring_lock(self):
+        t = make_transcriber()
+        observable_lock = _ObservableLock()
+        t._stderr_lock = observable_lock
+        old_generation = t._stderr_generation
+        stale_chunk = b"STALE-GENERATION ErrorOutOfDeviceMemory\n"
+        worker_errors = []
+
+        def append_stale_chunk():
+            try:
+                t._append_stderr_chunk(stale_chunk, old_generation)
+            except BaseException as error:
+                worker_errors.append(error)
+
+        observable_lock.acquire()
+        observable_lock.acquire_attempted.clear()
+        worker = threading.Thread(target=append_stale_chunk)
+        worker.start()
+        acquisition_attempted = False
+        try:
+            acquisition_attempted = observable_lock.acquire_attempted.wait(timeout=5)
+            if acquisition_attempted:
+                t._stderr_generation = old_generation + 1
+                t._stderr_tail[:] = b"CURRENT-GENERATION\n"
+                t._stderr_out_of_device_memory = False
+        finally:
+            observable_lock.release()
+
+        worker.join(timeout=5)
+
+        assert acquisition_attempted
+        assert not worker.is_alive()
+        if worker_errors:
+            raise worker_errors[0]
+        assert bytes(t._stderr_tail) == b"CURRENT-GENERATION\n"
+        assert b"STALE-GENERATION" not in t._stderr_tail
+        assert t._stderr_out_of_device_memory is False
+
+    def test_drainer_uses_bound_process_instead_of_current_process(self):
+        t = make_transcriber()
+        old_stderr = TrackingChunks([b"old process diagnostics\n"])
+        old_process = MagicMock()
+        old_process.stderr = old_stderr
+        new_stderr = TrackingChunks([b"new process diagnostics\n"])
+        new_process = MagicMock()
+        new_process.stderr = new_stderr
+        t.process = new_process
+
+        t._drain_stderr(old_process, t._stderr_generation)
+
+        assert old_stderr.yielded_count == 1
+        assert new_stderr.yielded_count == 0
+        assert bytes(t._stderr_tail) == b"old process diagnostics\n"
+
+    def test_current_generation_records_tail_and_oom(self):
+        t = make_transcriber()
+        stderr = TrackingChunks([b"current ErrorOutOfDeviceMemory diagnostics\n"])
+        process = MagicMock()
+        process.stderr = stderr
+
+        t._drain_stderr(process, t._stderr_generation)
+
+        assert stderr.yielded_count == 1
+        assert bytes(t._stderr_tail) == b"current ErrorOutOfDeviceMemory diagnostics\n"
+        assert t._stderr_out_of_device_memory is True
+
+    def test_oom_guidance_survives_marker_eviction_from_tail(self):
+        t = make_transcriber()
+        emitted = []
+        t.transcription.connect(emitted.append)
+        stderr = TrackingChunks(
+            [b"ErrorOutOfDeviceMemory\n"] + [b"x" * 1023 + b"\n"] * 65
+        )
+
+        run_failed_whisper_server(t, stderr)
+
+        assert stderr.yielded_count == 66
+        assert b"ErrorOutOfDeviceMemory" not in t._stderr_tail
+        assert t._stderr_out_of_device_memory is True
+        assert any("insufficient memory" in message.lower() for message in emitted)
+
+    def test_oom_guidance_survives_huge_line_prefix_truncation(self):
+        t = make_transcriber()
+        emitted = []
+        t.transcription.connect(emitted.append)
+        line = b"ErrorOutOfDeviceMemory:" + (
+            b"x" * (3 * _WHISPER_CPP_STDERR_TAIL_MAX_BYTES)
+        )
+        stderr = TrackingChunks([line])
+
+        run_failed_whisper_server(t, stderr)
+
+        assert stderr.yielded_count == 1
+        assert len(t._stderr_tail) == _WHISPER_CPP_STDERR_TAIL_MAX_BYTES
+        assert b"ErrorOutOfDeviceMemory" not in t._stderr_tail
+        assert t._stderr_out_of_device_memory is True
+        assert any("insufficient memory" in message.lower() for message in emitted)
+
+    def test_large_non_oom_diagnostics_do_not_emit_memory_guidance(self):
+        t = make_transcriber()
+        emitted = []
+        t.transcription.connect(emitted.append)
+        line = b"erroroutofdevicememory:" + (
+            b"x" * (2 * _WHISPER_CPP_STDERR_TAIL_MAX_BYTES)
+        )
+        stderr = TrackingChunks([line])
+
+        run_failed_whisper_server(t, stderr)
+
+        assert stderr.yielded_count == 1
+        assert t._stderr_out_of_device_memory is False
+        assert not any("insufficient memory" in message.lower() for message in emitted)
+
+    def test_oom_state_is_reset_between_start_attempts(self):
+        t = make_transcriber()
+        initial_generation = t._stderr_generation
+        emitted = []
+        t.transcription.connect(emitted.append)
+        first_process = MagicMock()
+        first_process.poll.return_value = 1
+        first_process.stderr = TrackingChunks([b"ErrorOutOfDeviceMemory\n"])
+        second_process = MagicMock()
+        second_process.poll.return_value = 1
+        second_process.stderr = TrackingChunks([b"ordinary failure\n"])
+
+        with (
+            patch(
+                "buzz.transcriber.recording_transcriber.subprocess.Popen",
+                side_effect=[first_process, second_process],
+            ),
+            patch("buzz.transcriber.recording_transcriber.time.sleep"),
+            patch("buzz.transcriber.recording_transcriber._", lambda s: s),
+        ):
+            t.is_running = True
+            t.start_local_whisper_server()
+            assert t._stderr_generation == initial_generation + 1
+            assert t._stderr_out_of_device_memory is True
+            t.start_local_whisper_server()
+
+        memory_messages = [
+            message for message in emitted if "insufficient memory" in message.lower()
+        ]
+        assert len(memory_messages) == 1
+        assert t._stderr_generation == initial_generation + 2
+        assert t._stderr_out_of_device_memory is False
+        assert bytes(t._stderr_tail) == b"ordinary failure\n"
+
+    def test_diagnostics_are_reset_before_popen_failure(self):
+        t = make_transcriber()
+        initial_generation = t._stderr_generation
+        t._append_stderr_chunk(
+            b"old ErrorOutOfDeviceMemory diagnostics\n",
+            initial_generation,
+        )
+
+        with patch(
+            "buzz.transcriber.recording_transcriber.subprocess.Popen",
+            side_effect=OSError("cannot exec"),
+        ):
+            t.is_running = True
+            t.start_local_whisper_server()
+
+        assert t._stderr_tail == bytearray()
+        assert t._stderr_out_of_device_memory is False
+        assert t._stderr_generation == initial_generation + 1
+
+    def test_invalid_utf8_diagnostics_do_not_break_failure_handling(self, caplog):
+        t = make_transcriber()
+        emitted = []
+        t.transcription.connect(emitted.append)
+        stderr = TrackingChunks([b"invalid: \xff\xfe\n"])
+
+        run_failed_whisper_server(t, stderr)
+
+        assert stderr.yielded_count == 1
+        assert any("failed to start" in message.lower() for message in emitted)
+        assert "\ufffd\ufffd" in caplog.text
 
 
 class TestStartLocalWhisperServer:
