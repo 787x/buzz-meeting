@@ -38,6 +38,9 @@ import whisper
 import faster_whisper
 
 
+_WHISPER_CPP_STDERR_TAIL_MAX_BYTES = 64 * 1024
+
+
 class RecordingTranscriber(QObject):
     transcription = pyqtSignal(str)
     finished = pyqtSignal()
@@ -107,7 +110,10 @@ class RecordingTranscriber(QObject):
         self.whisper_api_model = self.settings.value(
             key=Settings.Key.OPENAI_API_MODEL, default_value="whisper-1"
         )
-        self._stderr_lines: list[bytes] = []
+        self._stderr_tail = bytearray()
+        self._stderr_out_of_device_memory = False
+        self._stderr_lock = threading.Lock()
+        self._stderr_generation = 0
 
     def start(self):
         self.is_running = True
@@ -518,10 +524,30 @@ class RecordingTranscriber(QObject):
     def amplitude(arr: np.ndarray):
         return float(np.sqrt(np.mean(arr**2)))
 
-    def _drain_stderr(self):
-        if self.process and self.process.stderr:
-            for line in self.process.stderr:
-                self._stderr_lines.append(line)
+    def _drain_stderr(self, process, generation: int) -> None:
+        if process and process.stderr:
+            for line in process.stderr:
+                self._append_stderr_chunk(line, generation)
+
+    def _append_stderr_chunk(self, chunk: bytes, generation: int) -> None:
+        out_of_device_memory = b"ErrorOutOfDeviceMemory" in chunk
+        with self._stderr_lock:
+            if generation != self._stderr_generation:
+                return
+
+            if out_of_device_memory:
+                self._stderr_out_of_device_memory = True
+
+            if len(chunk) >= _WHISPER_CPP_STDERR_TAIL_MAX_BYTES:
+                self._stderr_tail[:] = chunk[-_WHISPER_CPP_STDERR_TAIL_MAX_BYTES:]
+                return
+
+            overflow = (
+                len(self._stderr_tail) + len(chunk) - _WHISPER_CPP_STDERR_TAIL_MAX_BYTES
+            )
+            if overflow > 0:
+                del self._stderr_tail[:overflow]
+            self._stderr_tail.extend(chunk)
 
     def stop_recording(self):
         with self.mutex:
@@ -536,6 +562,12 @@ class RecordingTranscriber(QObject):
                 logging.warning("Whisper server process had to be killed after timeout")
 
     def start_local_whisper_server(self):
+        with self._stderr_lock:
+            self._stderr_generation += 1
+            generation = self._stderr_generation
+            self._stderr_tail.clear()
+            self._stderr_out_of_device_memory = False
+
         # Reduce verbose HTTP client logging from OpenAI/httpx
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -582,7 +614,7 @@ class RecordingTranscriber(QObject):
 
         try:
             if sys.platform == "win32":
-                self.process = subprocess.Popen(
+                process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
@@ -590,12 +622,13 @@ class RecordingTranscriber(QObject):
                     creationflags=subprocess.CREATE_NO_WINDOW
                 )
             else:
-                self.process = subprocess.Popen(
+                process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                     shell=False,
                 )
+            self.process = process
         except Exception as e:
             error_msg = f"Failed to start whisper-server subprocess: {str(e)}"
             logging.error(error_msg)
@@ -603,8 +636,11 @@ class RecordingTranscriber(QObject):
 
         # Drain stderr in a background thread to prevent pipe buffer from filling
         # up and blocking the subprocess (especially on Windows with compiled exe).
-        self._stderr_lines = []
-        stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        stderr_thread = threading.Thread(
+            target=self._drain_stderr,
+            args=(process, generation),
+            daemon=True,
+        )
         stderr_thread.start()
 
         # Wait for server to start and load model, checking periodically
@@ -615,16 +651,19 @@ class RecordingTranscriber(QObject):
 
         if self.process is not None and self.process.poll() is None:
             self.transcription.emit(_("Starting transcription..."))
-            logging.debug(f"Whisper server started successfully.")
+            logging.debug("Whisper server started successfully.")
             logging.debug(f"Model: {self.model_path}")
         else:
             stderr_thread.join(timeout=2)
-            stderr_output = b"".join(self._stderr_lines).decode(errors="replace")
+            with self._stderr_lock:
+                stderr_tail = bytes(self._stderr_tail)
+                stderr_out_of_device_memory = self._stderr_out_of_device_memory
+            stderr_output = stderr_tail.decode(errors="replace")
             logging.error(f"Whisper server failed to start. Error: {stderr_output}")
 
             self.transcription.emit(_("Whisper server failed to start. Check logs for details."))
 
-            if "ErrorOutOfDeviceMemory" in stderr_output:
+            if stderr_out_of_device_memory:
                 message = _(
                     "Whisper server failed to start due to insufficient memory. "
                     "Please try again with a smaller model. "
