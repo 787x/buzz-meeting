@@ -367,6 +367,95 @@ def test_borrowed_input_is_copied_and_multiple_blocks_keep_exact_order(tmp_path)
     )
 
 
+def test_empty_blocks_between_non_empty_blocks_do_not_reach_writer(tmp_path):
+    recorder, factory = make_fake_recorder(tmp_path)
+    first = np.array([0.25, -0.25], dtype=np.float32)
+    second = np.array([0.5], dtype=np.float32)
+
+    recorder.start()
+    assert recorder.enqueue(first)
+    assert recorder.enqueue(np.empty(0, dtype=np.float32))
+    assert recorder.enqueue(np.empty(0, dtype=np.float32))
+    assert recorder.enqueue(second)
+    result = recorder.stop()
+
+    assert result.sample_count == first.size + second.size
+    assert recorder.accepted_sample_count == first.size + second.size
+    assert factory.writer is not None
+    assert len(factory.writer.blocks) == 2
+    np.testing.assert_array_equal(
+        np.concatenate(factory.writer.blocks),
+        np.array([8192, -8192, 16384], dtype=np.int16),
+    )
+
+
+def test_valid_empty_blocks_are_noops_while_writer_is_blocked(tmp_path):
+    errors = []
+    recorder, factory = make_fake_recorder(
+        tmp_path,
+        blocked=True,
+        on_error=errors.append,
+    )
+    recorder.start()
+    first = np.array([0.25, -0.25], dtype=np.float32)
+    assert recorder.enqueue(first)
+    assert factory.writer is not None
+    assert factory.writer.write_entered.wait(timeout=5)
+
+    with recorder._condition:
+        before = (
+            len(recorder._queue),
+            recorder._buffered_sample_count,
+            recorder._accepted_sample_count,
+            recorder._written_sample_count,
+            recorder._producer_in_flight,
+        )
+    writer_calls = list(factory.writer.calls)
+
+    with patch("buzz.meeting.meeting_recorder.np.array") as array_copy:
+        for _ in range(10_000):
+            assert recorder.enqueue(np.empty(0, dtype=np.float32))
+        array_copy.assert_not_called()
+
+    with recorder._condition:
+        assert (
+            len(recorder._queue),
+            recorder._buffered_sample_count,
+            recorder._accepted_sample_count,
+            recorder._written_sample_count,
+            recorder._producer_in_flight,
+        ) == before
+    assert factory.writer.calls == writer_calls
+    assert not factory.writer.published
+    assert errors == []
+    assert recorder.state == MeetingRecorderState.RUNNING
+
+    factory.writer.release_write.set()
+    result = recorder.stop()
+
+    assert result.sample_count == first.size
+    assert len(factory.writer.blocks) == 1
+
+
+def test_valid_empty_block_preserves_enqueue_lifecycle_semantics(tmp_path):
+    recorder, _ = make_fake_recorder(tmp_path)
+    empty = np.empty(0, dtype=np.float32)
+
+    with pytest.raises(MeetingRecorderStateError, match="state CREATED"):
+        recorder.enqueue(empty)
+
+    recorder.start()
+    assert recorder.enqueue(empty)
+    recorder.request_stop()
+
+    with pytest.raises(MeetingRecorderStateError, match="state STOPPING"):
+        recorder.enqueue(empty)
+
+    assert recorder.stop().state == MeetingRecorderState.STOPPED
+    with pytest.raises(MeetingRecorderStateError, match="state STOPPED"):
+        recorder.enqueue(empty)
+
+
 def test_stop_before_start_is_noop_and_does_not_consume_recorder(tmp_path):
     recorder, _ = make_fake_recorder(tmp_path)
 
@@ -629,7 +718,31 @@ def test_invalid_input_is_explicit_and_fails_archive_without_escaping_later(tmp_
     with pytest.raises(MeetingRecorderInputError, match="float32"):
         recorder.enqueue(np.ones(2, dtype=np.float64))
 
-    assert not recorder.enqueue(np.ones(2, dtype=np.float32))
+    assert not recorder.enqueue(np.empty(0, dtype=np.float32))
+    assert recorder.stop().state == MeetingRecorderState.FAILED
+    assert len(errors) == 1
+
+
+@pytest.mark.parametrize(
+    ("samples", "message"),
+    [
+        (np.empty(0, dtype=np.float64), "float32"),
+        (np.empty((0, 1), dtype=np.float32), "mono"),
+        ([], "numpy array"),
+    ],
+)
+def test_empty_input_must_still_satisfy_type_and_shape_contract(
+    tmp_path,
+    samples,
+    message,
+):
+    errors = []
+    recorder, _ = make_fake_recorder(tmp_path, on_error=errors.append)
+    recorder.start()
+
+    with pytest.raises(MeetingRecorderInputError, match=message):
+        recorder.enqueue(samples)
+
     assert recorder.stop().state == MeetingRecorderState.FAILED
     assert len(errors) == 1
 
