@@ -1,5 +1,6 @@
 import logging
 import os
+import shutil
 import tempfile
 from functools import partial
 from typing import List
@@ -27,7 +28,16 @@ from buzz.meeting.speaker_review import MeetingSpeakerReviewService
 from buzz.db.entity.transcription import Transcription
 from buzz.db.service.transcription_service import TranscriptionService
 from buzz.model_loader import TranscriptionModel, ModelType, WhisperModelSize
-from buzz.transcriber.transcriber import Task, OutputFormat
+from buzz.transcriber.transcriber import (
+    Task,
+    OutputFormat,
+    Segment,
+    FileTranscriptionTask,
+)
+from buzz.transcriber.whisper_file_transcriber import (
+    WhisperFileTranscriber,
+    check_file_has_audio_stream,
+)
 from buzz.widgets.main_window import MainWindow as ProductionMainWindow
 from buzz.widgets.meetings_library_widget import MeetingsLibraryWidget
 from buzz.widgets.preferences_dialog.models.file_transcription_preferences import (
@@ -69,6 +79,31 @@ def disable_plugin_initialization(monkeypatch):
 
 def get_test_asset(filename: str):
     return os.path.join(os.path.dirname(__file__), "../../testdata/", filename)
+
+
+class _LocalArtifactWhisperFileTranscriber(WhisperFileTranscriber):
+    """Keep MainWindow URL coverage independent of a downloaded ASR model."""
+
+    seen_tasks = []
+
+    def transcribe(self) -> List[Segment]:
+        type(self).seen_tasks.append(self.transcription_task)
+        self.progress.emit((0, 100))
+        check_file_has_audio_stream(self.transcription_task.file_path)
+        self.progress.emit((100, 100))
+        return [Segment(start=0, end=100, text="local test transcript")]
+
+
+class _LocalModel(TranscriptionModel):
+    def __init__(self, model_path: str):
+        super().__init__(
+            model_type=ModelType.WHISPER,
+            whisper_model_size=WhisperModelSize.TINY,
+        )
+        self.model_path = model_path
+
+    def get_local_model_path(self):
+        return self.model_path
 
 
 class TestMainWindow:
@@ -261,9 +296,76 @@ class TestMainWindow:
         return window.findChild(QTableView)
 
     def test_should_run_url_import_file_transcription_task(
-        self, qtbot: QtBot, db, transcription_service
+        self, qtbot: QtBot, db, transcription_service, monkeypatch, tmp_path
     ):
+        source_url = (
+            "https://github.com/chidiwilliams/buzz/raw/main/testdata/whisper-french.mp3"
+        )
+
+        class FakeYoutubeDL:
+            extract_calls = []
+            download_calls = []
+
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def extract_info(self, requested_url, download):
+                type(self).extract_calls.append((requested_url, download))
+                if requested_url != source_url:
+                    raise ValueError(f"unexpected URL: {requested_url}")
+                return {"title": "whisper-french.mp3"}
+
+            @staticmethod
+            def sanitize_info(info):
+                return info
+
+            def download(self, requested_urls):
+                type(self).download_calls.append(tuple(requested_urls))
+                if requested_urls != [source_url]:
+                    raise ValueError(f"unexpected URLs: {requested_urls}")
+                shutil.copyfile(
+                    get_test_asset("whisper-french.mp3"), self.options["outtmpl"]
+                )
+                return 0
+
+        monkeypatch.setattr(
+            "buzz.transcriber.file_transcriber.YoutubeDL", FakeYoutubeDL
+        )
+        monkeypatch.setattr(
+            "buzz.file_transcriber_queue_worker.WhisperFileTranscriber",
+            _LocalArtifactWhisperFileTranscriber,
+        )
+
+        local_model_path = tmp_path / "local-test-model.pt"
+        local_model_path.write_bytes(b"local test model")
+        model = _LocalModel(str(local_model_path))
+        preferences = FileTranscriptionPreferences(
+            language=None,
+            task=Task.TRANSCRIBE,
+            model=model,
+            word_level_timings=False,
+            extract_speech=False,
+            initial_prompt="",
+            enable_llm_translation=False,
+            llm_prompt="",
+            llm_model="",
+            output_formats={OutputFormat.TXT},
+        )
+        monkeypatch.setattr(
+            FileTranscriberWidget,
+            "load_preferences",
+            lambda _self: preferences,
+        )
+        _LocalArtifactWhisperFileTranscriber.seen_tasks = []
+
         window = MainWindow(transcription_service, fake_meeting_library_service)
+        qtbot.add_widget(window)
         menu: QMenuBar = window.menuBar()
         file_action = menu.actions()[0]
         import_url_action: QAction = file_action.menu().actions()[1]
@@ -271,7 +373,7 @@ class TestMainWindow:
         with patch(
             "buzz.widgets.import_url_dialog.ImportURLDialog.prompt"
         ) as prompt_mock:
-            prompt_mock.return_value = "https://github.com/chidiwilliams/buzz/raw/main/testdata/whisper-french.mp3"
+            prompt_mock.return_value = source_url
             import_url_action.trigger()
 
         file_transcriber_widget: FileTranscriberWidget = window.findChild(
@@ -285,6 +387,26 @@ class TestMainWindow:
             self._get_assert_task_status_callback(table_widget, 0, "completed"),
             timeout=2 * 60 * 1000,
         )
+
+        assert FakeYoutubeDL.extract_calls == [
+            (
+                "https://github.com/chidiwilliams/buzz/raw/main/testdata/whisper-french.mp3",
+                False,
+            )
+        ]
+        assert FakeYoutubeDL.download_calls == [
+            (
+                "https://github.com/chidiwilliams/buzz/raw/main/testdata/whisper-french.mp3",
+            )
+        ]
+        assert len(_LocalArtifactWhisperFileTranscriber.seen_tasks) == 1
+        task = _LocalArtifactWhisperFileTranscriber.seen_tasks[0]
+        assert task.url == (
+            "https://github.com/chidiwilliams/buzz/raw/main/testdata/whisper-french.mp3"
+        )
+        assert task.source == FileTranscriptionTask.Source.URL_IMPORT
+        assert os.path.isfile(task.file_path)
+        assert os.path.getsize(task.file_path) > 0
 
         window.close()
 

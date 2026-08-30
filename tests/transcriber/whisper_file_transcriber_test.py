@@ -15,6 +15,7 @@ from unittest.mock import Mock
 
 import psutil
 import pytest
+from PyQt6.QtWidgets import QApplication
 from pytestqt.qtbot import QtBot
 
 from buzz.model_loader import TranscriptionModel, ModelType, WhisperModelSize
@@ -36,6 +37,21 @@ from buzz.transcriber.whisper_file_transcriber import (
 )
 from tests.audio import test_audio_path
 from tests.model_loader import get_model_path
+
+
+class _LocalArtifactWhisperFileTranscriber(WhisperFileTranscriber):
+    """Keep URL-import coverage independent of a downloaded ASR model."""
+
+    def transcribe(self) -> List[Segment]:
+        self.progress.emit((0, 100))
+        check_file_has_audio_stream(self.transcription_task.file_path)
+        self.progress.emit((100, 100))
+        return [Segment(start=0, end=100, text="local test transcript")]
+
+
+@pytest.fixture(scope="session")
+def qapp_cls():
+    return QApplication
 
 
 def _spawn_grandchild_worker(pipe):
@@ -368,22 +384,57 @@ class TestWhisperFileTranscriber:
         transcriber.stop()
         time.sleep(3)
 
-    def test_transcribe_from_url(self, qtbot):
+    def test_transcribe_from_url(self, qtbot, monkeypatch, tmp_path):
         url = (
             "https://github.com/chidiwilliams/buzz/raw/main/testdata/whisper-french.mp3"
+        )
+
+        class FakeYoutubeDL:
+            extract_calls = []
+            download_calls = []
+
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def extract_info(self, requested_url, download):
+                type(self).extract_calls.append((requested_url, download))
+                if requested_url != url:
+                    raise ValueError(f"unexpected URL: {requested_url}")
+                return {"title": "whisper-french.mp3"}
+
+            @staticmethod
+            def sanitize_info(info):
+                return info
+
+            def download(self, requested_urls):
+                type(self).download_calls.append(tuple(requested_urls))
+                if requested_urls != [url]:
+                    raise ValueError(f"unexpected URLs: {requested_urls}")
+                shutil.copyfile(test_audio_path, self.options["outtmpl"])
+                return 0
+
+        monkeypatch.setattr(
+            "buzz.transcriber.file_transcriber.YoutubeDL", FakeYoutubeDL
         )
 
         mock_progress = Mock()
         mock_completed = Mock()
         transcription_options = TranscriptionOptions()
-        model_path = get_model_path(transcription_options.model)
+        local_model_path = tmp_path / "local-test-model.pt"
+        local_model_path.write_bytes(b"local test model")
         file_transcription_options = FileTranscriptionOptions(url=url)
 
-        transcriber = WhisperFileTranscriber(
+        transcriber = _LocalArtifactWhisperFileTranscriber(
             task=FileTranscriptionTask(
                 transcription_options=transcription_options,
                 file_transcription_options=file_transcription_options,
-                model_path=model_path,
+                model_path=str(local_model_path),
                 url=url,
                 source=FileTranscriptionTask.Source.URL_IMPORT,
             )
@@ -398,6 +449,20 @@ class TestWhisperFileTranscriber:
         # Reports progress at 0, 0 <= progress <= 100, and 100
         assert mock_progress.call_count >= 2
         assert mock_progress.call_args_list[0][0][0] == (0, 100)
+
+        assert FakeYoutubeDL.extract_calls == [
+            (
+                "https://github.com/chidiwilliams/buzz/raw/main/testdata/whisper-french.mp3",
+                False,
+            )
+        ]
+        assert FakeYoutubeDL.download_calls == [
+            (
+                "https://github.com/chidiwilliams/buzz/raw/main/testdata/whisper-french.mp3",
+            )
+        ]
+        assert os.path.isfile(transcriber.transcription_task.file_path)
+        assert os.path.getsize(transcriber.transcription_task.file_path) > 0
 
         mock_completed.assert_called()
         segments = mock_completed.call_args[0][0]
