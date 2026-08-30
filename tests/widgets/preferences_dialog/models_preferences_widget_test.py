@@ -1,29 +1,50 @@
 import os
 
 import pytest
+import whisper
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QComboBox, QPushButton
+from PyQt6.QtWidgets import QApplication, QComboBox, QPushButton
 from pytestqt.qtbot import QtBot
 
 from buzz.locale import _
 from buzz.model_loader import (
-    TranscriptionModel,
-    ModelType,
+    ModelDownloader,
+    WhisperModelSize,
+    get_expected_whisper_model_size,
+    get_whisper_file_path,
 )
 from buzz.widgets.preferences_dialog.models_preferences_widget import (
     ModelsPreferencesWidget,
 )
-from tests.model_loader import get_model_path
+
+
+@pytest.fixture(scope="session")
+def qapp_cls():
+    return QApplication
 
 
 class TestModelsPreferencesWidget:
-    @pytest.fixture(scope="class")
-    def clear_model_cache(self):
-        for model_type in ModelType:
-            if model_type.is_available():
-                path = TranscriptionModel(model_type=model_type).get_local_model_path()
-                if path and os.path.isfile(path):
-                    os.remove(path)
+    @pytest.fixture(autouse=True)
+    def isolate_model_cache(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("buzz.model_loader.model_root_dir", str(tmp_path))
+
+    @pytest.fixture
+    def fake_model_download(self, monkeypatch):
+        requests = []
+
+        def download_model(downloader, url, file_path, expected_sha256):
+            requests.append((url, file_path, expected_sha256))
+            expected_size = get_expected_whisper_model_size(
+                downloader.model.whisper_model_size
+            )
+            assert expected_size is not None
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            with open(file_path, "wb") as model_file:
+                model_file.truncate(expected_size)
+            return True
+
+        monkeypatch.setattr(ModelDownloader, "download_model", download_model)
+        return requests
 
     def test_should_show_model_list(self, qtbot):
         widget = ModelsPreferencesWidget()
@@ -49,7 +70,9 @@ class TestModelsPreferencesWidget:
         second_item = widget.model_list_widget.topLevelItem(1)
         assert second_item.text(0) == _("Available for Download")
 
-    def test_should_download_model(self, qtbot: QtBot, clear_model_cache):
+    def test_should_download_model(
+        self, qtbot: QtBot, fake_model_download
+    ):
         # make progress dialog non-modal to unblock qtbot.wait_until
         widget = ModelsPreferencesWidget(
             progress_dialog_modality=Qt.WindowModality.NonModal
@@ -88,9 +111,19 @@ class TestModelsPreferencesWidget:
 
         qtbot.wait_until(callback=downloaded_model, timeout=60_000)
 
-    @pytest.fixture(scope="class")
-    def default_model_path(self) -> str:
-        return get_model_path(transcription_model=(TranscriptionModel.default()))
+        assert len(fake_model_download) == 1
+        assert fake_model_download[0][0] == whisper._MODELS[WhisperModelSize.TINY.value]
+        assert os.path.isfile(fake_model_download[0][1])
+
+    @pytest.fixture
+    def default_model_path(self, isolate_model_cache) -> str:
+        model_path = get_whisper_file_path(WhisperModelSize.TINY)
+        expected_size = get_expected_whisper_model_size(WhisperModelSize.TINY)
+        assert expected_size is not None
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        with open(model_path, "wb") as model_file:
+            model_file.truncate(expected_size)
+        return model_path
 
     def test_should_show_downloaded_model(self, qtbot, default_model_path):
         widget = ModelsPreferencesWidget()
