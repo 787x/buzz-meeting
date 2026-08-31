@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+import weakref
 import pytest
 import platform
 
@@ -23,6 +24,46 @@ from buzz.widgets.presentation_window import PresentationWindow
 from buzz.settings.settings import Settings
 
 from tests.mock_sounddevice import MockSoundDevice, MockInputStream
+
+
+def _close_recording_widget_after_worker_shutdown(qtbot, widget):
+    """Complete the widget's asynchronous shutdown before releasing it.
+
+    ``transcription_stopped`` is emitted while the recording QThread is still
+    finishing.  Keep the caller's strong reference, observe both lifecycle
+    signals, and only then enter the normal close path so pytest-qt cannot
+    delete a widget whose preview callback is still running.
+    """
+    lifetime_guard = widget
+    widget_reference = weakref.ref(lifetime_guard)
+    transcription_thread = lifetime_guard.transcription_thread
+    assert transcription_thread is not None
+
+    with qtbot.waitSignals(
+        [
+            (lifetime_guard.transcription_stopped, "transcription_stopped"),
+            (transcription_thread.finished, "transcription_thread.finished"),
+        ],
+        timeout=60 * 1000,
+        order="strict",
+    ):
+        lifetime_guard.stop_recording()
+
+    assert widget_reference() is lifetime_guard
+
+    preview_listener = lifetime_guard.recording_amplitude_listener
+    assert preview_listener is not None
+    preview_stream = preview_listener.stream
+    assert preview_stream is not None
+
+    assert lifetime_guard.close() is True
+    assert widget_reference() is lifetime_guard
+    assert lifetime_guard.recording_amplitude_listener is None
+
+    if hasattr(preview_stream, "thread"):
+        assert not preview_stream.thread.is_alive()
+    else:
+        assert preview_stream.closed
 
 
 class TestRecordingTranscriberWidget:
@@ -64,11 +105,8 @@ class TestRecordingTranscriberWidget:
             widget.record_button.click()
             qtbot.wait_until(callback=assert_text_box_contains_text, timeout=60 * 1000)
 
-            with qtbot.wait_signal(widget.transcription_stopped, timeout=60 * 1000):
-                widget.stop_recording()
-
             assert len(widget.transcription_text_box.toPlainText()) > 0
-            widget.close()
+            _close_recording_widget_after_worker_shutdown(qtbot, widget)
 
     @pytest.mark.skipif(
         platform.system() == "Darwin" and platform.mac_ver()[0].startswith('13.'),
@@ -110,16 +148,13 @@ class TestRecordingTranscriberWidget:
             widget.record_button.click()
             qtbot.wait_until(callback=assert_text_box_contains_text, timeout=60 * 1000)
 
-            with qtbot.wait_signal(widget.transcription_stopped, timeout=60 * 1000):
-                widget.stop_recording()
-
             assert len(widget.transcription_text_box.toPlainText()) > 0
 
             with open(widget.transcript_export_file, 'r') as file:
                 contents = file.read()
                 assert len(contents) > 0
 
-            widget.close()
+            _close_recording_widget_after_worker_shutdown(qtbot, widget)
 
     @pytest.mark.timeout(60)
     def test_on_next_transcription_append_above(self, qtbot: QtBot):
