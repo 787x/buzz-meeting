@@ -8,13 +8,15 @@ import subprocess
 import sys
 import tempfile
 import time
-from threading import Thread
+from pathlib import Path
+from threading import Event, Thread
 from types import SimpleNamespace
 from typing import List
 from unittest.mock import Mock
 
 import psutil
 import pytest
+from PyQt6.QtCore import QObject, QThread
 from PyQt6.QtWidgets import QApplication
 from pytestqt.qtbot import QtBot
 
@@ -85,6 +87,857 @@ def _wait_until(predicate, timeout: float = 15.0, interval: float = 0.1) -> bool
             return True
         time.sleep(interval)
     return predicate()
+
+
+class _LifecyclePipe:
+    def __init__(self):
+        self.closed = False
+        self.close_calls = 0
+        self.closed_event = Event()
+
+    def close(self):
+        self.close_calls += 1
+        self.closed = True
+        self.closed_event.set()
+
+    def recv(self):
+        assert self.closed_event.wait(10), "reader pipe was not closed"
+        raise EOFError
+
+
+class _LifecycleProcess:
+    """Only the Process API used by the transcriber's lifecycle, with gates."""
+
+    def __init__(
+        self, *, child_before_gate=False, complete=False, fail_start=False,
+        terminate_completes=True,
+    ):
+        self.child_before_gate = child_before_gate
+        self.complete = complete
+        self.fail_start = fail_start
+        self.terminate_completes = terminate_completes
+        self.start_entered = Event()
+        self.allow_start = Event()
+        self.join_entered = Event()
+        self.wait_entered = Event()
+        self.finished = Event()
+        self.sentinel = self.finished
+        self.timeline = []
+        self.pid = None
+        self.exitcode = None
+        self.alive = False
+        self.reaped = False
+
+    def start(self):
+        self.timeline.append("start-entered")
+        if self.child_before_gate:
+            self.alive = True
+        self.start_entered.set()
+        assert self.allow_start.wait(10), "test did not release startup"
+        if self.fail_start:
+            raise RuntimeError("controlled start failure")
+        self.pid = 12345
+        self.alive = True
+        self.timeline.append("start-returning")
+        if self.complete:
+            self.exitcode = 0
+            self.alive = False
+            self.finished.set()
+
+    def terminate(self):
+        self.timeline.append("terminate")
+        if not self.terminate_completes:
+            return
+        self.exitcode = -15
+        self.alive = False
+        self.finished.set()
+
+    def join(self, timeout=None):
+        self.timeline.append("join")
+        self.join_entered.set()
+        if timeout is not None and not self.finished.is_set():
+            return
+        assert self.finished.wait(5), "child was not terminated/completed"
+        self.reaped = True
+        self.timeline.append("reaped")
+
+    def is_alive(self):
+        return self.alive
+
+    def kill(self):
+        self.timeline.append("kill")
+        self.exitcode = -9
+        self.alive = False
+        self.finished.set()
+
+
+def _lifecycle_case(monkeypatch, **process_options):
+    from buzz.transcriber import whisper_file_transcriber as module
+
+    process = _LifecycleProcess(**process_options)
+    pipes = (_LifecyclePipe(), _LifecyclePipe())
+    pipe_factory = Mock(return_value=pipes)
+    monkeypatch.setattr(module.multiprocessing, "Pipe", pipe_factory)
+    monkeypatch.setattr(module.multiprocessing, "Process", lambda **kwargs: process)
+
+    def wait_for_exit(handles):
+        assert handles == [process.sentinel]
+        process.wait_entered.set()
+        assert process.finished.wait(5), "child was not terminated/completed"
+        return handles
+
+    monkeypatch.setattr(module, "wait", wait_for_exit)
+    monkeypatch.setattr(module.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        module, "terminate_child_processes",
+        lambda pid: process.timeline.append("terminate-descendants"),
+    )
+    transcriber = WhisperFileTranscriber(
+        FileTranscriptionTask(
+            transcription_options=TranscriptionOptions(),
+            file_transcription_options=FileTranscriptionOptions(),
+            model_path="unused-test-model",
+        )
+    )
+    return transcriber, process, pipes, pipe_factory
+
+
+def _drive_lifecycle(transcriber):
+    outcome = {}
+
+    def run():
+        try:
+            outcome["result"] = transcriber.transcribe()
+        except Exception as exc:
+            outcome["error"] = exc
+
+    worker = Thread(target=run, daemon=True)
+    worker.start()
+    return worker, outcome
+
+
+def _release_lifecycle(worker, process, pipes):
+    """Failure cleanup never satisfies the assertions made before this call."""
+    process.allow_start.set()
+    process.finished.set()
+    for pipe in pipes:
+        if not pipe.closed:
+            pipe.close()
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "test worker leaked"
+
+
+class TestStartupCancellation:
+    def test_stop_before_start(self, monkeypatch):
+        transcriber, process, pipes, pipe_factory = _lifecycle_case(
+            monkeypatch, complete=True
+        )
+        process.allow_start.set()
+        transcriber.stop()
+        transcriber.stop()
+        with pytest.raises(Exception, match="Transcription was canceled"):
+            transcriber.transcribe()
+        assert transcriber.stopped
+        assert not transcriber.started_process
+        assert process.timeline == []
+        pipe_factory.assert_not_called()
+        assert transcriber.read_line_thread is None
+
+    @pytest.mark.parametrize("child_before_gate", [False, True])
+    def test_stop_during_start(self, monkeypatch, child_before_gate):
+        transcriber, process, pipes, _ = _lifecycle_case(
+            monkeypatch, child_before_gate=child_before_gate
+        )
+        worker, outcome = _drive_lifecycle(transcriber)
+        try:
+            assert process.start_entered.wait(5)
+            transcriber.stop()
+            transcriber.stop()
+            assert transcriber.stopped
+            assert not transcriber.started_process
+            assert process.timeline == ["start-entered"]
+            process.timeline.append("stop-requested")
+            process.allow_start.set()
+            worker.join(timeout=10)
+            assert not worker.is_alive(), "pending cancellation was not replayed"
+            assert str(outcome.get("error")) == "Transcription was canceled"
+            assert process.reaped and not process.is_alive()
+            assert process.timeline == [
+                "start-entered", "stop-requested", "start-returning",
+                "terminate-descendants", "terminate", "join", "reaped",
+            ]
+            assert transcriber.read_line_thread is None
+            assert all(pipe.closed and pipe.close_calls == 1 for pipe in pipes)
+            transcriber.stop()
+            assert process.timeline.count("terminate") == 1
+            assert process.timeline.count("join") == 1
+            assert not transcriber.started_process
+        finally:
+            _release_lifecycle(worker, process, pipes)
+
+    def test_normal_start_and_completion(self, monkeypatch):
+        transcriber, process, pipes, _ = _lifecycle_case(monkeypatch, complete=True)
+        process.allow_start.set()
+        assert transcriber.transcribe() == []
+        assert not transcriber.stopped
+        assert not transcriber.started_process
+        assert process.timeline == ["start-entered", "start-returning", "join", "reaped"]
+        assert process.reaped
+        assert not transcriber.read_line_thread.is_alive()
+        assert all(pipe.closed and pipe.close_calls == 1 for pipe in pipes)
+        transcriber.stop()
+        assert "terminate" not in process.timeline
+
+    def test_normal_post_start_stop_is_idempotent(self, monkeypatch):
+        transcriber, process, pipes, _ = _lifecycle_case(monkeypatch)
+        process.allow_start.set()
+        worker, outcome = _drive_lifecycle(transcriber)
+        try:
+            assert process.wait_entered.wait(5)
+            assert transcriber.started_process
+            transcriber.stop()
+            assert process.reaped
+            transcriber.stop()
+            worker.join(timeout=10)
+            assert not worker.is_alive()
+            assert str(outcome.get("error")) == "Unknown error"
+            assert process.timeline.count("terminate") == 1
+            assert process.timeline.count("terminate-descendants") == 1
+            assert process.timeline.count("join") == 1
+            assert not process.is_alive()
+            assert not transcriber.started_process
+            assert not transcriber.read_line_thread.is_alive()
+            assert all(pipe.closed and pipe.close_calls == 1 for pipe in pipes)
+        finally:
+            _release_lifecycle(worker, process, pipes)
+
+    def test_start_failure_closes_pipes_and_preserves_error(self, monkeypatch):
+        transcriber, process, pipes, _ = _lifecycle_case(monkeypatch, fail_start=True)
+        process.allow_start.set()
+        with pytest.raises(RuntimeError, match="controlled start failure"):
+            transcriber.transcribe()
+        assert not transcriber.started_process
+        assert "join" not in process.timeline
+        assert "terminate" not in process.timeline
+        assert transcriber.read_line_thread is None
+        assert all(pipe.closed and pipe.close_calls == 1 for pipe in pipes)
+        transcriber.stop()
+        assert not transcriber._lifecycle_lock._is_owned()
+        assert transcriber._cleanup_done.is_set()
+
+    @pytest.mark.parametrize("during_start", [False, True])
+    def test_concurrent_stop_during_slow_cleanup(self, monkeypatch, during_start):
+        from buzz.transcriber import whisper_file_transcriber as module
+
+        transcriber, process, pipes, _ = _lifecycle_case(monkeypatch)
+        cleanup_entered, release_cleanup = Event(), Event()
+        stop_returned = Event()
+        stop_errors = []
+        callers = []
+
+        def slow_descendants(pid):
+            process.timeline.append("terminate-descendants")
+            cleanup_entered.set()
+            # Only the first owner blocks, so an ownership mutation exposes a
+            # second destructive caller instead of merely timing out.
+            if process.timeline.count("terminate-descendants") == 1:
+                assert release_cleanup.wait(10), "test did not release cleanup"
+
+        def stop_again():
+            try:
+                transcriber.stop()
+            except Exception as exc:
+                stop_errors.append(exc)
+            finally:
+                stop_returned.set()
+
+        monkeypatch.setattr(module, "terminate_child_processes", slow_descendants)
+        worker, outcome = _drive_lifecycle(transcriber)
+        try:
+            assert process.start_entered.wait(5)
+            if during_start:
+                transcriber.stop()
+            process.allow_start.set()
+            if not during_start:
+                assert process.wait_entered.wait(5)
+                owner = Thread(target=stop_again, daemon=True)
+                callers.append(owner)
+                owner.start()
+            assert cleanup_entered.wait(5)
+
+            acquired = transcriber._lifecycle_lock.acquire(blocking=False)
+            assert acquired, "lifecycle lock held during blocking cleanup"
+            transcriber._lifecycle_lock.release()
+
+            second = Thread(target=stop_again, daemon=True)
+            callers.append(second)
+            second.start()
+            assert stop_returned.wait(2), "second stop waited for the cleanup owner"
+            assert not stop_errors
+            assert process.timeline.count("terminate-descendants") == 1
+            assert not process.reaped
+            assert not transcriber._cleanup_done.is_set()
+            assert all(not pipe.closed for pipe in pipes)
+
+            release_cleanup.set()
+            for caller in callers:
+                caller.join(timeout=5)
+                assert not caller.is_alive()
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+            assert not stop_errors
+            assert process.reaped and not process.is_alive()
+            assert process.timeline.count("terminate") == 1
+            assert process.timeline.count("join") == 1
+            assert all(pipe.closed and pipe.close_calls == 1 for pipe in pipes)
+            assert transcriber._cleanup_done.is_set()
+            assert str(outcome.get("error")) == (
+                "Transcription was canceled" if during_start else "Unknown error"
+            )
+        finally:
+            release_cleanup.set()
+            _release_lifecycle(worker, process, pipes)
+            for caller in callers:
+                caller.join(timeout=5)
+                assert not caller.is_alive()
+
+    def test_blocking_operations_are_unlocked_including_kill_fallback(self, monkeypatch):
+        from buzz.transcriber import whisper_file_transcriber as module
+
+        transcriber, process, pipes, _ = _lifecycle_case(
+            monkeypatch, terminate_completes=False
+        )
+        observed = []
+
+        def observe(name, operation):
+            def checked(*args, **kwargs):
+                assert not transcriber._lifecycle_lock._is_owned(), name
+                observed.append(name)
+                return operation(*args, **kwargs)
+            return checked
+
+        for name in ("start", "terminate", "join", "kill"):
+            monkeypatch.setattr(process, name, observe(name, getattr(process, name)))
+        for index, pipe in enumerate(pipes):
+            monkeypatch.setattr(pipe, "close", observe(f"pipe-{index}", pipe.close))
+        monkeypatch.setattr(
+            module, "terminate_child_processes",
+            observe("descendants", module.terminate_child_processes),
+        )
+        reader_release = Event()
+        original_read_line = transcriber.read_line
+
+        def gated_read_line(pipe):
+            original_read_line(pipe)
+            assert reader_release.wait(10), "test did not release reader"
+
+        monkeypatch.setattr(transcriber, "read_line", gated_read_line)
+        worker, outcome = _drive_lifecycle(transcriber)
+        try:
+            process.allow_start.set()
+            assert process.wait_entered.wait(5)
+            reader = transcriber.read_line_thread
+            original_join = observe("reader-join", reader.join)
+
+            def release_and_join(*args, **kwargs):
+                reader_release.set()
+                return original_join(*args, **kwargs)
+
+            monkeypatch.setattr(reader, "join", release_and_join)
+            transcriber.stop()
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+            assert process.reaped and not process.is_alive()
+            assert process.timeline.count("terminate") == 1
+            assert process.timeline.count("kill") == 1
+            assert process.timeline.count("join") == 2
+            assert set(observed) == {
+                "start", "terminate", "join", "kill", "descendants",
+                "pipe-0", "pipe-1", "reader-join",
+            }
+            assert reader_release.is_set() and not reader.is_alive()
+            assert all(pipe.closed and pipe.close_calls == 1 for pipe in pipes)
+            assert "error" in outcome
+        finally:
+            reader_release.set()
+            _release_lifecycle(worker, process, pipes)
+
+    @pytest.mark.parametrize("cancel", [False, True])
+    def test_finalization_waits_for_cleanup_owner(self, monkeypatch, cancel):
+        transcriber, process, pipes, _ = _lifecycle_case(monkeypatch)
+        close_entered, release_close = Event(), Event()
+        finalization_waiting = Event()
+        owner_errors = []
+        original_close = pipes[1].close
+        original_wait = transcriber._cleanup_condition.wait
+
+        def observe_finalization_wait(*args, **kwargs):
+            finalization_waiting.set()
+            return original_wait(*args, **kwargs)
+
+        monkeypatch.setattr(transcriber._cleanup_condition, "wait", observe_finalization_wait)
+
+        def slow_close():
+            close_entered.set()
+            assert release_close.wait(10), "test did not release pipe cleanup"
+            original_close()
+
+        monkeypatch.setattr(pipes[1], "close", slow_close)
+
+        def stop_owner():
+            try:
+                transcriber.stop()
+            except Exception as exc:
+                owner_errors.append(exc)
+
+        owner = None
+        worker, outcome = _drive_lifecycle(transcriber)
+        try:
+            process.allow_start.set()
+            assert process.wait_entered.wait(5)
+            if cancel:
+                owner = Thread(target=stop_owner, daemon=True)
+                owner.start()
+            else:
+                process.alive = False
+                process.exitcode = 0
+                process.finished.set()
+            assert close_entered.wait(5)
+            if cancel:
+                assert finalization_waiting.wait(5)
+            # Either normal finalization or another stop owns cleanup. A new
+            # stop must not terminate/reap/close anything for a second time.
+            transcriber.stop()
+            assert process.timeline.count("terminate") == int(cancel)
+            assert worker.is_alive()
+            assert not transcriber._cleanup_done.is_set()
+            release_close.set()
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+            if cancel:
+                assert str(outcome.get("error")) == "Unknown error"
+            else:
+                assert outcome == {"result": []}
+            assert process.reaped
+            assert process.timeline.count("join") == 1
+            assert all(pipe.closed and pipe.close_calls == 1 for pipe in pipes)
+            assert not transcriber.read_line_thread.is_alive()
+            assert not owner_errors
+        finally:
+            release_close.set()
+            _release_lifecycle(worker, process, pipes)
+            if owner is not None:
+                owner.join(timeout=5)
+                assert not owner.is_alive()
+
+    def test_failed_cleanup_releases_ownership_for_retry(self, monkeypatch):
+        transcriber, process, pipes, _ = _lifecycle_case(monkeypatch)
+        terminate = process.terminate
+
+        def fail_once():
+            monkeypatch.setattr(process, "terminate", terminate)
+            raise RuntimeError("controlled terminate failure")
+
+        monkeypatch.setattr(process, "terminate", fail_once)
+        worker, outcome = _drive_lifecycle(transcriber)
+        try:
+            process.allow_start.set()
+            assert process.wait_entered.wait(5)
+            with pytest.raises(RuntimeError, match="controlled terminate failure"):
+                transcriber.stop()
+            assert not transcriber._lifecycle_lock._is_owned()
+            assert not transcriber._cleanup_claimed
+            assert transcriber.started_process and process.is_alive()
+            transcriber.stop()
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+            assert process.reaped and not process.is_alive()
+            assert transcriber._cleanup_error is None
+            assert all(pipe.closed and pipe.close_calls == 1 for pipe in pipes)
+            assert str(outcome.get("error")) == "Unknown error"
+        finally:
+            _release_lifecycle(worker, process, pipes)
+
+    @pytest.mark.parametrize("failed_resource", ["send_pipe", "reader_join"])
+    def test_post_reap_resource_cleanup_retry(self, monkeypatch, failed_resource):
+        from buzz.transcriber import whisper_file_transcriber as module
+
+        transcriber, process, pipes, _ = _lifecycle_case(monkeypatch)
+        release_finalization, release_reader = Event(), Event()
+        original_wait = module.wait
+        original_read = transcriber.read_line
+        original_close = pipes[1].close
+        failure = RuntimeError("controlled post-reap resource failure")
+        attempts = []
+
+        def wait_for_finalization(handles):
+            result = original_wait(handles)
+            assert release_finalization.wait(10), "finalization not released"
+            return result
+
+        def gated_reader(pipe):
+            original_read(pipe)
+            assert release_reader.wait(10), "reader not released"
+
+        def resource_attempt(name):
+            assert process.reaped and not process.is_alive()
+            assert not transcriber._lifecycle_lock._is_owned()
+            process.timeline.append(name)
+            attempts.append(name)
+            if name == failed_resource and attempts.count(name) == 1:
+                raise failure
+
+        def close_send():
+            resource_attempt("send_pipe")
+            original_close()
+
+        monkeypatch.setattr(module, "wait", wait_for_finalization)
+        monkeypatch.setattr(transcriber, "read_line", gated_reader)
+        monkeypatch.setattr(pipes[1], "close", close_send)
+        worker, outcome = _drive_lifecycle(transcriber)
+        try:
+            process.allow_start.set()
+            assert process.wait_entered.wait(5)
+            reader = transcriber.read_line_thread
+            original_join = reader.join
+
+            def join_reader(*args, **kwargs):
+                resource_attempt("reader_join")
+                release_reader.set()
+                return original_join(*args, **kwargs)
+
+            monkeypatch.setattr(reader, "join", join_reader)
+            with pytest.raises(RuntimeError) as caught:
+                transcriber.stop()
+            assert caught.value is failure
+            assert process.timeline[:6] == [
+                "start-entered", "start-returning", "terminate-descendants",
+                "terminate", "join", "reaped",
+            ]
+            assert process.timeline[6] == "send_pipe"
+            assert process.reaped and not transcriber.started_process
+            assert not transcriber._cleanup_claimed
+            assert transcriber._cleanup_error is failure
+            completed_after_failure = transcriber._cleanup_done.is_set()
+            assert transcriber.recv_pipe is pipes[0]
+            assert transcriber.send_pipe is pipes[1]
+            assert transcriber.read_line_thread is reader
+            assert reader.is_alive()
+            if failed_resource == "send_pipe":
+                assert all(not pipe.closed for pipe in pipes)
+
+            transcriber.stop()
+            assert all(pipe.closed and pipe.close_calls == 1 for pipe in pipes), (
+                "second stop did not retry post-reap resource cleanup"
+            )
+            assert not reader.is_alive(), "second stop did not finish reader cleanup"
+            assert not completed_after_failure, "failed cleanup was marked complete"
+            assert attempts.count(failed_resource) == 2
+            assert transcriber._cleanup_done.is_set()
+            assert not transcriber._cleanup_claimed
+            assert transcriber._cleanup_error is None
+            timeline = list(process.timeline)
+            transcriber.stop()
+            assert process.timeline == timeline
+            assert process.timeline.count("terminate-descendants") == 1
+            assert process.timeline.count("terminate") == 1
+            assert process.timeline.count("join") == 1
+            release_finalization.set()
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+            assert str(outcome.get("error")) == "Unknown error"
+            assert process.timeline == timeline
+        finally:
+            release_reader.set()
+            release_finalization.set()
+            _release_lifecycle(worker, process, pipes)
+
+    def test_concurrent_post_reap_resource_retry(self, monkeypatch):
+        transcriber, process, pipes, _ = _lifecycle_case(monkeypatch)
+        process.allow_start.set()
+        process.start()
+        transcriber.current_process = process
+        transcriber.started_process = True
+        transcriber.recv_pipe, transcriber.send_pipe = pipes
+        reader = Thread(target=transcriber.read_line, args=(pipes[0],), daemon=True)
+        transcriber.read_line_thread = reader
+        reader.start()
+        original_close = pipes[1].close
+        retry_entered, release_retry, second_returned = Event(), Event(), Event()
+        failure = RuntimeError("controlled post-reap resource failure")
+        attempts = []
+        errors = []
+        callers = []
+
+        def close_send():
+            assert process.reaped
+            assert not transcriber._lifecycle_lock._is_owned()
+            attempts.append("close")
+            if len(attempts) == 1:
+                raise failure
+            if len(attempts) == 2:
+                retry_entered.set()
+                assert release_retry.wait(10), "retry not released"
+            original_close()
+
+        def stop_again(returned=None):
+            try:
+                transcriber.stop()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                if returned is not None:
+                    returned.set()
+
+        monkeypatch.setattr(pipes[1], "close", close_send)
+        try:
+            with pytest.raises(RuntimeError) as caught:
+                transcriber.stop()
+            assert caught.value is failure
+            assert not transcriber._cleanup_claimed
+            assert not transcriber._cleanup_done.is_set()
+            owner = Thread(target=stop_again, daemon=True)
+            callers.append(owner)
+            owner.start()
+            assert retry_entered.wait(5)
+            assert transcriber._cleanup_claimed
+            assert transcriber._cleanup_error is failure
+            acquired = transcriber._lifecycle_lock.acquire(blocking=False)
+            assert acquired, "retry holds lifecycle lock during pipe close"
+            transcriber._lifecycle_lock.release()
+            second = Thread(target=stop_again, args=(second_returned,), daemon=True)
+            callers.append(second)
+            second.start()
+            assert second_returned.wait(5)
+            assert not errors
+            assert len(attempts) == 2, "multiple concurrent retry owners"
+            assert all(not pipe.closed for pipe in pipes)
+            assert not transcriber._cleanup_done.is_set()
+            release_retry.set()
+            for caller in callers:
+                caller.join(timeout=5)
+                assert not caller.is_alive()
+            assert not errors
+            assert not reader.is_alive()
+            assert all(pipe.closed and pipe.close_calls == 1 for pipe in pipes)
+            assert transcriber._cleanup_done.is_set()
+            assert not transcriber._cleanup_claimed
+            assert transcriber._cleanup_error is None
+            transcriber.stop()
+            assert len(attempts) == 2
+            assert process.timeline.count("terminate-descendants") == 1
+            assert process.timeline.count("terminate") == 1
+            assert process.timeline.count("join") == 1
+        finally:
+            release_retry.set()
+            for caller in callers:
+                caller.join(timeout=5)
+                assert not caller.is_alive()
+            original_close()
+            pipes[0].close()
+            reader.join(timeout=5)
+            assert not reader.is_alive()
+
+    def test_finalization_observes_post_reap_cleanup_failure(self, monkeypatch):
+        transcriber, process, pipes, _ = _lifecycle_case(monkeypatch)
+        cleanup_entered, release_cleanup, finalization_waiting = Event(), Event(), Event()
+        original_close = pipes[1].close
+        original_wait = transcriber._cleanup_condition.wait
+        failure = RuntimeError("controlled post-reap resource failure")
+        owner_errors = []
+
+        def fail_close():
+            assert process.reaped
+            cleanup_entered.set()
+            assert release_cleanup.wait(10), "failure not released"
+            raise failure
+
+        def observe_wait(*args, **kwargs):
+            finalization_waiting.set()
+            return original_wait(*args, **kwargs)
+
+        def stop_owner():
+            try:
+                transcriber.stop()
+            except BaseException as exc:
+                owner_errors.append(exc)
+
+        monkeypatch.setattr(pipes[1], "close", fail_close)
+        monkeypatch.setattr(transcriber._cleanup_condition, "wait", observe_wait)
+        worker, outcome = _drive_lifecycle(transcriber)
+        owner = None
+        try:
+            process.allow_start.set()
+            assert process.wait_entered.wait(5)
+            owner = Thread(target=stop_owner, daemon=True)
+            owner.start()
+            assert cleanup_entered.wait(5)
+            assert finalization_waiting.wait(5)
+            release_cleanup.set()
+            owner.join(timeout=5)
+            worker.join(timeout=5)
+            assert not owner.is_alive()
+            assert not worker.is_alive(), "finalization waited forever for successful cleanup"
+            assert owner_errors == [failure]
+            assert outcome.get("error") is failure
+            assert not transcriber._cleanup_done.is_set()
+            assert not transcriber._cleanup_claimed
+            assert not transcriber.started_process
+            assert transcriber.read_line_thread.is_alive()
+            monkeypatch.setattr(pipes[1], "close", original_close)
+            transcriber.stop()
+            assert transcriber._cleanup_error is None
+            assert transcriber._cleanup_done.is_set()
+            assert all(pipe.closed and pipe.close_calls == 1 for pipe in pipes)
+            assert not transcriber.read_line_thread.is_alive()
+            assert process.timeline.count("join") == 1
+            assert process.timeline.count("terminate") == 1
+        finally:
+            release_cleanup.set()
+            monkeypatch.setattr(pipes[1], "close", original_close)
+            _release_lifecycle(worker, process, pipes)
+            if owner is not None:
+                owner.join(timeout=5)
+                assert not owner.is_alive()
+
+    def test_normal_finalization_resource_failure_is_retryable(self, monkeypatch):
+        transcriber, process, pipes, _ = _lifecycle_case(monkeypatch, complete=True)
+        process.allow_start.set()
+        original_close = pipes[1].close
+        failure = RuntimeError("controlled normal-finalization resource failure")
+
+        def fail_once():
+            assert process.reaped
+            monkeypatch.setattr(pipes[1], "close", original_close)
+            raise failure
+
+        monkeypatch.setattr(pipes[1], "close", fail_once)
+        try:
+            with pytest.raises(RuntimeError) as caught:
+                transcriber.transcribe()
+            assert caught.value is failure
+            assert not transcriber.started_process
+            assert not transcriber._cleanup_done.is_set()
+            assert not transcriber._cleanup_claimed
+            assert transcriber._cleanup_error is failure
+            transcriber.stop()
+            transcriber.stop()
+            assert all(pipe.closed and pipe.close_calls == 1 for pipe in pipes)
+            assert not transcriber.read_line_thread.is_alive()
+            assert transcriber._cleanup_done.is_set()
+            assert transcriber._cleanup_error is None
+            assert process.timeline == ["start-entered", "start-returning", "join", "reaped"]
+        finally:
+            original_close()
+            pipes[0].close()
+            if transcriber.read_line_thread is not None:
+                transcriber.read_line_thread.join(timeout=5)
+                assert not transcriber.read_line_thread.is_alive()
+
+    @pytest.mark.parametrize("pending_resource", ["send_pipe", "reader"])
+    def test_incomplete_resources_are_retryable(self, monkeypatch, pending_resource):
+        from buzz.transcriber import whisper_file_transcriber as module
+
+        transcriber, process, pipes, _ = _lifecycle_case(monkeypatch, complete=True)
+        process.allow_start.set()
+        original_close = pipes[1].close
+        reader = SimpleNamespace(alive=pending_resource == "reader", join_calls=0)
+
+        def join_reader(timeout):
+            assert not transcriber._lifecycle_lock._is_owned()
+            reader.join_calls += 1
+            if reader.join_calls == 2:
+                reader.alive = False
+
+        reader.start = lambda: None
+        reader.is_alive = lambda: reader.alive
+        reader.join = join_reader
+        monkeypatch.setattr(module, "Thread", lambda **kwargs: reader)
+        if pending_resource == "send_pipe":
+            def fail_close():
+                monkeypatch.setattr(pipes[1], "close", original_close)
+                raise OSError("controlled pipe close failure")
+
+            monkeypatch.setattr(pipes[1], "close", fail_close)
+        with pytest.raises(RuntimeError, match="Transcription resources did not close"):
+            transcriber.transcribe()
+        assert process.reaped and not transcriber.started_process
+        assert not transcriber._cleanup_done.is_set()
+        assert not transcriber._cleanup_claimed
+        transcriber.stop()
+        transcriber.stop()
+        assert all(pipe.closed and pipe.close_calls == 1 for pipe in pipes)
+        assert not reader.is_alive()
+        assert reader.join_calls == (2 if pending_resource == "reader" else 0)
+        assert transcriber._cleanup_done.is_set()
+        assert transcriber._cleanup_error is None
+        assert process.timeline == ["start-entered", "start-returning", "join", "reaped"]
+
+    def test_qthread_startup_cancellation(self, qtbot, monkeypatch):
+        transcriber, process, pipes, _ = _lifecycle_case(
+            monkeypatch, child_before_gate=True
+        )
+        owner = QObject()
+        thread = QThread(owner)
+        errors = []
+        transcriber.moveToThread(thread)
+        thread.started.connect(transcriber.run)
+        transcriber.error.connect(errors.append)
+        transcriber.error.connect(thread.quit)
+        transcriber.completed.connect(thread.quit)
+        thread.finished.connect(transcriber.deleteLater)
+        thread.start()
+        try:
+            assert process.start_entered.wait(5)
+            transcriber.stop()
+            assert transcriber.stopped and not transcriber.started_process
+            process.allow_start.set()
+            qtbot.waitUntil(lambda: not thread.isRunning(), timeout=10000)
+            assert errors == ["Transcription was canceled"]
+            assert process.reaped and not process.is_alive()
+            assert process.timeline.count("terminate") == 1
+            assert all(pipe.closed and pipe.close_calls == 1 for pipe in pipes)
+        finally:
+            process.allow_start.set()
+            process.finished.set()
+            for pipe in pipes:
+                if not pipe.closed:
+                    pipe.close()
+            thread.quit()
+            assert thread.wait(10000), "QThread did not finish; no forced termination allowed"
+
+    def test_process_level_natural_exit(self):
+        root = Path(__file__).resolve().parents[2]
+        node = (
+            "tests/transcriber/whisper_file_transcriber_test.py::"
+            "TestStartupCancellation::test_qthread_startup_cancellation"
+        )
+        env = os.environ.copy()
+        for key in tuple(env):
+            if key.startswith("COV_CORE_") or key == "COVERAGE_PROCESS_START":
+                env.pop(key)
+        env["PYTEST_ADDOPTS"] = ""
+        env["BUZZ_DISABLE_TELEMETRY"] = "1"
+        with subprocess.Popen(
+            [sys.executable, "-m", "pytest", "-q", node],
+            cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+        ) as child:
+            try:
+                output, _ = child.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                # Windows venv launchers may have a real interpreter child.
+                descendants = psutil.Process(child.pid).children(recursive=True)
+                for process in reversed(descendants):
+                    try:
+                        process.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+                child.kill()
+                output, _ = child.communicate(timeout=10)
+                pytest.fail(f"Child pytest did not exit naturally within 60s:\n{output}")
+            assert child.returncode == 0, output
+            assert "1 passed" in output, output
 
 
 class TestCheckFileHasAudioStream:

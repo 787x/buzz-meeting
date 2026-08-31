@@ -13,8 +13,8 @@ from buzz import cuda_setup  # noqa: F401
 import torch
 import platform
 from platformdirs import user_cache_dir
-from multiprocessing.connection import Connection
-from threading import Thread
+from multiprocessing.connection import Connection, wait
+from threading import Condition, Event, RLock, Thread
 from typing import Optional, List
 
 import psutil
@@ -135,6 +135,12 @@ class WhisperFileTranscriber(FileTranscriber):
         self.segments = []
         self.started_process = False
         self.stopped = False
+        self._lifecycle_lock = RLock()
+        self._cleanup_condition = Condition(self._lifecycle_lock)
+        self._cleanup_claimed = False
+        # Success only; the condition also wakes finalization after a failure.
+        self._cleanup_done = Event()
+        self._cleanup_error = None
         self.recv_pipe = None
         self.send_pipe = None
         self.error_message = None
@@ -149,47 +155,55 @@ class WhisperFileTranscriber(FileTranscriber):
         if torch.cuda.is_available():
             logging.debug(f"CUDA version detected: {torch.version.cuda}")
 
-        self.recv_pipe, self.send_pipe = multiprocessing.Pipe(duplex=False)
+        with self._lifecycle_lock:
+            if self.stopped:
+                raise Exception("Transcription was canceled")
+            self._cleanup_claimed = False
+            self._cleanup_done.clear()
+            self._cleanup_error = None
 
-        self.current_process = multiprocessing.Process(
-            target=self.transcribe_whisper,
-            args=(self.send_pipe, self.transcription_task),
-        )
-        if not self.stopped:
-            self.current_process.start()
-            self.started_process = True
-
-        self.read_line_thread = Thread(target=self.read_line, args=(self.recv_pipe,))
-        self.read_line_thread.start()
-
-        # Only join the process if it was actually started
-        if self.started_process:
-            self.current_process.join()
-
-        # Close the send pipe after process ends to signal read_line thread to stop
-        # This prevents the read thread from blocking on recv() after the process is gone
         try:
-            if self.send_pipe and not self.send_pipe.closed:
-                self.send_pipe.close()
-        except OSError:
-            pass
+            recv_pipe, send_pipe = multiprocessing.Pipe(duplex=False)
+            with self._lifecycle_lock:
+                self.recv_pipe, self.send_pipe = recv_pipe, send_pipe
+            process = multiprocessing.Process(
+                target=self.transcribe_whisper,
+                args=(send_pipe, self.transcription_task),
+            )
+            with self._lifecycle_lock:
+                self.current_process = process
 
-        # Close the receive pipe to unblock the read_line thread
-        try:
-            if self.recv_pipe and not self.recv_pipe.closed:
-                self.recv_pipe.close()
-        except OSError:
-            pass
+            # Do not hold the lock across spawn: stop() must be able to record
+            # a cancellation while Process.start() is still in progress.
+            process.start()
+            with self._lifecycle_lock:
+                self.started_process = True
+                pending_stop = self.stopped
+                if not pending_stop:
+                    # Publish/start the reader before stop() can claim its pipe.
+                    self.read_line_thread = Thread(
+                        target=self.read_line, args=(recv_pipe,)
+                    )
+                    self.read_line_thread.start()
 
-        # Join read_line_thread with timeout to prevent hanging
-        if self.read_line_thread and self.read_line_thread.is_alive():
-            self.read_line_thread.join(timeout=3)
-            if self.read_line_thread.is_alive():
-                logging.warning(
-                    "Read line thread didn't terminate gracefully in transcribe()"
-                )
+            if pending_stop:
+                self.stop()
+                raise Exception("Transcription was canceled")
 
-        self.started_process = False
+            # Wait without reaping; only the cleanup owner calls join(). This
+            # also lets a concurrent stop() terminate and reap the worker once.
+            wait([process.sentinel])
+        except Exception:
+            self.stop()
+            raise
+        finally:
+            self._cleanup_transcription(cancel=self.stopped)
+            # A concurrent stop() may own cleanup. Do not finish the Qt worker
+            # (or consume its reader's result) until that owner has finished.
+            with self._cleanup_condition:
+                self._cleanup_condition.wait_for(lambda: not self._cleanup_claimed)
+                if self._cleanup_error is not None:
+                    raise self._cleanup_error
 
         logging.debug(
             "whisper process completed with code = %s, time taken = %s,"
@@ -228,6 +242,85 @@ class WhisperFileTranscriber(FileTranscriber):
                 raise Exception(error)
 
         return self.segments
+
+    def _cleanup_transcription(self, *, cancel: bool) -> None:
+        with self._lifecycle_lock:
+            if self._cleanup_claimed or self._cleanup_done.is_set():
+                return
+            self._cleanup_claimed = True
+            self._cleanup_done.clear()
+            process = self.current_process if self.started_process else None
+            recv_pipe, send_pipe = self.recv_pipe, self.send_pipe
+            reader = self.read_line_thread
+
+        reaped = process is None
+        cleanup_error = None
+        try:
+            try:
+                if process is not None:
+                    if cancel:
+                        if process.pid is not None:
+                            terminate_child_processes(process.pid)
+                        process.terminate()
+                    process.join(timeout=10 if cancel else None)
+                    if cancel and process.is_alive():
+                        logging.warning("Process didn't terminate gracefully, force killing")
+                        process.kill()
+                        process.join(timeout=5)
+                    reaped = not process.is_alive()
+                    if not reaped:
+                        raise RuntimeError("Transcription process did not terminate")
+            finally:
+                self._close_transcription_resources(
+                    recv_pipe, send_pipe, reader, reader_timeout=5 if cancel else 3
+                )
+        except BaseException as exc:
+            cleanup_error = exc
+            raise
+        finally:
+            with self._cleanup_condition:
+                if reaped:
+                    self.started_process = False
+                # Keep the resource references on failure; the next owner skips
+                # the already-reaped process and retries only pending resources.
+                self._cleanup_error = cleanup_error
+                self._cleanup_claimed = False
+                if cleanup_error is None:
+                    self._cleanup_done.set()
+                self._cleanup_condition.notify_all()
+
+    @staticmethod
+    def _close_transcription_resources(
+        recv_pipe, send_pipe, reader, *, reader_timeout: float
+    ) -> None:
+        """Close/join the owner's resource snapshot without a lifecycle lock."""
+        # Close the send pipe after process ends to signal read_line thread to stop
+        # This prevents the read thread from blocking on recv() after the process is gone
+        try:
+            if send_pipe and not send_pipe.closed:
+                send_pipe.close()
+        except OSError:
+            pass
+
+        # Close the receive pipe to unblock the read_line thread
+        try:
+            if recv_pipe and not recv_pipe.closed:
+                recv_pipe.close()
+        except OSError:
+            pass
+
+        # Join read_line_thread with timeout to prevent hanging
+        if reader and reader.is_alive():
+            reader.join(timeout=reader_timeout)
+            if reader.is_alive():
+                logging.warning(
+                    "Read line thread didn't terminate gracefully"
+                )
+
+        if any(pipe and not pipe.closed for pipe in (recv_pipe, send_pipe)) or (
+            reader and reader.is_alive()
+        ):
+            raise RuntimeError("Transcription resources did not close")
 
     @classmethod
     def transcribe_whisper(
@@ -641,42 +734,17 @@ class WhisperFileTranscriber(FileTranscriber):
         return model
 
     def stop(self):
-        self.stopped = True
+        with self._lifecycle_lock:
+            # This is a durable request, including before process publication.
+            self.stopped = True
+            if self._cleanup_done.is_set():
+                return
+            if not self.started_process and self._cleanup_error is None:
+                # Startup owns unpublished resources until cancellation replay.
+                # A post-reap cleanup error, however, must remain retryable.
+                return
 
-        if self.started_process:
-            # Kill the whisper-cli subprocess the worker spawned first. The
-            # worker's own terminate() below does not reach it, so it would
-            # otherwise keep running (orphaned) after Stop / app close.
-            if self.current_process.pid is not None:
-                terminate_child_processes(self.current_process.pid)
-
-            # Terminate the worker itself; it is reaped via join() below.
-            self.current_process.terminate()
-
-            # Close the pipes to unblock the read_line thread, which is
-            # otherwise stuck in recv() until it gets EOF / an OSError.
-            try:
-                if hasattr(self, "send_pipe") and self.send_pipe:
-                    self.send_pipe.close()
-            except Exception as e:
-                logging.debug(f"Error closing send_pipe: {e}")
-
-            try:
-                if hasattr(self, "recv_pipe") and self.recv_pipe:
-                    self.recv_pipe.close()
-            except Exception as e:
-                logging.debug(f"Error closing recv_pipe: {e}")
-
-            if self.read_line_thread and self.read_line_thread.is_alive():
-                self.read_line_thread.join(timeout=5)
-                if self.read_line_thread.is_alive():
-                    logging.warning("Read line thread still alive after 5s")
-
-            self.current_process.join(timeout=10)
-            if self.current_process.is_alive():
-                logging.warning("Process didn't terminate gracefully, force killing")
-                self.current_process.kill()
-                self.current_process.join(timeout=5)
+        self._cleanup_transcription(cancel=True)
 
     def read_line(self, pipe: Connection):
         while True:
