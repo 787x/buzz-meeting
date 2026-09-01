@@ -1,4 +1,5 @@
 import os
+import sys
 import textwrap
 
 import pytest
@@ -52,6 +53,7 @@ def _write_plugin(plugin_dir, source=VALID_PLUGIN):
 @pytest.fixture()
 def isolated_plugins(tmp_path, monkeypatch):
     """Point the loader at temp dirs and stub keyring + bundled-copy."""
+    original_sys_path = sys.path.copy()
     plugins_dir = tmp_path / "plugins"
     deps_dir = tmp_path / "deps"
     plugins_dir.mkdir()
@@ -77,7 +79,64 @@ def isolated_plugins(tmp_path, monkeypatch):
         "delete_secret",
         lambda name: secrets.pop(name, None),
     )
-    return plugins_dir, deps_dir, secrets
+    try:
+        yield plugins_dir, deps_dir, secrets
+    finally:
+        sys.path[:] = original_sys_path
+
+
+def test_isolated_plugins_restores_exact_sys_path(tmp_path, monkeypatch):
+    original_sys_path_object = sys.path
+    original_sys_path = sys.path.copy()
+    duplicate_path = str(tmp_path / "duplicate-baseline")
+    expected_sys_path = [duplicate_path, *original_sys_path, duplicate_path]
+    sys.path[:] = expected_sys_path
+
+    fixture = isolated_plugins.__wrapped__(tmp_path, monkeypatch)
+    try:
+        _plugins_dir, deps_dir, _secrets = next(fixture)
+        loader.ensure_deps_on_path()
+        extra_path = str(tmp_path / "additional-test-path")
+        sys.path.insert(1, extra_path)
+
+        with pytest.raises(StopIteration):
+            next(fixture)
+
+        assert sys.path is original_sys_path_object
+        assert sys.path == expected_sys_path
+        assert str(deps_dir) not in sys.path
+        assert extra_path not in sys.path
+    finally:
+        if sys.path is not original_sys_path_object:
+            sys.path = original_sys_path_object
+        original_sys_path_object[:] = original_sys_path
+
+
+def test_isolated_plugins_restores_sys_path_after_exception(tmp_path, monkeypatch):
+    original_sys_path_object = sys.path
+    original_sys_path = sys.path.copy()
+    duplicate_path = str(tmp_path / "duplicate-baseline")
+    expected_sys_path = [duplicate_path, *original_sys_path, duplicate_path]
+    sys.path[:] = expected_sys_path
+
+    fixture = isolated_plugins.__wrapped__(tmp_path, monkeypatch)
+    try:
+        _plugins_dir, deps_dir, _secrets = next(fixture)
+        loader.ensure_deps_on_path()
+        extra_path = str(tmp_path / "additional-test-path")
+        sys.path.insert(1, extra_path)
+
+        with pytest.raises(RuntimeError, match="fixture consumer failed"):
+            fixture.throw(RuntimeError("fixture consumer failed"))
+
+        assert sys.path is original_sys_path_object
+        assert sys.path == expected_sys_path
+        assert str(deps_dir) not in sys.path
+        assert extra_path not in sys.path
+    finally:
+        if sys.path is not original_sys_path_object:
+            sys.path = original_sys_path_object
+        original_sys_path_object[:] = original_sys_path
 
 
 @pytest.fixture()
