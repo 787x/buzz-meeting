@@ -122,3 +122,23 @@ uv add --index https://pypi.ngc.nvidia.com nvidia-cublas-cu12==12.8.3.14 nvidia-
 To use Faster Whisper on GPU, install the following libraries:
 * [cuBLAS](https://developer.nvidia.com/cublas)
 * [cuDNN](https://developer.nvidia.com/cudnn)
+
+### Packaging Buzz for Windows
+
+The supported Windows package is an AMD64/x64 PyInstaller ONEDIR build. Packaging requires Python 3.12, `uv`, Git with the repository's recursive submodules, GNU Make, CMake, MSVC with the Desktop development with C++ workload and Windows SDK, the Vulkan SDK, FFmpeg/ffprobe on `PATH`, and Inno Setup with `ISCC` on `PATH`. PyInstaller is supplied by the project environment; it is not a separate system prerequisite. Rust and Cargo are not required for the base package, and DeepFilterNet remains optional.
+
+From an MSVC-capable Git Bash session, run the canonical package command directly. The package transaction requires Bash/POSIX shell semantics; invoking Windows Make without a usable Bash on `PATH` fails closed before packaging begins.
+
+```bash
+uv run make bundle_windows
+```
+
+`uv` may build the editable project before Make starts. The packaging boundary recognizes and normalizes only the exact known build-generated CTC `setup.py` state. Arbitrary or staged CTC changes are rejected and preserved, and unknown untracked files are never cleaned automatically.
+
+The command force-rebuilds the CTC forced-aligner extension, rebuilds the native Windows audio helper, runs its native CTest suite and staged self-test, prepares the existing Whisper.cpp prerequisites, performs a clean PyInstaller ONEDIR build, validates the exact package layout and AMD64 PE architecture, runs the packaged helper self-test, checks release-version consistency, and compiles the x64-Windows-only installer with Inno Setup. Running `pyinstaller Buzz.spec` directly assumes all native prerequisites are already prepared and is not the authoritative release pipeline.
+
+The intermediate application tree is written to `dist/Buzz/`. The installer is written as `dist/Buzz-<version>-windows.exe`; Inno Setup may also emit `dist/Buzz-<version>-windows-*.bin` DiskSpanning sidecars.
+
+Building and validating a package does not publish a public GitHub release. Release publication remains a separate, explicitly triggered project operation.
+
+After a successful package build, an optional manual smoke can cover installation, launch, system-audio capture, process/application capture on a supported Windows version, stop/restart, upgrade over a previous installation, and uninstall. These checks are useful release validation but are not CI-blocking package gates.

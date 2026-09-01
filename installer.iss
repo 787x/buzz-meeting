@@ -8,8 +8,26 @@
 #define OutputDir "dist"
 #define AppRegKey "Software\Buzz"
 
-#define VersionFile FileRead(FileOpen("buzz\__version__.py"))
-#define AppVersion Copy(VersionFile, Pos('VERSION = "', VersionFile) + 11, 5)
+#define VersionPrefix 'VERSION = "'
+#define VersionFileHandle
+#define VersionMatchCount 0
+#define AppVersion ""
+
+#sub ProcessVersionLine
+  #define VersionLine = Trim(FileRead(VersionFileHandle))
+  #if Pos(VersionPrefix, VersionLine) == 1 && RPos('"', VersionLine) == Len(VersionLine) && Len(VersionLine) > Len(VersionPrefix)
+    #expr VersionMatchCount++
+    #expr AppVersion = Copy(VersionLine, Len(VersionPrefix) + 1, Len(VersionLine) - Len(VersionPrefix) - 1)
+  #endif
+#endsub
+
+#for {VersionFileHandle = FileOpen("buzz\__version__.py"); VersionFileHandle && !FileEof(VersionFileHandle); ""} ProcessVersionLine
+#if VersionFileHandle
+  #call FileClose(VersionFileHandle)
+#endif
+#if VersionMatchCount != 1
+  #error "Malformed buzz\__version__.py: expected exactly one complete VERSION assignment"
+#endif
 
 [Setup]
 ; NOTE: The value of AppId uniquely identifies this application. Do not use the same AppId value in installers for other applications.
@@ -17,6 +35,8 @@
 AppId={{574290A2-EF7C-4845-85F3-BFF2F011A580}
 AppName={#AppName}
 AppVersion={#AppVersion}
+ArchitecturesAllowed=x64os
+ArchitecturesInstallIn64BitMode=x64os
 DefaultDirName={autopf}\{#AppName}
 DisableProgramGroupPage=yes
 ; Uncomment the following line to run in non administrative install mode (install for current user only.)
