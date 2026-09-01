@@ -19,6 +19,25 @@ SOURCE_FILE = ALIGNER_PKG / "forced_align_impl.cpp"
 PATCHES_DIR = PROJECT_ROOT / "patches"
 
 
+def _decode_diagnostic(data: bytes | None) -> str:
+    """Decode captured build output without losing undecodable bytes."""
+    if not data:
+        return ""
+    return data.decode("utf-8", errors="backslashreplace")
+
+
+def _write_diagnostic(stream, data: bytes | None) -> None:
+    """Write captured output without failing on the stream's encoding."""
+    text = _decode_diagnostic(data)
+    if not text:
+        return
+
+    encoding = getattr(stream, "encoding", None)
+    if encoding:
+        text = text.encode(encoding, errors="backslashreplace").decode(encoding)
+    print(text, file=stream)
+
+
 def _compiled_extensions():
     return [p for pattern in ("*.pyd", "*.so") for p in ALIGNER_PKG.glob(pattern)]
 
@@ -46,7 +65,6 @@ def apply_patches():
             ["git", "apply", "--check", "--ignore-whitespace", str(patch_file)],
             cwd=ALIGNER_DIR,
             capture_output=True,
-            text=True,
         )
         if check_forward.returncode == 0:
             # Patch can be applied — do it for real.
@@ -55,23 +73,31 @@ def apply_patches():
                 cwd=ALIGNER_DIR,
                 check=True,
                 capture_output=True,
-                text=True,
             )
             print(f"Applied patch: {patch_file.name}")
         else:
             # Dry-run failed — either already applied or genuinely broken.
             check_reverse = subprocess.run(
-                ["git", "apply", "--check", "--reverse", "--ignore-whitespace", str(patch_file)],
+                [
+                    "git",
+                    "apply",
+                    "--check",
+                    "--reverse",
+                    "--ignore-whitespace",
+                    str(patch_file),
+                ],
                 cwd=ALIGNER_DIR,
                 capture_output=True,
-                text=True,
             )
             if check_reverse.returncode == 0:
                 print(f"Patch already applied (skipping): {patch_file.name}")
             else:
-                print(
-                    f"WARNING: could not apply patch {patch_file.name}: {check_forward.stderr}",
-                    file=sys.stderr,
+                warning = (
+                    f"WARNING: could not apply patch {patch_file.name}: "
+                ).encode("utf-8") + (check_forward.stderr or b"")
+                _write_diagnostic(
+                    sys.stderr,
+                    warning,
                 )
 
 
@@ -90,11 +116,9 @@ def build():
         cwd=ALIGNER_DIR,
         check=True,
         capture_output=True,
-        text=True,
     )
-    print(result.stdout)
-    if result.stderr:
-        print(result.stderr, file=sys.stderr)
+    _write_diagnostic(sys.stdout, result.stdout)
+    _write_diagnostic(sys.stderr, result.stderr)
     print("Successfully built ctc_forced_aligner C++ extension")
 
 
@@ -115,8 +139,8 @@ def main():
         build()
     except subprocess.CalledProcessError as e:
         print(f"Error building ctc_forced_aligner: {e}", file=sys.stderr)
-        print(f"stdout: {e.stdout}", file=sys.stderr)
-        print(f"stderr: {e.stderr}", file=sys.stderr)
+        _write_diagnostic(sys.stderr, b"stdout: " + (e.stdout or b""))
+        _write_diagnostic(sys.stderr, b"stderr: " + (e.stderr or b""))
         sys.exit(1)
 
 
