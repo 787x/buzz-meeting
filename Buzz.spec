@@ -3,6 +3,7 @@ import os
 import os.path
 import platform
 import shutil
+import sysconfig
 
 from PyInstaller.utils.hooks import collect_data_files, copy_metadata
 
@@ -50,9 +51,17 @@ datas += collect_data_files("faster_whisper", include_py_files=True)
 datas += collect_data_files("stable_whisper", include_py_files=True)
 datas += collect_data_files("whisper")
 datas += collect_data_files("demucs", include_py_files=True)
-datas += collect_data_files("whisper_diarization", include_py_files=True)
-datas += collect_data_files("deepmultilingualpunctuation", include_py_files=True)
-datas += collect_data_files("ctc_forced_aligner", include_py_files=True, excludes=["build"])
+datas += collect_data_files(
+    "whisper_diarization", include_py_files=True, excludes=[".git"]
+)
+datas += collect_data_files(
+    "deepmultilingualpunctuation", include_py_files=True, excludes=[".git"]
+)
+datas += collect_data_files(
+    "ctc_forced_aligner",
+    include_py_files=True,
+    excludes=[".git", "build", "**/*.pyd"],
+)
 datas += collect_data_files("nemo", include_py_files=True)
 datas += collect_data_files("lightning_fabric", include_py_files=True)
 datas += collect_data_files("pytorch_lightning", include_py_files=True)
@@ -63,6 +72,7 @@ datas += [("buzz/plugins/ai_summary", "plugins/ai_summary")]
 datas += [("buzz/plugins/transcript_resizer", "plugins/transcript_resizer")]
 datas += [("buzz/plugins/export_docx", "plugins/export_docx")]
 datas += [("buzz/plugins/enhanced_language_detection", "plugins/enhanced_language_detection")]
+datas += [("buzz/plugins/skip_already_transcribed", "plugins/skip_already_transcribed")]
 datas += [("buzz/plugins/deep_filter_net", "plugins/deep_filter_net")]
 
 block_cipher = None
@@ -119,6 +129,24 @@ if platform.system() == "Windows":
         )
     binaries.append((windows_audio_helper, "native/windows"))
 
+    ctc_extension_suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    if not ctc_extension_suffix or not ctc_extension_suffix.endswith(".pyd"):
+        raise RuntimeError(
+            f"Could not determine the Windows CTC extension suffix: {ctc_extension_suffix!r}"
+        )
+    ctc_extension = os.path.join(
+        "ctc_forced_aligner",
+        "ctc_forced_aligner",
+        f"ctc_forced_aligner{ctc_extension_suffix}",
+    )
+    if not os.path.isfile(ctc_extension):
+        raise FileNotFoundError(
+            "Missing compiled CTC forced-aligner extension. "
+            "Run 'uv run python scripts/build_ctc_forced_aligner.py --force' "
+            f"before PyInstaller: {ctc_extension}"
+        )
+    binaries.append((ctc_extension, "ctc_forced_aligner"))
+
 a = Analysis(
     ["main.py"],
     pathex=[],
@@ -150,6 +178,22 @@ a = Analysis(
     cipher=block_cipher,
     noarchive=False,
 )
+
+# The imported extension is discovered automatically as an ``EXTENSION`` and
+# would otherwise be collected beneath ``ctc_forced_aligner/ctc_forced_aligner``.
+# Keep only the explicit ABI-aware ``BINARY`` entry above so the ONEDIR package
+# contains one canonical CTC extension at ``ctc_forced_aligner/<filename>``.
+if platform.system() == "Windows":
+    ctc_source = os.path.normcase(os.path.abspath(ctc_extension))
+    a.binaries[:] = [
+        entry
+        for entry in a.binaries
+        if not (
+            entry[2] == "EXTENSION"
+            and os.path.normcase(os.path.abspath(entry[1])) == ctc_source
+        )
+    ]
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(
