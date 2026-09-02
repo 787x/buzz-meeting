@@ -763,9 +763,14 @@ class TestRecordingTranscriberWidgetPresentation:
 
     @pytest.mark.timeout(60)
     def test_on_text_color_clicked_cancel(self, qtbot: QtBot):
-        """Test that cancelling color dialog does not save"""
+        """Test that cancelling color dialog does not overwrite an existing saved color."""
         settings = Settings()
-        original_color = settings.value(Settings.Key.PRESENTATION_WINDOW_TEXT_COLOR, "#000000")
+
+        # Establish an explicit precondition: a known color is already saved.
+        initial_color = "#123456"
+        settings.set_value(Settings.Key.PRESENTATION_WINDOW_TEXT_COLOR, initial_color)
+        original_color = settings.value(Settings.Key.PRESENTATION_WINDOW_TEXT_COLOR, "")
+        assert original_color == initial_color
 
         with (patch("sounddevice.InputStream", side_effect=MockInputStream),
               patch("buzz.transcriber.recording_transcriber.RecordingTranscriber.get_device_sample_rate",

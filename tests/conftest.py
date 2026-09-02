@@ -404,6 +404,70 @@ def pytest_unconfigure(config) -> None:
             pass
 
 
+def _clear_default_settings() -> None:
+    """Clear and sync the production-style default Settings namespace (Buzz / empty application).
+
+    Only affects the default INI namespace; named application namespaces
+    (Settings(application="...")) are independent files and untouched.
+    """
+    from buzz.settings.settings import Settings
+
+    settings = Settings()
+    settings.clear()
+    settings.sync()
+
+
+@pytest.fixture(autouse=True)
+def isolate_default_settings():
+    """Isolate the default Settings namespace across all tests.
+
+    Pre-clears before each test to prevent contamination from prior tests
+    or same-session external setup. Post-clears after each test (including
+    on failure/exception) via yield-fixture semantics.
+    """
+    _clear_default_settings()
+    yield
+    _clear_default_settings()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    """Teardown-boundary oracle: verify default Settings is clean after fixture teardown.
+
+    Runs after all function-scoped fixture teardowns have completed for the
+    just-finished test. Opens a fresh Settings() (which syncs from disk via
+    P0's sandbox) and rejects every key except the narrowly proven
+    session-owned residuals (user-identifier, plugins/*).
+
+    This is an observer only �?it does not clear state.
+    """
+    outcome = yield
+    outcome.force_result(None)
+
+    if _SANDBOX_STATE and not item.config.getoption("co", default=False):
+        from buzz.settings.settings import Settings
+
+        settings = Settings()
+        settings.sync()
+        keys = settings.settings.allKeys()
+
+        _ALLOWED_SESSION_KEYS = {
+            Settings.Key.USER_IDENTIFIER.value,
+        }
+        _ALLOWED_SESSION_PREFIXES = ("plugins/",)
+
+        leaked = [
+            k for k in keys
+            if k not in _ALLOWED_SESSION_KEYS
+            and not any(k.startswith(p) for p in _ALLOWED_SESSION_PREFIXES)
+        ]
+        if leaked:
+            raise AssertionError(
+                f"P1 default Settings isolation violated: {len(leaked)} key(s) "
+                f"remain after fixture teardown: {leaked}"
+            )
+
+
 @pytest.fixture()
 def db() -> QSqlDatabase:
     db_module = _ensure_db_resolver_is_sandboxed()
