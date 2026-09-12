@@ -230,7 +230,7 @@ jobs:
           if [ "$RUNNER_OS" == "Windows" ]; then
             uv pip install msvc-runtime
             uv pip install -U torch==2.8.0+cu129 torchaudio==2.8.0+cu129 --index-url https://download.pytorch.org/whl/cu129
-            uv pip install nvidia-cublas-cu12==12.9.1.4 nvidia-cuda-cupti-cu12==12.9.79 nvidia-cuda-runtime-cu12==12.9.79 --extra-index-url https://pypi.ngc.nvidia.com
+            uv pip install nvidia-cublas-cu12==12.9.1.4 nvidia-cuda-cupti-cu12==12.9.79 nvidia-cuda-runtime-cu12==12.9.79
 
             uv cache clean
             uv run pip cache purge
@@ -275,21 +275,25 @@ jobs:
             sudo pkill -9 XProtect >/dev/null || true;
             while pgrep XProtect; do sleep 3; done;
 
-            CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
-            KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+            if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+              CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+              KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
 
-            echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o $CERTIFICATE_PATH
+              echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o $CERTIFICATE_PATH
 
-            security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-            security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
-            security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+              security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+              security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+              security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
 
-            security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
-            security list-keychain -d user -s $KEYCHAIN_PATH
+              security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+              security list-keychain -d user -s $KEYCHAIN_PATH
 
-            xcrun notarytool store-credentials --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" notarytool --validate
+              xcrun notarytool store-credentials --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" notarytool --validate
 
-            uv run make bundle_mac
+              uv run make bundle_mac
+            else
+              uv run make bundle_mac_unsigned
+            fi
 
           elif [ "$RUNNER_OS" == "Windows" ]; then
 
