@@ -4,6 +4,7 @@ import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
 import sys
+from threading import local
 
 import pytest
 
@@ -20,6 +21,41 @@ from buzz.audio_capture.windows_application_targets import (
     _resolve_capture_pid,
     _validate_windows_application_audio_target,
 )
+
+
+def _install_ctypes_last_error_fallback(monkeypatch, ctypes_api) -> None:
+    state = local()
+
+    def get_last_error() -> int:
+        return getattr(state, "value", 0)
+
+    def set_last_error(value: int) -> int:
+        previous = get_last_error()
+        state.value = int(value)
+        return previous
+
+    monkeypatch.setattr(ctypes_api, "get_last_error", get_last_error, raising=False)
+    monkeypatch.setattr(ctypes_api, "set_last_error", set_last_error, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _portable_ctypes_last_error(monkeypatch):
+    if not hasattr(ctypes, "get_last_error") or not hasattr(ctypes, "set_last_error"):
+        _install_ctypes_last_error_fallback(monkeypatch, ctypes)
+
+
+def test_ctypes_last_error_fallback_is_mutable(monkeypatch) -> None:
+    class CtypesWithoutLastError:
+        pass
+
+    ctypes_api = CtypesWithoutLastError()
+    _install_ctypes_last_error_fallback(monkeypatch, ctypes_api)
+
+    assert ctypes_api.get_last_error() == 0
+    assert ctypes_api.set_last_error(5) == 0
+    assert ctypes_api.get_last_error() == 5
+    assert ctypes_api.set_last_error(7) == 5
+    assert ctypes_api.get_last_error() == 7
 
 
 @dataclass
