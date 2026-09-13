@@ -1016,6 +1016,83 @@ class TestMeetingShutdown:
         adapter.start("meeting.wav", 16000, FinalTranscriptionConfig())
         return adapter
 
+    @pytest.mark.parametrize("outcome", ["completed", "error"])
+    @pytest.mark.parametrize("outcome_first", [True, False])
+    def test_natural_terminal_event_order_is_deterministic(
+        self, outcome, outcome_first
+    ):
+        from buzz.meeting import meeting_transcriber_adapter as module
+
+        adapter = module.MeetingTrackTranscriber()
+        thread = Mock()
+        thread.wait.return_value = False
+        worker = Mock(cleanup_complete=False)
+        adapter._thread = thread
+        adapter._transcriber = worker
+        module._owned_workers.add((thread, worker))
+        completed = []
+        errors = []
+        adapter.track_completed.connect(completed.append)
+        adapter.track_error.connect(errors.append)
+
+        def deliver_outcome(selected_outcome=outcome):
+            if selected_outcome == "completed":
+                adapter._on_completed([])
+            else:
+                adapter._on_error("natural failure")
+
+        def assert_not_terminal():
+            assert completed == []
+            assert errors == []
+            assert adapter._thread is thread
+            assert adapter._transcriber is worker
+
+        if outcome_first:
+            deliver_outcome()
+            assert_not_terminal()
+
+            worker.cleanup_complete = True
+            adapter._try_finalize_natural_terminal()
+            assert_not_terminal()
+
+            adapter._worker_destroyed.set()
+            adapter._try_finalize_natural_terminal()
+            assert_not_terminal()
+
+            thread.wait.return_value = True
+            adapter._on_thread_finished()
+        else:
+            worker.cleanup_complete = True
+            adapter._worker_destroyed.set()
+            thread.wait.return_value = True
+            adapter._on_thread_finished()
+            assert_not_terminal()
+
+            deliver_outcome()
+
+        assert adapter._thread is None
+        assert adapter._transcriber is None
+        assert adapter._pending_result is None
+        assert adapter._terminal_emitted
+        assert (thread, worker) not in module._owned_workers
+        thread.wait.assert_any_call(0)
+        thread.deleteLater.assert_called_once_with()
+        if outcome == "completed":
+            assert completed == [[]]
+            assert errors == []
+        else:
+            assert completed == []
+            assert errors == ["natural failure"]
+
+        deliver_outcome()
+        deliver_outcome("error" if outcome == "completed" else "completed")
+        if outcome == "completed":
+            assert completed == [[]]
+            assert errors == []
+        else:
+            assert completed == []
+            assert errors == ["natural failure"]
+
     def test_normal_completion_destroys_worker_on_owner_thread(
         self, qtbot, monkeypatch
     ):
