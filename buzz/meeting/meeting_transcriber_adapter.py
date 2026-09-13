@@ -9,13 +9,12 @@ from __future__ import annotations
 import logging
 from threading import Event, Thread
 from time import monotonic
-from typing import Optional
+from typing import Any, Optional
 
 from PyQt6.QtCore import (
     QMetaObject,
     QObject,
     QThread,
-    QTimer,
     Qt,
     pyqtSignal,
     pyqtSlot,
@@ -77,7 +76,8 @@ class MeetingTrackTranscriber(QObject):
         self._stop_thread: Optional[Thread] = None
         self._worker_destroyed = Event()
         self._dispose_requested = False
-        self._pending_result = None
+        self._pending_result: Optional[tuple[str, Any, Optional[int], tuple]] = None
+        self._terminal_emitted = False
 
     def start(
         self,
@@ -125,6 +125,7 @@ class MeetingTrackTranscriber(QObject):
         self._thread = QThread()
         self._worker_destroyed.clear()
         self._dispose_requested = False
+        self._terminal_emitted = False
         _owned_workers.add((self._thread, self._transcriber))
         self._transcriber.moveToThread(self._thread)
 
@@ -235,14 +236,33 @@ class MeetingTrackTranscriber(QObject):
     def _on_thread_finished(self) -> None:
         if self._shutdown_requested or self._thread is None:
             return
-        if not self._worker_destroyed.is_set() or not self._thread.wait(0):
-            QTimer.singleShot(1, self._on_thread_finished)
+
+        # AutoConnection queues this slot to the adapter's affinity thread,
+        # never the QThread being joined. ``finished`` is emitted immediately
+        # before native thread exit, so complete that join here.
+        self._thread.wait()
+        self._try_finalize_natural_terminal()
+
+    def _try_finalize_natural_terminal(self) -> None:
+        """Release and emit once every natural terminal condition is true."""
+        if (
+            self._shutdown_requested
+            or self._terminal_emitted
+            or self._thread is None
+            or self._transcriber is None
+            or self._pending_result is None
+        ):
             return
+        if (
+            not self._transcriber.cleanup_complete
+            or not self._worker_destroyed.is_set()
+            or not self._thread.wait(0)
+        ):
+            return
+
         pending = self._pending_result
-        if pending is None:
-            QTimer.singleShot(1, self._on_thread_finished)
-            return
         kind, value, profile_version, detailed_words = pending
+        self._terminal_emitted = True
         self._release_worker()
         if kind == "completed":
             self._emit_completed(value, profile_version, detailed_words)
@@ -251,7 +271,7 @@ class MeetingTrackTranscriber(QObject):
 
     @pyqtSlot(list)
     def _on_completed(self, segments: list[Segment]) -> None:
-        if self._shutdown_requested:
+        if self._shutdown_requested or self._terminal_emitted:
             return  # Suppress callback during intentional shutdown
         profile_version = self._active_profile_version
         detailed_words = (
@@ -260,16 +280,19 @@ class MeetingTrackTranscriber(QObject):
             else ()
         )
         if self._thread is None:
+            self._terminal_emitted = True
             self._transcriber = None
             self._active_profile_version = None
             self._emit_completed(segments, profile_version, detailed_words)
             return
-        self._pending_result = (
-            "completed",
-            segments,
-            profile_version,
-            detailed_words,
-        )
+        if self._pending_result is None:
+            self._pending_result = (
+                "completed",
+                segments,
+                profile_version,
+                detailed_words,
+            )
+        self._try_finalize_natural_terminal()
 
     def _emit_completed(
         self,
@@ -314,14 +337,17 @@ class MeetingTrackTranscriber(QObject):
     @pyqtSlot(str)
     def _on_error(self, error: str) -> None:
         """Queue an error until worker destruction and thread exit are verified."""
-        if self._shutdown_requested:
+        if self._shutdown_requested or self._terminal_emitted:
             return  # Suppress callback during intentional shutdown
         if self._thread is None:
+            self._terminal_emitted = True
             self._transcriber = None
             self._active_profile_version = None
             self.track_error.emit(error)
             return
-        self._pending_result = ("error", error, None, ())
+        if self._pending_result is None:
+            self._pending_result = ("error", error, None, ())
+        self._try_finalize_natural_terminal()
 
     @staticmethod
     def _resolve_model_type(model_type_str: str) -> ModelType:
