@@ -13,9 +13,22 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = "Build-BuzzMeeting-Installer-V4.cmd"
 
 
+def isolated_git_environment():
+    env = os.environ.copy()
+    for name in tuple(env):
+        if name.startswith("GIT_"):
+            env.pop(name)
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    return env
+
+
 def git(root, *args):
     return subprocess.check_output(
-        ["git", "-C", str(root), *args], text=True, stderr=subprocess.STDOUT
+        ["git", "-C", str(root), *args],
+        text=True,
+        stderr=subprocess.STDOUT,
+        env=isolated_git_environment(),
     ).strip()
 
 
@@ -23,11 +36,17 @@ def git(root, *args):
 def release_repo(tmp_path):
     remote = tmp_path / "remote.git"
     subprocess.run(
-        ["git", "init", "--bare", str(remote)], check=True, capture_output=True
+        ["git", "init", "--bare", str(remote)],
+        check=True,
+        capture_output=True,
+        env=isolated_git_environment(),
     )
     seed = tmp_path / "seed"
     subprocess.run(
-        ["git", "init", "-b", "main", str(seed)], check=True, capture_output=True
+        ["git", "init", "-b", "main", str(seed)],
+        check=True,
+        capture_output=True,
+        env=isolated_git_environment(),
     )
     git(seed, "config", "user.email", "test@example.invalid")
     git(seed, "config", "user.name", "Release gate fixture")
@@ -45,6 +64,7 @@ def release_repo(tmp_path):
         ["git", "clone", "-b", "main", str(remote), str(clone)],
         check=True,
         capture_output=True,
+        env=isolated_git_environment(),
     )
     git(clone, "branch", "-m", "holding")
     git(clone, "worktree", "add", "-b", "main", str(checkout), "origin/main")
@@ -53,7 +73,7 @@ def release_repo(tmp_path):
 
 
 def invoke(checkout, sha=None, *, tools=None):
-    env = os.environ.copy()
+    env = isolated_git_environment()
     # Keep actual Git/CMD/PowerShell. Deliberately omit build tools so even the
     # successful validation branch cannot build/install from this test fixture.
     system = Path(os.environ["SystemRoot"]) / "System32"
@@ -140,6 +160,16 @@ def test_validated_sha_gate(release_repo, case):
         git(seed, "push", "origin", "main")
         sha = git(seed, "rev-parse", "HEAD")
         requested_sha = sha
+        remote = Path(git(seed, "remote", "get-url", "origin"))
+        assert git(remote, "rev-parse", "refs/heads/main") == sha
+        git(
+            checkout,
+            "fetch",
+            "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+        )
+        assert git(checkout, "rev-parse", "origin/main") == sha
+        git(checkout, "merge-base", "--is-ancestor", "HEAD", "origin/main")
         if case == "head-changed-during-update":
             hooks = checkout.parent / "hooks"
             hooks.mkdir()
@@ -148,6 +178,7 @@ def test_validated_sha_gate(release_repo, case):
                 "git -c user.name=fixture -c user.email=test@example.invalid "
                 "commit --allow-empty --no-verify -m unvalidated\n",
                 encoding="utf-8",
+                newline="\n",
             )
             git(checkout, "config", "core.hooksPath", str(hooks))
             expected = "Local HEAD did not reach validated target"

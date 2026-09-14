@@ -87,31 +87,60 @@ class TestRecordingTranscriberWidget:
         platform.system() == "Darwin" and platform.mac_ver()[0].startswith('13.'),
         reason="Does not pick up mock sound device")
     def test_should_transcribe(self, qtbot):
-        with (patch(
+        with (patch("sounddevice.InputStream", side_effect=MockInputStream),
+              patch(
                   "buzz.transcriber.recording_transcriber.RecordingTranscriber.get_device_sample_rate",
-                  return_value=16_000)):
+                  return_value=16_000),
+              patch(
+                  "buzz.model_loader.TranscriptionModel.get_local_model_path",
+                  return_value="/synthetic/ready-model"),
+              patch(
+                  "buzz.widgets.recording_transcriber_widget.ModelDownloader"
+              ) as downloader_class,
+              patch(
+                  "buzz.transcriber.recording_transcriber.RecordingTranscriber._load_model",
+                  return_value=object()) as load_model,
+              patch(
+                  "buzz.transcriber.recording_transcriber.RecordingTranscriber._transcribe",
+                  return_value={"text": "deterministic widget transcript"}
+              ) as transcribe):
 
             widget = RecordingTranscriberWidget(
                 custom_sounddevice=MockSoundDevice()
             )
+            widget.selected_device_id = 0
+            widget.reset_recording_amplitude_listener()
             widget.device_sample_rate = 16_000
             qtbot.add_widget(widget)
 
-            assert len(widget.transcription_text_box.toPlainText()) == 0
-
-            def assert_text_box_contains_text():
-                assert len(widget.transcription_text_box.toPlainText()) > 0
+            initial_preview = widget.recording_amplitude_listener
+            assert initial_preview is not None
+            initial_preview_stream = initial_preview.stream
+            assert initial_preview_stream is not None
+            assert initial_preview_stream.thread.is_alive()
+            assert widget.transcription_text_box.toPlainText() == ""
 
             widget.record_button.click()
-            qtbot.wait_until(callback=assert_text_box_contains_text, timeout=60 * 1000)
 
-            assert len(widget.transcription_text_box.toPlainText()) > 0
+            assert widget.recording_amplitude_listener is None
+            assert not initial_preview_stream.thread.is_alive()
+            qtbot.waitUntil(
+                lambda: widget.transcription_text_box.toPlainText()
+                == "deterministic widget transcript",
+                timeout=60 * 1000,
+            )
+
+            downloader_class.assert_not_called()
+            load_model.assert_called_once_with()
+            assert transcribe.call_count >= 1
+            assert widget.transcription_text_box.toPlainText()
             _close_recording_widget_after_worker_shutdown(qtbot, widget)
 
     @pytest.mark.skipif(
         platform.system() == "Darwin" and platform.mac_ver()[0].startswith('13.'),
         reason="Does not pick up mock sound device")
     def test_should_transcribe_and_export(self, qtbot):
+        expected_transcript = "deterministic exported widget transcript"
         settings = Settings()
         settings.set_value(
             Settings.Key.RECORDING_TRANSCRIBER_EXPORT_FOLDER,
@@ -123,38 +152,69 @@ class TestRecordingTranscriberWidget:
         except FileNotFoundError:
             pass
 
-        with (patch(
+        with (patch("sounddevice.InputStream", side_effect=MockInputStream),
+              patch(
                   "buzz.transcriber.recording_transcriber.RecordingTranscriber.get_device_sample_rate",
                   return_value=16_000),
+              patch(
+                  "buzz.model_loader.TranscriptionModel.get_local_model_path",
+                  return_value="/synthetic/ready-model"),
+              patch(
+                  "buzz.widgets.recording_transcriber_widget.ModelDownloader"
+              ) as downloader_class,
+              patch(
+                  "buzz.transcriber.recording_transcriber.RecordingTranscriber._load_model",
+                  return_value=object()) as load_model,
+              patch(
+                  "buzz.transcriber.recording_transcriber.RecordingTranscriber._transcribe",
+                  return_value={"text": expected_transcript}
+              ) as transcribe,
               patch(
                   'buzz.settings.settings.Settings.get_default_export_file_template',
                   return_value='mock-export-file'),
               patch("sounddevice.query_devices", side_effect=MockSoundDevice().query_devices),
-              patch("sounddevice.check_input_settings", side_effect=MockSoundDevice().check_input_settings),
-              patch("sounddevice.InputStream", side_effect=MockSoundDevice().InputStream)):
+              patch("sounddevice.check_input_settings", side_effect=MockSoundDevice().check_input_settings)):
 
             widget = RecordingTranscriberWidget(
                 custom_sounddevice=MockSoundDevice()
             )
+            widget.selected_device_id = 0
+            widget.reset_recording_amplitude_listener()
             widget.device_sample_rate = 16_000
             widget.export_enabled = True
             qtbot.add_widget(widget)
 
-            assert len(widget.transcription_text_box.toPlainText()) == 0
-
-            def assert_text_box_contains_text():
-                assert len(widget.transcription_text_box.toPlainText()) > 0
+            initial_preview = widget.recording_amplitude_listener
+            assert initial_preview is not None
+            initial_preview_stream = initial_preview.stream
+            assert initial_preview_stream is not None
+            assert initial_preview_stream.thread.is_alive()
+            assert widget.transcription_text_box.toPlainText() == ""
 
             widget.record_button.click()
-            qtbot.wait_until(callback=assert_text_box_contains_text, timeout=60 * 1000)
 
-            assert len(widget.transcription_text_box.toPlainText()) > 0
+            assert widget.recording_amplitude_listener is None
+            assert not initial_preview_stream.thread.is_alive()
+            qtbot.waitUntil(
+                lambda: expected_transcript
+                in widget.transcription_text_box.toPlainText(),
+                timeout=60 * 1000,
+            )
+
+            downloader_class.assert_not_called()
+            load_model.assert_called_once_with()
+            assert transcribe.call_count >= 1
+            assert expected_transcript in widget.transcription_text_box.toPlainText()
 
             with open(widget.transcript_export_file, 'r') as file:
                 contents = file.read()
                 assert len(contents) > 0
+                assert expected_transcript in contents
 
             _close_recording_widget_after_worker_shutdown(qtbot, widget)
+            assert widget.transcriber is None
+            assert widget.transcription_thread is None
+            assert widget.recording_amplitude_listener is None
 
     @pytest.mark.timeout(60)
     def test_on_next_transcription_append_above(self, qtbot: QtBot):
