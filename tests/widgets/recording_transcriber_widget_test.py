@@ -1093,11 +1093,17 @@ class TestRecordingTranscriberWidgetPresentation:
 import contextlib
 
 @contextlib.contextmanager
-def _widget_ctx(qtbot):
+def _widget_ctx(qtbot, *, platform_name="win32", windows_build=20_348):
     with (patch("sounddevice.InputStream", side_effect=MockInputStream),
           patch("buzz.transcriber.recording_transcriber.RecordingTranscriber.get_device_sample_rate",
                 return_value=16_000),
-          patch("sounddevice.check_input_settings")):
+          patch("sounddevice.check_input_settings"),
+          patch("buzz.widgets.recording_transcriber_widget.sys.platform", platform_name),
+          patch(
+              "buzz.widgets.recording_transcriber_widget.sys.getwindowsversion",
+              return_value=SimpleNamespace(build=windows_build),
+              create=True,
+          )):
         widget = RecordingTranscriberWidget(custom_sounddevice=MockSoundDevice())
         qtbot.add_widget(widget)
         yield widget
@@ -1275,10 +1281,7 @@ class TestAudioSourceSelection:
 
     @pytest.mark.timeout(60)
     def test_windows_build_20347_hides_only_application_audio(self, qtbot):
-        with patch(
-            "buzz.widgets.recording_transcriber_widget.sys.getwindowsversion",
-            return_value=SimpleNamespace(build=20_347),
-        ), _widget_ctx(qtbot) as widget:
+        with _widget_ctx(qtbot, windows_build=20_347) as widget:
             options = [
                 widget.audio_source_combo_box.itemText(index)
                 for index in range(widget.audio_source_combo_box.count())
@@ -1288,9 +1291,7 @@ class TestAudioSourceSelection:
 
     @pytest.mark.timeout(60)
     def test_non_windows_selector_has_no_system_audio(self, qtbot):
-        with patch(
-            "buzz.widgets.recording_transcriber_widget.sys.platform", "linux"
-        ), _widget_ctx(qtbot) as widget:
+        with _widget_ctx(qtbot, platform_name="linux") as widget:
             options = [
                 widget.audio_source_combo_box.itemText(index)
                 for index in range(widget.audio_source_combo_box.count())

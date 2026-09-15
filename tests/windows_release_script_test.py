@@ -171,16 +171,25 @@ def test_validated_sha_gate(release_repo, case):
         assert git(checkout, "rev-parse", "origin/main") == sha
         git(checkout, "merge-base", "--is-ancestor", "HEAD", "origin/main")
         if case == "head-changed-during-update":
-            hooks = checkout.parent / "hooks"
-            hooks.mkdir()
-            (hooks / "post-merge").write_text(
+            hooks = Path(
+                git(
+                    checkout,
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "hooks",
+                )
+            )
+            hooks.mkdir(parents=True, exist_ok=True)
+            post_merge_hook = hooks / "post-merge"
+            post_merge_hook.write_text(
                 "#!/bin/sh\n"
                 "git -c user.name=fixture -c user.email=test@example.invalid "
                 "commit --allow-empty --no-verify -m unvalidated\n",
                 encoding="utf-8",
                 newline="\n",
             )
-            git(checkout, "config", "core.hooksPath", str(hooks))
+            post_merge_hook.chmod(0o755)
             expected = "Local HEAD did not reach validated target"
     elif case == "fetch-failed":
         git(checkout, "remote", "set-url", "origin", str(checkout / "absent.git"))
@@ -194,6 +203,7 @@ def test_validated_sha_gate(release_repo, case):
     assert "[7/8]" not in output, "Build reached without validation/tool prerequisites"
     head = git(checkout, "rev-parse", "HEAD")
     if case == "head-changed-during-update":
+        assert "uv is not available on PATH" not in output
         assert head not in {before, sha}  # The synthetic hook really ran.
     else:
         assert head == (sha if case == "fast-forward" else before)
