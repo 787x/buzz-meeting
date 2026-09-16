@@ -1,4 +1,5 @@
 import os
+import sys
 import threading
 import time
 import weakref
@@ -1094,16 +1095,15 @@ import contextlib
 
 @contextlib.contextmanager
 def _widget_ctx(qtbot, *, platform_name="win32", windows_build=20_348):
+    simulated_sys = SimpleNamespace(
+        platform=platform_name,
+        getwindowsversion=lambda: SimpleNamespace(build=windows_build),
+    )
     with (patch("sounddevice.InputStream", side_effect=MockInputStream),
           patch("buzz.transcriber.recording_transcriber.RecordingTranscriber.get_device_sample_rate",
                 return_value=16_000),
           patch("sounddevice.check_input_settings"),
-          patch("buzz.widgets.recording_transcriber_widget.sys.platform", platform_name),
-          patch(
-              "buzz.widgets.recording_transcriber_widget.sys.getwindowsversion",
-              return_value=SimpleNamespace(build=windows_build),
-              create=True,
-          )):
+          patch("buzz.widgets.recording_transcriber_widget.sys", simulated_sys)):
         widget = RecordingTranscriberWidget(custom_sounddevice=MockSoundDevice())
         qtbot.add_widget(widget)
         yield widget
@@ -1264,6 +1264,18 @@ class TestOnDeviceChanged:
 
 
 class TestAudioSourceSelection:
+    @pytest.mark.timeout(60)
+    def test_simulated_windows_platform_is_module_local(self, qtbot):
+        from buzz.widgets import recording_transcriber_widget as widget_module
+
+        physical_platform = sys.platform
+        with _widget_ctx(qtbot) as widget:
+            assert widget_module.sys.platform == "win32"
+            assert sys.platform == physical_platform
+            assert widget.audio_source_combo_box.count() == 3
+
+        assert sys.platform == physical_platform
+
     @pytest.mark.timeout(60)
     def test_supported_windows_selector_has_all_three_sources(self, qtbot):
         with _widget_ctx(qtbot) as widget:

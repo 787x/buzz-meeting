@@ -4,7 +4,9 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
+from distlib.scripts import ScriptMaker
 import pytest
 import yaml
 
@@ -181,15 +183,29 @@ def test_validated_sha_gate(release_repo, case):
                 )
             )
             hooks.mkdir(parents=True, exist_ok=True)
-            post_merge_hook = hooks / "post-merge"
-            post_merge_hook.write_text(
-                "#!/bin/sh\n"
-                "git -c user.name=fixture -c user.email=test@example.invalid "
-                "commit --allow-empty --no-verify -m unvalidated\n",
+            hook_source = checkout.parent / "post_merge_hook.py"
+            hook_source.write_text(
+                "#!python\n"
+                "import subprocess\n"
+                "subprocess.run(\n"
+                "    [\n"
+                "        'git', '-c', 'user.name=fixture',\n"
+                "        '-c', 'user.email=test@example.invalid',\n"
+                "        'commit', '--allow-empty', '--no-verify',\n"
+                "        '-m', 'unvalidated',\n"
+                "    ],\n"
+                "    check=True,\n"
+                ")\n",
                 encoding="utf-8",
                 newline="\n",
             )
-            post_merge_hook.chmod(0o755)
+            maker = ScriptMaker(str(checkout.parent), str(hooks))
+            maker.executable = str(Path(sys.executable).resolve())
+            maker.variants = {""}
+            [launcher] = maker.make(hook_source.name)
+            post_merge_hook = hooks / "post-merge"
+            Path(launcher).replace(post_merge_hook)
+            assert post_merge_hook.read_bytes().startswith(b"MZ")
             expected = "Local HEAD did not reach validated target"
     elif case == "fetch-failed":
         git(checkout, "remote", "set-url", "origin", str(checkout / "absent.git"))
@@ -205,6 +221,8 @@ def test_validated_sha_gate(release_repo, case):
     if case == "head-changed-during-update":
         assert "uv is not available on PATH" not in output
         assert head not in {before, sha}  # The synthetic hook really ran.
+        assert git(checkout, "rev-parse", "HEAD^") == sha
+        assert git(checkout, "log", "-1", "--pretty=%s") == "unvalidated"
     else:
         assert head == (sha if case == "fast-forward" else before)
     assert git(checkout, "status", "--porcelain") == dirt
