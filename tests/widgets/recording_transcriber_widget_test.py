@@ -1336,8 +1336,17 @@ class TestAudioSourceSelection:
     @pytest.mark.timeout(60)
     def test_switching_back_to_microphone_restarts_preview(self, qtbot):
         with _widget_ctx(qtbot) as widget:
+            widget.selected_device_id = 0
+            widget.reset_recording_amplitude_listener()
+            initial_listener = widget.recording_amplitude_listener
+            assert initial_listener is not None
+            initial_stream = initial_listener.stream
+            assert initial_stream is not None
+            assert initial_stream.thread.is_alive()
+
             widget.audio_source_combo_box.setCurrentIndex(1)
             assert widget.recording_amplitude_listener is None
+            assert not initial_stream.thread.is_alive()
 
             with patch(
                 "buzz.widgets.recording_transcriber_widget.RecordingAmplitudeListener"
@@ -1345,10 +1354,11 @@ class TestAudioSourceSelection:
                 widget.audio_source_combo_box.setCurrentIndex(0)
 
             listener_class.assert_called_once_with(
-                input_device_index=widget.selected_device_id,
+                input_device_index=0,
                 parent=widget,
             )
             listener_class.return_value.start_recording.assert_called_once_with()
+            assert widget.recording_amplitude_listener is listener_class.return_value
             assert not widget.audio_devices_combo_box.isHidden()
             assert widget.audio_meter_widget.isEnabled()
 

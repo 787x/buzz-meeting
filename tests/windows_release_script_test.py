@@ -34,6 +34,33 @@ def git(root, *args):
     ).strip()
 
 
+def controlled_environment(*, tools=None):
+    env = isolated_git_environment()
+    git_executable = Path(shutil.which("git")).resolve()
+    git_exec_path = Path(
+        subprocess.check_output(
+            [str(git_executable), "--exec-path"],
+            text=True,
+            env=env,
+        ).strip()
+    ).resolve()
+    git_runtime_path = git_exec_path.parents[2] / "usr" / "bin"
+    assert (git_exec_path / "git-submodule").is_file()
+    assert (git_runtime_path / "sh.exe").is_file()
+
+    system = Path(os.environ["SystemRoot"]) / "System32"
+    path = [
+        *([str(tools)] if tools is not None else []),
+        str(git_executable.parent),
+        str(git_exec_path),
+        str(git_runtime_path),
+        str(system),
+        str(system / "WindowsPowerShell" / "v1.0"),
+    ]
+    env["PATH"] = os.pathsep.join(path)
+    return env
+
+
 @pytest.fixture
 def release_repo(tmp_path):
     remote = tmp_path / "remote.git"
@@ -75,19 +102,10 @@ def release_repo(tmp_path):
 
 
 def invoke(checkout, sha=None, *, tools=None):
-    env = isolated_git_environment()
+    env = controlled_environment(tools=tools)
     # Keep actual Git/CMD/PowerShell. Deliberately omit build tools so even the
     # successful validation branch cannot build/install from this test fixture.
     system = Path(os.environ["SystemRoot"]) / "System32"
-    path = [
-        *([str(tools)] if tools is not None else []),
-        *[
-            str(Path(shutil.which("git")).parent),
-            str(system),
-            str(system / "WindowsPowerShell" / "v1.0"),
-        ],
-    ]
-    env["PATH"] = os.pathsep.join(path)
     if sha is None:
         env.pop("BUZZ_VALIDATED_SHA", None)
     else:
@@ -340,9 +358,13 @@ def test_valid_sha_build_runs_in_resolved_worktree(release_repo):
         Path(os.environ["SystemRoot"]) / "System32" / "where.exe",
         dist / "Buzz-1.4.5-windows.exe",
     )
+    controlled_path = controlled_environment(tools=tools)["PATH"]
+    for name in ("uv", "make", "cmake", "iscc"):
+        assert Path(shutil.which(name, path=controlled_path)).parent == tools
     result = invoke(checkout, sha, tools=tools)
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
+    assert "[2/8] Initializing repository submodules" in output
     assert "[7/8]" in output
     observed = Path((checkout / "observed-build-cwd.txt").read_text().strip())
     assert observed.resolve() == checkout.resolve()
