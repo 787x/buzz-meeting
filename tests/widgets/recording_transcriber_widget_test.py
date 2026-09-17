@@ -1315,12 +1315,18 @@ class TestAudioSourceSelection:
     @pytest.mark.timeout(60)
     def test_selecting_system_stops_mic_preview_and_disables_idle_meter(self, qtbot):
         with _widget_ctx(qtbot) as widget:
+            widget.selected_device_id = 0
+            widget.reset_recording_amplitude_listener()
             listener = widget.recording_amplitude_listener
             assert listener is not None
+            preview_stream = listener.stream
+            assert preview_stream is not None
+            assert preview_stream.thread.is_alive()
             with patch.object(listener, "stop_recording", wraps=listener.stop_recording) as stop:
                 widget.audio_source_combo_box.setCurrentIndex(1)
 
             stop.assert_called_once_with()
+            assert not preview_stream.thread.is_alive()
             assert widget.recording_amplitude_listener is None
             assert widget.audio_devices_combo_box.isHidden()
             assert widget.microphone_label.isHidden()

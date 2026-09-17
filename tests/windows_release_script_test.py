@@ -208,15 +208,39 @@ def test_validated_sha_gate(release_repo, case):
             assert post_merge_hook.read_bytes().startswith(b"MZ")
             expected = "Local HEAD did not reach validated target"
     elif case == "fetch-failed":
-        git(checkout, "remote", "set-url", "origin", str(checkout / "absent.git"))
+        fetch_probe = checkout.parent / "fetch-failure-observed.txt"
+        helper_source = checkout.parent / "git_remote_fixturefail.py"
+        helper_source.write_text(
+            "#!python\n"
+            "from pathlib import Path\n"
+            f"Path({str(fetch_probe)!r}).write_text('fetch attempted', encoding='utf-8')\n"
+            "raise SystemExit(97)\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        tools = checkout.parent / "controlled fetch tools"
+        tools.mkdir()
+        maker = ScriptMaker(str(checkout.parent), str(tools))
+        maker.executable = str(Path(sys.executable).resolve())
+        maker.variants = {""}
+        [launcher] = maker.make(helper_source.name)
+        Path(launcher).replace(tools / "git-remote-fixturefail.exe")
+        git(checkout, "remote", "set-url", "origin", "fixturefail::controlled")
         expected = "update/build process failed"
     before = git(checkout, "rev-parse", "HEAD")
     dirt = git(checkout, "status", "--porcelain")
-    result = invoke(checkout, requested_sha)
+    result = invoke(
+        checkout,
+        requested_sha,
+        tools=tools if case == "fetch-failed" else None,
+    )
     output = result.stdout + result.stderr
     assert result.returncode == 1, output
     assert expected in output, output
     assert "[7/8]" not in output, "Build reached without validation/tool prerequisites"
+    if case == "fetch-failed":
+        assert fetch_probe.read_text(encoding="utf-8") == "fetch attempted"
+        assert "uv is not available on PATH" not in output
     head = git(checkout, "rev-parse", "HEAD")
     if case == "head-changed-during-update":
         assert "uv is not available on PATH" not in output
