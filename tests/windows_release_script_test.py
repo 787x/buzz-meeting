@@ -4,7 +4,9 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
+from distlib.scripts import ScriptMaker
 import pytest
 import yaml
 
@@ -13,21 +15,67 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = "Build-BuzzMeeting-Installer-V4.cmd"
 
 
+def isolated_git_environment():
+    env = os.environ.copy()
+    for name in tuple(env):
+        if name.startswith("GIT_"):
+            env.pop(name)
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    return env
+
+
 def git(root, *args):
     return subprocess.check_output(
-        ["git", "-C", str(root), *args], text=True, stderr=subprocess.STDOUT
+        ["git", "-C", str(root), *args],
+        text=True,
+        stderr=subprocess.STDOUT,
+        env=isolated_git_environment(),
     ).strip()
+
+
+def controlled_environment(*, tools=None):
+    env = isolated_git_environment()
+    git_executable = Path(shutil.which("git")).resolve()
+    git_exec_path = Path(
+        subprocess.check_output(
+            [str(git_executable), "--exec-path"],
+            text=True,
+            env=env,
+        ).strip()
+    ).resolve()
+    git_runtime_path = git_exec_path.parents[2] / "usr" / "bin"
+    assert (git_exec_path / "git-submodule").is_file()
+    assert (git_runtime_path / "sh.exe").is_file()
+
+    system = Path(os.environ["SystemRoot"]) / "System32"
+    path = [
+        *([str(tools)] if tools is not None else []),
+        str(git_executable.parent),
+        str(git_exec_path),
+        str(git_runtime_path),
+        str(system),
+        str(system / "WindowsPowerShell" / "v1.0"),
+    ]
+    env["PATH"] = os.pathsep.join(path)
+    return env
 
 
 @pytest.fixture
 def release_repo(tmp_path):
     remote = tmp_path / "remote.git"
     subprocess.run(
-        ["git", "init", "--bare", str(remote)], check=True, capture_output=True
+        ["git", "init", "--bare", str(remote)],
+        check=True,
+        capture_output=True,
+        env=isolated_git_environment(),
     )
     seed = tmp_path / "seed"
     subprocess.run(
-        ["git", "init", "-b", "main", str(seed)], check=True, capture_output=True
+        ["git", "init", "-b", "main", str(seed)],
+        check=True,
+        capture_output=True,
+        env=isolated_git_environment(),
     )
     git(seed, "config", "user.email", "test@example.invalid")
     git(seed, "config", "user.name", "Release gate fixture")
@@ -45,6 +93,7 @@ def release_repo(tmp_path):
         ["git", "clone", "-b", "main", str(remote), str(clone)],
         check=True,
         capture_output=True,
+        env=isolated_git_environment(),
     )
     git(clone, "branch", "-m", "holding")
     git(clone, "worktree", "add", "-b", "main", str(checkout), "origin/main")
@@ -53,19 +102,10 @@ def release_repo(tmp_path):
 
 
 def invoke(checkout, sha=None, *, tools=None):
-    env = os.environ.copy()
+    env = controlled_environment(tools=tools)
     # Keep actual Git/CMD/PowerShell. Deliberately omit build tools so even the
     # successful validation branch cannot build/install from this test fixture.
     system = Path(os.environ["SystemRoot"]) / "System32"
-    path = [
-        *([str(tools)] if tools is not None else []),
-        *[
-            str(Path(shutil.which("git")).parent),
-            str(system),
-            str(system / "WindowsPowerShell" / "v1.0"),
-        ],
-    ]
-    env["PATH"] = os.pathsep.join(path)
     if sha is None:
         env.pop("BUZZ_VALIDATED_SHA", None)
     else:
@@ -140,30 +180,91 @@ def test_validated_sha_gate(release_repo, case):
         git(seed, "push", "origin", "main")
         sha = git(seed, "rev-parse", "HEAD")
         requested_sha = sha
+        remote = Path(git(seed, "remote", "get-url", "origin"))
+        assert git(remote, "rev-parse", "refs/heads/main") == sha
+        git(
+            checkout,
+            "fetch",
+            "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+        )
+        assert git(checkout, "rev-parse", "origin/main") == sha
+        git(checkout, "merge-base", "--is-ancestor", "HEAD", "origin/main")
         if case == "head-changed-during-update":
-            hooks = checkout.parent / "hooks"
-            hooks.mkdir()
-            (hooks / "post-merge").write_text(
-                "#!/bin/sh\n"
-                "git -c user.name=fixture -c user.email=test@example.invalid "
-                "commit --allow-empty --no-verify -m unvalidated\n",
-                encoding="utf-8",
+            hooks = Path(
+                git(
+                    checkout,
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "hooks",
+                )
             )
-            git(checkout, "config", "core.hooksPath", str(hooks))
+            hooks.mkdir(parents=True, exist_ok=True)
+            hook_source = checkout.parent / "post_merge_hook.py"
+            hook_source.write_text(
+                "#!python\n"
+                "import subprocess\n"
+                "subprocess.run(\n"
+                "    [\n"
+                "        'git', '-c', 'user.name=fixture',\n"
+                "        '-c', 'user.email=test@example.invalid',\n"
+                "        'commit', '--allow-empty', '--no-verify',\n"
+                "        '-m', 'unvalidated',\n"
+                "    ],\n"
+                "    check=True,\n"
+                ")\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            maker = ScriptMaker(str(checkout.parent), str(hooks))
+            maker.executable = str(Path(sys.executable).resolve())
+            maker.variants = {""}
+            [launcher] = maker.make(hook_source.name)
+            post_merge_hook = hooks / "post-merge"
+            Path(launcher).replace(post_merge_hook)
+            assert post_merge_hook.read_bytes().startswith(b"MZ")
             expected = "Local HEAD did not reach validated target"
     elif case == "fetch-failed":
-        git(checkout, "remote", "set-url", "origin", str(checkout / "absent.git"))
+        fetch_probe = checkout.parent / "fetch-failure-observed.txt"
+        helper_source = checkout.parent / "git_remote_fixturefail.py"
+        helper_source.write_text(
+            "#!python\n"
+            "from pathlib import Path\n"
+            f"Path({str(fetch_probe)!r}).write_text('fetch attempted', encoding='utf-8')\n"
+            "raise SystemExit(97)\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        tools = checkout.parent / "controlled fetch tools"
+        tools.mkdir()
+        maker = ScriptMaker(str(checkout.parent), str(tools))
+        maker.executable = str(Path(sys.executable).resolve())
+        maker.variants = {""}
+        [launcher] = maker.make(helper_source.name)
+        Path(launcher).replace(tools / "git-remote-fixturefail.exe")
+        git(checkout, "remote", "set-url", "origin", "fixturefail::controlled")
         expected = "update/build process failed"
     before = git(checkout, "rev-parse", "HEAD")
     dirt = git(checkout, "status", "--porcelain")
-    result = invoke(checkout, requested_sha)
+    result = invoke(
+        checkout,
+        requested_sha,
+        tools=tools if case == "fetch-failed" else None,
+    )
     output = result.stdout + result.stderr
     assert result.returncode == 1, output
     assert expected in output, output
     assert "[7/8]" not in output, "Build reached without validation/tool prerequisites"
+    if case == "fetch-failed":
+        assert fetch_probe.read_text(encoding="utf-8") == "fetch attempted"
+        assert "uv is not available on PATH" not in output
     head = git(checkout, "rev-parse", "HEAD")
     if case == "head-changed-during-update":
+        assert "uv is not available on PATH" not in output
         assert head not in {before, sha}  # The synthetic hook really ran.
+        assert git(checkout, "rev-parse", "HEAD^") == sha
+        assert git(checkout, "log", "-1", "--pretty=%s") == "unvalidated"
     else:
         assert head == (sha if case == "fast-forward" else before)
     assert git(checkout, "status", "--porcelain") == dirt
@@ -257,9 +358,13 @@ def test_valid_sha_build_runs_in_resolved_worktree(release_repo):
         Path(os.environ["SystemRoot"]) / "System32" / "where.exe",
         dist / "Buzz-1.4.5-windows.exe",
     )
+    controlled_path = controlled_environment(tools=tools)["PATH"]
+    for name in ("uv", "make", "cmake", "iscc"):
+        assert Path(shutil.which(name, path=controlled_path)).parent == tools
     result = invoke(checkout, sha, tools=tools)
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
+    assert "[2/8] Initializing repository submodules" in output
     assert "[7/8]" in output
     observed = Path((checkout / "observed-build-cwd.txt").read_text().strip())
     assert observed.resolve() == checkout.resolve()

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
-from PyQt6.QtCore import QCoreApplication
+from PyQt6 import sip
+from PyQt6.QtCore import QCoreApplication, QObject, QThread, Qt, pyqtSlot
 
 from buzz.meeting.final_transcription import (
     FinalTranscriptionConfig,
@@ -145,38 +147,86 @@ class TestAdapterSignals:
         from unittest.mock import Mock
         from buzz.meeting import meeting_transcriber_adapter as module
 
+        entered = Event()
+        release = Event()
+
+        class ControlledWorker(QObject):
+            def __init__(self) -> None:
+                super().__init__()
+                self.cleanup_complete = True
+                self.request_cancel = Mock()
+                self.stop = Mock()
+                self.wait_for_cleanup = Mock(return_value=True)
+
+            @pyqtSlot()
+            def hold_owner_thread(self) -> None:
+                entered.set()
+                assert release.wait(10)
+
         adapter = MeetingTrackTranscriber()
-        transcriber = Mock()
-        transcriber.cleanup_complete = True
-        thread = Mock()
-        adapter._transcriber, adapter._thread = transcriber, thread
-        monkeypatch.setattr(
-            module,
-            "QMetaObject",
-            SimpleNamespace(invokeMethod=Mock(return_value=None)),
+        worker = ControlledWorker()
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(  # type: ignore[call-arg]
+            worker.hold_owner_thread, Qt.ConnectionType.DirectConnection
         )
+        thread.finished.connect(  # type: ignore[call-arg]
+            worker.deleteLater, Qt.ConnectionType.DirectConnection
+        )
+        adapter._transcriber, adapter._thread = worker, thread
+        worker_key = (thread, worker)
+        module._owned_workers.add(worker_key)
+        thread.start()
+        try:
+            assert entered.wait(5)
+            assert adapter.shutdown(100) is False
+            assert worker.cleanup_complete
+            assert adapter._cleanup_verified.is_set()
+            assert thread.isRunning()
+            assert not thread.wait(0)
+            assert not sip.isdeleted(worker)
+            assert adapter._transcriber is worker and adapter._thread is thread
+            assert worker_key in module._owned_workers
 
-        assert adapter.shutdown(0) is False
-        assert adapter._transcriber is transcriber and adapter._thread is thread
-        thread.wait.assert_not_called()
+            release.set()
+            assert thread.wait(5000)
+            assert sip.isdeleted(worker)
+            assert adapter.shutdown(1000) is True
+            assert adapter._transcriber is None and adapter._thread is None
+            assert worker_key not in module._owned_workers
+            assert adapter.shutdown(0) is True
+        finally:
+            release.set()
+            if thread.isRunning():
+                thread.quit()
+                assert thread.wait(5000)
+            module._owned_workers.discard(worker_key)
+            module._owned_worker_controllers.pop(worker_key, None)
 
-        adapter._worker_destroyed.set()
-        thread.wait.return_value = True
-        assert adapter.shutdown(1000) is True
-        assert adapter.shutdown(0) is True
-
-    def test_shutdown_requires_observed_thread_exit(self, qt_application) -> None:
+    def test_shutdown_requires_observed_thread_exit(
+        self, qt_application, monkeypatch
+    ) -> None:
         from unittest.mock import Mock
+        from buzz.meeting import meeting_transcriber_adapter as module
 
         adapter = MeetingTrackTranscriber()
-        transcriber = SimpleNamespace(request_cancel=Mock())
+        transcriber = Mock(cleanup_complete=True)
         thread = Mock()
         thread.wait.return_value = False
         adapter._transcriber, adapter._thread = transcriber, thread
-        adapter._worker_destroyed.set()
+        monkeypatch.setattr(module.sip, "isdeleted", lambda worker: True)
+        worker_key = (thread, transcriber)
+        module._owned_workers.add(worker_key)
 
-        assert adapter.shutdown(1000) is False
-        assert adapter._transcriber is transcriber and adapter._thread is thread
+        try:
+            assert adapter.shutdown(1000) is False
+            assert adapter._cleanup_verified.is_set()
+            thread.quit.assert_called_once_with()
+            thread.wait.assert_called_once()
+            assert adapter._transcriber is transcriber and adapter._thread is thread
+            assert worker_key in module._owned_workers
+        finally:
+            module._owned_workers.discard(worker_key)
 
     def test_no_unsafe_qobject_or_qthread_destruction(self) -> None:
         import inspect
@@ -200,18 +250,10 @@ class TestAdapterSignals:
         )
         adapter._thread = Mock()
         adapter._thread.wait.return_value = False
-
-        def dispose(*args):
-            adapter._worker_destroyed.set()
-
-        monkeypatch.setattr(
-            module,
-            "QMetaObject",
-            SimpleNamespace(invokeMethod=Mock(side_effect=dispose)),
-        )
+        monkeypatch.setattr(module.sip, "isdeleted", lambda worker: False)
         assert adapter.shutdown(1000) is False
         assert helper.join.call_args.args[0] == pytest.approx(0.3)
-        assert 99 <= adapter._thread.wait.call_args.args[0] <= 100
+        assert 199 <= adapter._thread.wait.call_args.args[0] <= 200
 
 
 class TestTaskConstruction:

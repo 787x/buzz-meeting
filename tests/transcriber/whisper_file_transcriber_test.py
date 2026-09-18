@@ -16,6 +16,7 @@ from unittest.mock import Mock
 
 import psutil
 import pytest
+from PyQt6 import sip
 from PyQt6.QtCore import QObject, QThread, Qt, pyqtSlot
 from PyQt6.QtWidgets import QApplication
 from pytestqt.qtbot import QtBot
@@ -1016,55 +1017,221 @@ class TestMeetingShutdown:
         adapter.start("meeting.wav", 16000, FinalTranscriptionConfig())
         return adapter
 
-    def test_normal_completion_destroys_worker_on_owner_thread(
-        self, qtbot, monkeypatch
+    def test_lifecycle_controller_requests_owner_thread_exit_after_cleanup(self):
+        from buzz.meeting import meeting_transcriber_adapter as module
+
+        cleanup_verified = Event()
+        worker = Mock(cleanup_complete=True)
+        owner_thread = QThread()
+        observed_threads = []
+
+        class ObservedController(module._WorkerLifecycleController):
+            @pyqtSlot()
+            def request_thread_exit(self):
+                observed_threads.append(QThread.currentThread())
+                super().request_thread_exit()
+
+        controller = ObservedController(worker, cleanup_verified, owner_thread)
+        controller.moveToThread(owner_thread)
+        owner_thread.started.connect(
+            controller.request_thread_exit, Qt.ConnectionType.DirectConnection
+        )
+        owner_thread.start()
+        joined = owner_thread.wait(5000)
+        if not joined:
+            owner_thread.quit()
+            assert owner_thread.wait(5000)
+
+        assert joined
+        assert observed_threads == [owner_thread]
+        assert cleanup_verified.is_set()
+
+    def test_lifecycle_controller_retains_running_thread_when_cleanup_incomplete(
+        self,
     ):
-        transcriber, process, _, _ = _lifecycle_case(monkeypatch, complete=True)
+        from buzz.meeting import meeting_transcriber_adapter as module
+
+        cleanup_verified = Event()
+        thread = Mock()
+        controller = module._WorkerLifecycleController(
+            Mock(cleanup_complete=False), cleanup_verified, thread
+        )
+
+        controller.request_thread_exit()
+
+        assert not cleanup_verified.is_set()
+        thread.quit.assert_not_called()
+
+    @pytest.mark.parametrize("outcome", ["completed", "error"])
+    @pytest.mark.parametrize("outcome_first", [True, False])
+    def test_natural_terminal_event_order_is_deterministic(
+        self, monkeypatch, outcome, outcome_first
+    ):
+        from buzz.meeting import meeting_transcriber_adapter as module
+
+        adapter = module.MeetingTrackTranscriber()
+        thread = Mock()
+        thread.wait.return_value = False
+        worker = Mock()
+        controller = Mock()
+        adapter._thread = thread
+        adapter._transcriber = worker
+        adapter._worker_lifecycle_controller = controller
+        worker_key = (thread, worker)
+        module._owned_workers.add(worker_key)
+        module._owned_worker_controllers[worker_key] = controller
+        deleted = False
+        monkeypatch.setattr(sip, "isdeleted", lambda obj: deleted)
+        completed = []
+        errors = []
+        adapter.track_completed.connect(completed.append)
+        adapter.track_error.connect(errors.append)
+
+        def deliver_outcome(selected_outcome=outcome):
+            if selected_outcome == "completed":
+                adapter._on_completed([])
+            else:
+                adapter._on_error("natural failure")
+
+        def deliver_finished():
+            nonlocal deleted
+            adapter._cleanup_verified.set()
+            deleted = True
+            thread.wait.return_value = True
+            adapter._on_thread_finished()
+
+        def assert_not_terminal():
+            assert completed == errors == []
+            assert adapter._thread is thread
+            assert adapter._transcriber is worker
+
+        if outcome_first:
+            deliver_outcome()
+            assert_not_terminal()
+            deliver_finished()
+        else:
+            deliver_finished()
+            assert_not_terminal()
+            deliver_outcome()
+
+        assert adapter._thread is adapter._transcriber is None
+        assert adapter._pending_result is None
+        assert adapter._terminal_emitted
+        assert worker_key not in module._owned_workers
+        assert worker_key not in module._owned_worker_controllers
+        thread.wait.assert_any_call(0)
+        thread.deleteLater.assert_called_once_with()
+        if outcome == "completed":
+            assert completed == [[]]
+            assert errors == []
+        else:
+            assert completed == []
+            assert errors == ["natural failure"]
+
+        deliver_outcome()
+        deliver_outcome("error" if outcome == "completed" else "completed")
+        if outcome == "completed":
+            assert completed == [[]]
+            assert errors == []
+        else:
+            assert completed == []
+            assert errors == ["natural failure"]
+
+    @pytest.mark.parametrize(
+        "complete,expected_completed,expected_errors",
+        [(True, [[]], []), (False, [], ["controlled start failure"])],
+    )
+    def test_natural_terminal_deletes_worker_and_emits_once(
+        self, qtbot, monkeypatch, complete, expected_completed, expected_errors
+    ):
+        from buzz.meeting import meeting_transcriber_adapter as module
+
+        transcriber, process, _, _ = _lifecycle_case(
+            monkeypatch, complete=complete, fail_start=not complete
+        )
+        adapter = self.start_adapter(monkeypatch, transcriber)
+        owner_thread = adapter._thread
+        controller = adapter._worker_lifecycle_controller
+        worker_key = (owner_thread, transcriber)
+        completed, errors, release_states = [], [], []
         destroyed_on = []
         transcriber.destroyed.connect(
             lambda: destroyed_on.append(QThread.currentThread()),
             Qt.ConnectionType.DirectConnection,
         )
-        adapter = self.start_adapter(monkeypatch, transcriber)
-        owner_thread = adapter._thread
-        thread_finished = Event()
-        owner_thread.finished.connect(
-            thread_finished.set, Qt.ConnectionType.DirectConnection
-        )
-        completed = []
+
+        def observe_release(_value):
+            release_states.append(
+                (
+                    owner_thread.wait(0),
+                    sip.isdeleted(transcriber),
+                    sip.isdeleted(controller),
+                    worker_key not in module._owned_workers,
+                    worker_key not in module._owned_worker_controllers,
+                )
+            )
+
         adapter.track_completed.connect(completed.append)
-
+        adapter.track_completed.connect(observe_release)
+        adapter.track_error.connect(errors.append)
+        adapter.track_error.connect(observe_release)
         process.allow_start.set()
-        qtbot.waitUntil(lambda: completed == [[]], timeout=5000)
+        qtbot.waitUntil(
+            lambda: completed == expected_completed and errors == expected_errors,
+            timeout=5000,
+        )
 
+        assert transcriber.cleanup_complete
+        assert adapter._cleanup_verified.is_set()
         assert destroyed_on == [owner_thread]
-        assert thread_finished.is_set()
+        assert release_states == [(True, True, True, True, True)]
         assert adapter._thread is adapter._transcriber is None
+        if complete:
+            adapter._on_completed([])
+            adapter._on_error("late competing error")
+        else:
+            adapter._on_error("duplicate error")
+            adapter._on_completed([])
+        assert completed == expected_completed
+        assert errors == expected_errors
 
-    def test_destruction_timeout_retains_then_retry_succeeds(self, qtbot, monkeypatch):
+    def test_thread_exit_timeout_retains_then_retry_succeeds(self, qtbot, monkeypatch):
+        from buzz.meeting import meeting_transcriber_adapter as module
+
         entered, release = Event(), Event()
+        original_controller = module._WorkerLifecycleController
 
-        class GatedDisposalTranscriber(WhisperFileTranscriber):
+        class GatedController(original_controller):
             @pyqtSlot()
-            def dispose_in_owner_thread(self):
+            def request_thread_exit(self):
                 entered.set()
                 assert release.wait(10)
-                super().dispose_in_owner_thread()
+                super().request_thread_exit()
 
-        base, process, pipes, _ = _lifecycle_case(monkeypatch, complete=True)
-        transcriber = GatedDisposalTranscriber(base.transcription_task)
+        monkeypatch.setattr(module, "_WorkerLifecycleController", GatedController)
+        transcriber, process, pipes, _ = _lifecycle_case(monkeypatch, complete=True)
         adapter = self.start_adapter(monkeypatch, transcriber)
         owner_thread = adapter._thread
+        controller = adapter._worker_lifecycle_controller
+        worker_key = (owner_thread, transcriber)
         try:
             process.allow_start.set()
             assert entered.wait(5)
             assert adapter.shutdown(0) is False
             assert adapter._thread is owner_thread
             assert adapter._transcriber is transcriber
-            assert not adapter._worker_destroyed.is_set()
+            assert not sip.isdeleted(transcriber)
+            assert worker_key in module._owned_workers
+            assert module._owned_worker_controllers[worker_key] is controller
             release.set()
             assert adapter.shutdown(5000) is True
+            assert sip.isdeleted(transcriber)
+            assert sip.isdeleted(controller)
+            assert not owner_thread.isRunning()
+            assert owner_thread.wait(0)
             assert adapter._thread is adapter._transcriber is None
+            assert worker_key not in module._owned_workers
+            assert worker_key not in module._owned_worker_controllers
             assert adapter.shutdown(0) is True
             assert all(pipe.closed for pipe in pipes)
         finally:
@@ -1075,11 +1242,15 @@ class TestMeetingShutdown:
     def test_startup_timeout_retains_then_replays(
         self, qtbot, monkeypatch, child_before_gate
     ):
+        from buzz.meeting import meeting_transcriber_adapter as module
+
         transcriber, process, pipes, _ = _lifecycle_case(
             monkeypatch, child_before_gate=child_before_gate
         )
         adapter = self.start_adapter(monkeypatch, transcriber)
         owner_thread = adapter._thread
+        controller = adapter._worker_lifecycle_controller
+        worker_key = (owner_thread, transcriber)
         completed, errors = [], []
         adapter.track_completed.connect(completed.append)
         adapter.track_error.connect(errors.append)
@@ -1089,6 +1260,8 @@ class TestMeetingShutdown:
             assert adapter._thread is owner_thread
             assert adapter._transcriber is transcriber
             assert owner_thread.isRunning()
+            assert worker_key in module._owned_workers
+            assert module._owned_worker_controllers[worker_key] is controller
             adapter._on_completed([])
             adapter._on_error("late error")
             assert completed == errors == []
@@ -1097,12 +1270,21 @@ class TestMeetingShutdown:
             process.allow_start.set()
             result = adapter.shutdown(5000)
             assert result is True, (
-                adapter._worker_destroyed.is_set(),
+                sip.isdeleted(transcriber),
                 owner_thread.isRunning(),
                 transcriber.cleanup_complete,
-                adapter._dispose_requested,
+                adapter._cleanup_verified.is_set(),
                 adapter._stop_thread.is_alive(),
             )
+            assert transcriber.cleanup_complete
+            assert adapter._cleanup_verified.is_set()
+            assert sip.isdeleted(transcriber)
+            assert sip.isdeleted(controller)
+            assert not owner_thread.isRunning()
+            assert owner_thread.wait(0)
+            assert adapter._thread is adapter._transcriber is None
+            assert worker_key not in module._owned_workers
+            assert worker_key not in module._owned_worker_controllers
             assert process.reaped and all(pipe.closed for pipe in pipes)
             assert process.timeline.count("terminate") == 1
             assert adapter.shutdown(0) is True
@@ -1111,6 +1293,8 @@ class TestMeetingShutdown:
             assert adapter.shutdown(5000)
 
     def test_cleanup_failure_retains_worker_for_retry(self, qtbot, monkeypatch):
+        from buzz.meeting import meeting_transcriber_adapter as module
+
         transcriber, process, _, _ = _lifecycle_case(monkeypatch)
         original_close = transcriber._close_transcription_resources
 
@@ -1121,16 +1305,19 @@ class TestMeetingShutdown:
         process.allow_start.set()
         adapter = self.start_adapter(monkeypatch, transcriber)
         owner_thread = adapter._thread
+        worker_key = (owner_thread, transcriber)
         try:
             assert process.wait_entered.wait(5)
             assert adapter.shutdown(5000) is False
             assert adapter._thread is owner_thread
             assert adapter._transcriber is transcriber
-            assert not adapter._worker_destroyed.is_set()
+            assert not adapter._cleanup_verified.is_set()
+            assert worker_key in module._owned_workers
             monkeypatch.setattr(
                 transcriber, "_close_transcription_resources", original_close
             )
             assert adapter.shutdown(5000) is True
+            assert sip.isdeleted(transcriber)
             assert process.timeline.count("join") == 1
         finally:
             monkeypatch.setattr(
@@ -1138,8 +1325,102 @@ class TestMeetingShutdown:
             )
             assert adapter.shutdown(5000)
 
+    def test_release_rejects_joined_thread_with_live_worker(self):
+        from buzz.meeting import meeting_transcriber_adapter as module
+
+        adapter = module.MeetingTrackTranscriber()
+        worker = QObject()
+        thread = Mock()
+        thread.wait.return_value = True
+        controller = Mock()
+        adapter._transcriber = worker
+        adapter._thread = thread
+        adapter._worker_lifecycle_controller = controller
+        adapter._cleanup_verified.set()
+        worker_key = (thread, worker)
+        module._owned_workers.add(worker_key)
+        module._owned_worker_controllers[worker_key] = controller
+        try:
+            with pytest.raises(
+                RuntimeError, match="ownership released before verified shutdown"
+            ):
+                adapter._release_worker()
+            assert worker_key in module._owned_workers
+            assert worker_key in module._owned_worker_controllers
+            thread.deleteLater.assert_not_called()
+        finally:
+            module._owned_workers.discard(worker_key)
+            module._owned_worker_controllers.pop(worker_key, None)
+
+    def test_already_deleted_worker_converges_without_qobject_invocation(
+        self, qtbot, monkeypatch
+    ):
+        from buzz.meeting import meeting_transcriber_adapter as module
+
+        class AlreadyDeletedWorker(WhisperFileTranscriber):
+            def request_cancel(self):
+                raise AssertionError("deleted worker must not be invoked")
+
+            def stop(self):
+                raise AssertionError("deleted worker must not be invoked")
+
+            def wait_for_cleanup(self, timeout):
+                raise AssertionError("deleted worker must not be invoked")
+
+        adapter = module.MeetingTrackTranscriber()
+        owner_thread = QThread()
+        base, process, _, _ = _lifecycle_case(monkeypatch, complete=True)
+        worker = AlreadyDeletedWorker(base.transcription_task)
+        worker.moveToThread(owner_thread)
+        owner_thread.started.connect(worker.run)
+        worker.completed.connect(owner_thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.error.connect(owner_thread.quit, Qt.ConnectionType.DirectConnection)
+        owner_thread.finished.connect(
+            worker.deleteLater, Qt.ConnectionType.DirectConnection
+        )
+        process.allow_start.set()
+        owner_thread.start()
+        qtbot.waitUntil(lambda: sip.isdeleted(worker), timeout=5000)
+        assert owner_thread.wait(5000)
+        assert worker.cleanup_complete
+        assert sip.isdeleted(worker)
+
+        controller = module._WorkerLifecycleController(
+            worker, adapter._cleanup_verified, owner_thread
+        )
+        controller.moveToThread(owner_thread)
+        adapter._transcriber = worker
+        adapter._thread = owner_thread
+        adapter._worker_lifecycle_controller = controller
+        worker_key = (owner_thread, worker)
+        module._owned_workers.add(worker_key)
+        module._owned_worker_controllers[worker_key] = controller
+        owner_thread.finished.connect(
+            controller.deleteLater, Qt.ConnectionType.DirectConnection
+        )
+        restarted = Event()
+        owner_thread.started.connect(restarted.set, Qt.ConnectionType.DirectConnection)
+        owner_thread.start()
+        try:
+            assert restarted.wait(5)
+            assert sip.isdeleted(worker)
+            assert owner_thread.isRunning()
+            assert adapter.shutdown(5000) is True
+            assert adapter._cleanup_verified.is_set()
+            assert owner_thread.wait(0)
+            assert sip.isdeleted(controller)
+            assert worker_key not in module._owned_workers
+            assert worker_key not in module._owned_worker_controllers
+            assert adapter.shutdown(0) is True
+        finally:
+            if owner_thread.isRunning():
+                owner_thread.quit()
+                assert owner_thread.wait(5000)
+            module._owned_workers.discard(worker_key)
+            module._owned_worker_controllers.pop(worker_key, None)
+
     def test_parent_disposal_keeps_worker_owned(self, qtbot, monkeypatch):
-        from buzz.meeting.meeting_transcriber_adapter import _owned_workers
+        from buzz.meeting import meeting_transcriber_adapter as module
 
         transcriber, process, _, _ = _lifecycle_case(monkeypatch)
         adapter = self.start_adapter(monkeypatch, transcriber)
@@ -1148,20 +1429,34 @@ class TestMeetingShutdown:
         parent.destroyed.connect(parent_destroyed.set)
         adapter.setParent(parent)
         owner_thread = adapter._thread
+        controller = adapter._worker_lifecycle_controller
+        worker_key = (owner_thread, transcriber)
         try:
             assert process.start_entered.wait(5)
             assert adapter.shutdown(0) is False
             assert owner_thread.parent() is None
             parent.deleteLater()
             qtbot.waitUntil(parent_destroyed.is_set, timeout=5000)
-            assert (owner_thread, transcriber) in _owned_workers
+            assert sip.isdeleted(adapter)
+            assert not sip.isdeleted(transcriber)
+            assert worker_key in module._owned_workers
+            assert module._owned_worker_controllers[worker_key] is controller
             assert owner_thread.isRunning()
+            process.allow_start.set()
+            assert adapter.shutdown(5000) is True
+            assert transcriber.cleanup_complete
+            assert adapter._cleanup_verified.is_set()
+            assert sip.isdeleted(transcriber)
+            assert sip.isdeleted(controller)
+            assert not owner_thread.isRunning()
+            assert owner_thread.wait(0)
+            assert adapter._thread is adapter._transcriber is None
+            assert worker_key not in module._owned_workers
+            assert worker_key not in module._owned_worker_controllers
+            assert adapter.shutdown(0) is True
         finally:
             process.allow_start.set()
-            qtbot.waitUntil(adapter._worker_destroyed.is_set, timeout=5000)
-            assert owner_thread.wait(5000)
-            adapter._release_worker()
-            assert (owner_thread, transcriber) not in _owned_workers
+            assert adapter.shutdown(5000)
 
     def test_descendant_cleanup_must_be_observed(self, monkeypatch):
         child = Mock()

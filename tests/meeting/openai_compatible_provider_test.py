@@ -1503,6 +1503,9 @@ class TestBoundedLifetimeTransport:
         request_started = threading.Event()
         release_server = threading.Event()
         attempts = 0
+        request_started_at: list[float] = []
+        real_monotonic = time.monotonic
+        clock_origin = real_monotonic()
 
         def stall(handler: BaseHTTPRequestHandler) -> None:
             nonlocal attempts
@@ -1511,8 +1514,27 @@ class TestBoundedLifetimeTransport:
             handler.send_header("Content-Length", "1")
             handler.end_headers()
             handler.wfile.flush()
+            request_started_at.append(real_monotonic())
             request_started.set()
             release_server.wait(5.0)
+
+        class PeerAnchoredClock:
+            @staticmethod
+            def monotonic() -> float:
+                if not request_started_at:
+                    return clock_origin
+                return clock_origin + real_monotonic() - request_started_at[0]
+
+        def remaining_after_peer_observes_request(deadline: float) -> float:
+            assert request_started.wait(10.0), "Local HTTP peer never observed the request"
+            return max(0.0, deadline - PeerAnchoredClock.monotonic())
+
+        monkeypatch.setattr(transport_module, "time", PeerAnchoredClock)
+        monkeypatch.setattr(
+            transport_module,
+            "_remaining_seconds",
+            remaining_after_peer_observes_request,
+        )
 
         try:
             with _local_http_server(stall) as base_url:
@@ -1521,14 +1543,14 @@ class TestBoundedLifetimeTransport:
                         base_url, "summary-model", timeout_seconds=1.5
                     )
                 )
-                started_at = time.monotonic()
                 with pytest.raises(
                     SummaryProviderTransportError,
                     match="^OpenAI-compatible summary request timed out$",
                 ):
                     provider.summarize(_request())
-                elapsed = time.monotonic() - started_at
                 assert request_started.is_set()
+                assert len(request_started_at) == 1
+                elapsed = real_monotonic() - request_started_at[0]
                 assert elapsed < 3.5
                 assert attempts == 1
                 assert _transport_children() == ()
