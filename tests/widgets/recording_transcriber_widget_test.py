@@ -1365,7 +1365,23 @@ class TestAudioSourceSelection:
     @pytest.mark.timeout(60)
     def test_system_microphone_system_preview_lifecycle(self, qtbot):
         with _widget_ctx(qtbot) as widget:
-            widget.audio_source_combo_box.setCurrentIndex(1)
+            widget.selected_device_id = 0
+            widget.reset_recording_amplitude_listener()
+            initial_listener = widget.recording_amplitude_listener
+            assert initial_listener is not None
+            initial_stream = initial_listener.stream
+            assert initial_stream is not None
+            assert initial_stream.thread.is_alive()
+
+            with patch.object(
+                initial_listener,
+                "stop_recording",
+                wraps=initial_listener.stop_recording,
+            ) as initial_stop:
+                widget.audio_source_combo_box.setCurrentIndex(1)
+
+            initial_stop.assert_called_once_with()
+            assert not initial_stream.thread.is_alive()
             assert widget.recording_amplitude_listener is None
 
             with patch(
@@ -1373,11 +1389,15 @@ class TestAudioSourceSelection:
             ) as listener_class:
                 listener = listener_class.return_value
                 widget.audio_source_combo_box.setCurrentIndex(0)
+                listener_class.assert_called_once_with(
+                    input_device_index=0,
+                    parent=widget,
+                )
+                listener.start_recording.assert_called_once_with()
                 assert widget.recording_amplitude_listener is listener
 
                 widget.audio_source_combo_box.setCurrentIndex(1)
 
-            listener.start_recording.assert_called_once_with()
             listener.stop_recording.assert_called_once_with()
             assert widget.recording_amplitude_listener is None
             assert not widget.audio_meter_widget.isEnabled()
