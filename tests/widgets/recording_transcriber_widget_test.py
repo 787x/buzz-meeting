@@ -1513,16 +1513,23 @@ class TestApplicationAudioSelection:
             "list_windows_application_audio_targets",
             return_value=[],
         ):
+            widget.selected_device_id = 0
+            widget.reset_recording_amplitude_listener()
             listener = widget.recording_amplitude_listener
             assert listener is not None
+            preview_stream = listener.stream
+            assert preview_stream is not None
+            assert preview_stream.thread.is_alive()
             with patch.object(
                 listener, "stop_recording", wraps=listener.stop_recording
             ) as stop:
                 _select_application_audio(widget)
 
             stop.assert_called_once_with()
+            assert not preview_stream.thread.is_alive()
             assert widget.recording_amplitude_listener is None
             assert widget.audio_devices_combo_box.isHidden()
+            assert widget.microphone_label.isHidden()
             assert not widget.application_audio_target_widget.isHidden()
             assert not widget.audio_meter_widget.isEnabled()
 
@@ -1549,6 +1556,7 @@ class TestApplicationAudioSelection:
             "list_windows_application_audio_targets",
             return_value=[],
         ):
+            widget.selected_device_id = 0
             widget.audio_source_combo_box.setCurrentIndex(1)
             _select_application_audio(widget)
             with patch(
@@ -1557,7 +1565,7 @@ class TestApplicationAudioSelection:
                 widget.audio_source_combo_box.setCurrentIndex(0)
 
             listener_class.assert_called_once_with(
-                input_device_index=widget.selected_device_id,
+                input_device_index=0,
                 parent=widget,
             )
             listener_class.return_value.start_recording.assert_called_once_with()
@@ -1571,11 +1579,14 @@ class TestApplicationAudioSelection:
         ), patch(
             "buzz.widgets.recording_transcriber_widget.RecordingAmplitudeListener"
         ) as listener_class:
+            widget.selected_device_id = 0
             for _transition_index in range(10):
                 _select_application_audio(widget)
                 widget.audio_source_combo_box.setCurrentIndex(0)
 
-            assert listener_class.call_count == 10
+            assert listener_class.call_args_list == [
+                call(input_device_index=0, parent=widget)
+            ] * 10
             assert widget.recording_amplitude_listener is listener_class.return_value
 
     @pytest.mark.timeout(60)
