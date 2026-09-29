@@ -38,6 +38,7 @@ from buzz.widgets.meeting_final_transcription import MeetingFinalTranscription
 from buzz.db.meeting_summary_repository import QSqlMeetingSummaryRepository
 from buzz.meeting.meeting_notes import MeetingNotesService
 from buzz.widgets.meeting_notes_controller import MeetingNotesController
+from buzz.widgets.meeting_speaker_generation import MeetingSpeakerGeneration
 
 
 def _build_main_window(database) -> MainWindow:
@@ -72,6 +73,9 @@ def _build_main_window(database) -> MainWindow:
             MeetingNotesService(
                 meeting_detail_service, QSqlMeetingSummaryRepository(database)
             )
+        ),
+        MeetingSpeakerGeneration(
+            meeting_detail_service, final_transcription_reader, speaker_review_service
         ),
     )
     meeting_final.recover()
