@@ -235,6 +235,62 @@ class TestAdapterSignals:
         assert "sip.delete" not in source
         assert ".terminate(" not in source
 
+    def test_cleanup_helper_launch_failure_retains_ownership(
+        self, qt_application, monkeypatch
+    ) -> None:
+        from unittest.mock import Mock
+        from buzz.meeting import meeting_transcriber_adapter as module
+
+        class Worker(QObject):
+            def __init__(self):
+                super().__init__()
+                self.cleanup_complete = False
+                self.request_cancel = Mock()
+                self.stop = Mock()
+
+        adapter = MeetingTrackTranscriber()
+        worker, thread = Worker(), QThread()
+        controller = module._WorkerLifecycleController(
+            worker, adapter._cleanup_verified, thread
+        )
+        adapter._transcriber, adapter._thread = worker, thread
+        adapter._worker_lifecycle_controller = controller
+        worker_key = (thread, worker)
+        module._owned_workers.add(worker_key)
+        module._owned_worker_controllers[worker_key] = controller
+        helper = Mock()
+        helper.start.side_effect = RuntimeError("controlled helper launch failure")
+        factory = Mock(return_value=helper)
+        monkeypatch.setattr(module, "Thread", factory)
+        release = Mock(wraps=adapter._release_worker)
+        monkeypatch.setattr(adapter, "_release_worker", release)
+        quit_thread = Mock(wraps=thread.quit)
+        monkeypatch.setattr(thread, "quit", quit_thread)
+
+        try:
+            assert adapter.shutdown(0) is False
+            worker.request_cancel.assert_called_once_with()
+            factory.assert_called_once()
+            helper.start.assert_called_once_with()
+            helper.join.assert_not_called()
+            helper.is_alive.assert_not_called()
+            worker.stop.assert_not_called()
+            assert adapter._stop_thread is helper
+            assert adapter._transcriber is worker and adapter._thread is thread
+            assert adapter._worker_lifecycle_controller is controller
+            assert worker_key in module._owned_workers
+            assert module._owned_worker_controllers[worker_key] is controller
+            assert not worker.cleanup_complete
+            assert not adapter._cleanup_verified.is_set()
+            assert not sip.isdeleted(worker)
+            assert not sip.isdeleted(controller)
+            assert not sip.isdeleted(thread)
+            quit_thread.assert_not_called()
+            release.assert_not_called()
+        finally:
+            module._owned_workers.discard(worker_key)
+            module._owned_worker_controllers.pop(worker_key, None)
+
     def test_waits_share_one_deadline(self, qt_application, monkeypatch):
         from unittest.mock import Mock
         from buzz.meeting import meeting_transcriber_adapter as module

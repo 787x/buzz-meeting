@@ -1469,6 +1469,121 @@ class TestMeetingShutdown:
         child.terminate.assert_called_once()
         child.kill.assert_called_once()
 
+    @pytest.mark.parametrize("denied", [True, False])
+    def test_descendant_enumeration_failure_is_not_success(self, monkeypatch, denied):
+        parent = Mock()
+        error = psutil.AccessDenied(123) if denied else psutil.NoSuchProcess(123)
+        parent.children.side_effect = error
+        monkeypatch.setattr(psutil, "Process", Mock(return_value=parent))
+        wait = Mock()
+        monkeypatch.setattr(psutil, "wait_procs", wait)
+
+        if denied:
+            with pytest.raises(psutil.AccessDenied) as caught:
+                terminate_child_processes(123)
+            assert caught.value is error
+        else:
+            assert terminate_child_processes(123) is None
+        parent.children.assert_called_once_with(recursive=True)
+        wait.assert_not_called()
+
+    def test_zero_budget_shutdown_reuses_blocked_cleanup(self, qtbot, monkeypatch):
+        from buzz.meeting import meeting_transcriber_adapter as module
+
+        transcriber, process, pipes, _ = _lifecycle_case(monkeypatch)
+        entered, release = Event(), Event()
+        original_close = transcriber._close_transcription_resources
+
+        def blocked_close(*args, **kwargs):
+            entered.set()
+            assert release.wait(10), "test did not release resource cleanup"
+            return original_close(*args, **kwargs)
+
+        monkeypatch.setattr(
+            transcriber, "_close_transcription_resources", blocked_close
+        )
+        helper_factory = Mock(wraps=module.Thread)
+        monkeypatch.setattr(module, "Thread", helper_factory)
+        process.allow_start.set()
+        adapter = self.start_adapter(monkeypatch, transcriber)
+        thread = adapter._thread
+        controller = adapter._worker_lifecycle_controller
+        worker_key = (thread, transcriber)
+        destroyed_on = []
+        transcriber.destroyed.connect(
+            lambda: destroyed_on.append(QThread.currentThread()),
+            Qt.ConnectionType.DirectConnection,
+        )
+        try:
+            assert process.wait_entered.wait(5)
+            assert adapter.shutdown(0) is False
+            assert entered.wait(5)
+            helper = adapter._stop_thread
+            assert helper.is_alive()
+            # A zero budget must not wait on the closed gate. Check both the
+            # actual return and the wait budget, without elapsed-time races.
+            join = Mock(wraps=helper.join)
+            monkeypatch.setattr(helper, "join", join)
+            for _ in range(3):
+                assert adapter.shutdown(0) is False
+                assert adapter._stop_thread is helper
+                assert adapter._transcriber is transcriber
+                assert adapter._thread is thread
+                assert adapter._worker_lifecycle_controller is controller
+                assert worker_key in module._owned_workers
+                assert module._owned_worker_controllers[worker_key] is controller
+                assert not transcriber.cleanup_complete
+                assert not adapter._cleanup_verified.is_set()
+                assert not sip.isdeleted(transcriber)
+                assert not sip.isdeleted(controller)
+                assert thread.isRunning()
+                assert destroyed_on == []
+            assert [call.args for call in join.call_args_list] == [(0,), (0,), (0,)]
+            helper_factory.assert_called_once()
+
+            release.set()
+            assert adapter.shutdown(5000) is True
+            assert not helper.is_alive()
+            assert process.reaped and not process.is_alive()
+            assert process.timeline.count("join") == 1
+            assert all(pipe.closed and pipe.close_calls == 1 for pipe in pipes)
+            assert not transcriber.read_line_thread.is_alive()
+            assert transcriber.cleanup_complete
+            assert destroyed_on == [thread]
+            assert sip.isdeleted(transcriber) and sip.isdeleted(controller)
+            assert thread.wait(0)
+            assert adapter._thread is adapter._transcriber is None
+            assert adapter._stop_thread is adapter._worker_lifecycle_controller is None
+            assert worker_key not in module._owned_workers
+            assert worker_key not in module._owned_worker_controllers
+            assert adapter.shutdown(0) is True
+        finally:
+            release.set()
+            assert adapter.shutdown(5000)
+
+    def test_request_cancel_before_resource_publication(self, monkeypatch):
+        from buzz.transcriber import whisper_file_transcriber as module
+
+        transcriber, process, pipes, pipe_factory = _lifecycle_case(monkeypatch)
+        process_factory = Mock(return_value=process)
+        monkeypatch.setattr(module.multiprocessing, "Process", process_factory)
+        transcriber.request_cancel()
+        assert transcriber.stopped
+        assert transcriber.cleanup_complete
+        for _ in range(2):
+            with pytest.raises(Exception, match="Transcription was canceled"):
+                transcriber.transcribe()
+            transcriber.stop()
+            assert transcriber.cleanup_complete
+            assert not transcriber.started_process
+            assert not hasattr(transcriber, "current_process")
+            assert transcriber.read_line_thread is None
+            assert transcriber.recv_pipe is transcriber.send_pipe is None
+        pipe_factory.assert_not_called()
+        process_factory.assert_not_called()
+        assert process.timeline == []
+        assert all(not pipe.closed for pipe in pipes)
+
     def test_cross_thread_disposal_is_rejected(self, monkeypatch):
         transcriber, _, _, _ = _lifecycle_case(monkeypatch)
         owner = QThread()
