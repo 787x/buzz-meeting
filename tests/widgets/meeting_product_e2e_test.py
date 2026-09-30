@@ -18,6 +18,7 @@ from PyQt6.QtSql import QSqlQuery
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from buzz.audio_capture.source import AudioSourceError
+from buzz.locale import _ as translate
 from buzz.db.meeting_library_repository import QSqlMeetingLibraryRepository
 from buzz.db.meeting_speaker_repository import QSqlMeetingSpeakerRepository
 from buzz.db.meeting_storage_repository import QSqlMeetingRepository
@@ -53,6 +54,7 @@ from buzz.widgets.main_window import MainWindow
 from buzz.widgets.meeting_final_transcription import MeetingFinalTranscription
 from buzz.widgets.meeting_mode import MeetingModeController
 from buzz.widgets.meeting_notes_controller import MeetingNotesController
+from buzz.widgets.meeting_notes_panel import ManualResponseDialog
 from buzz.widgets.meeting_speaker_generation import MeetingSpeakerGeneration
 from tests.meeting.meeting_workflow_test import ControlledAudioSource
 from tests.widgets.meeting_mode_test import Adapter
@@ -257,6 +259,86 @@ def test_product_explicit_speaker_generation_persisted_reload(
     assert all(path.read_bytes() == original for path, original in audio_before.items())
     np.testing.assert_allclose(p.speaker_runner.calls[0][0].waveform, 0.1, atol=0.0001)
     np.testing.assert_allclose(p.speaker_runner.calls[1][0].waveform, 0.2, atol=0.0001)
+
+
+def test_product_workspace_transcript_speakers_manual_notes_and_minutes(
+    product, qtbot, monkeypatch
+):
+    p = product
+    identity, stored, source = reviewable_final(p, qtbot)
+    widget = p.window.meeting_detail_widget
+    assert [widget.tabs.tabText(i) for i in range(widget.tabs.count())] == [
+        translate(name) for name in ("Transcript", "Speakers", "AI Notes", "Info")
+    ]
+    assert widget.tabs.currentIndex() == 0
+    assert widget.transcript_edit.toPlainText() == "\n\n".join(
+        segment.text for segment in source.transcript.segments
+    )
+    words = p.reader.load_words(source.final_generation.generation_id)
+    audio = {t.path: t.path.read_bytes() for t in (stored.microphone, stored.remote)}
+    for area in (1, 2, 3, 0, 1):
+        widget.tabs.setCurrentIndex(area)
+    assert not p.speaker_runner.calls and not p.requests
+    assert not p.notes.manual_contexts
+    assert widget.audio_table.rowCount() == 2
+    widget.generate_review_button.click()
+    qtbot.waitUntil(p.speaker_runner.entered.is_set)
+    widget.tabs.setCurrentIndex(3)
+    widget.tabs.setCurrentIndex(1)
+    assert "Generating" in widget.generation_status_label.text()
+    assert not widget.generate_review_button.isEnabled()
+    p.speaker_runner.release.set()
+    qtbot.waitUntil(lambda: not p.speakers.busy)
+    assert widget.tabs.currentIndex() == 1
+    widget.name_edit.setText("Meeting participant")
+    widget.save_name_button.click()
+    # Notes use names from explicit word assignments in the existing workflow.
+    for row, word in enumerate(widget._snapshot.speaker_review.words):
+        if word.word.source_role is stored.microphone.role:
+            widget.word_table.selectRow(row)
+            widget.assign_speaker_combo.setCurrentIndex(0)
+            widget.assign_button.click()
+    widget.complete_button.click()
+    persisted_review = p.detail.load(identity).speaker_review
+    assert persisted_review.speakers[0].display_name == "Meeting participant"
+    assert not widget.complete_button.isEnabled()
+    assert widget.tabs.currentIndex() == 1
+
+    widget.tabs.setCurrentIndex(2)
+    panel = widget.notes_panel
+    copied = []
+    monkeypatch.setattr(panel, "_copy_to_clipboard", copied.append)
+    panel.actions["Copy AI Request"].click()
+    assert len(copied) == 1 and "Meeting participant" in copied[0]
+    assert not p.requests and not p.summaries.list_for_meeting(identity)
+
+    def import_manual(dialog):
+        dialog.input.setPlainText(meeting_summary_to_json(p.provider.result))
+        dialog.strict.click()
+        return dialog.result()
+
+    monkeypatch.setattr(ManualResponseDialog, "exec", import_manual)
+    panel.actions["Import AI Response"].click()
+    (artifact,) = p.summaries.list_for_meeting(identity)
+    assert artifact.source_review_id == persisted_review.id
+    assert artifact.source_review_revision == persisted_review.revision
+    assert panel.selected_id == artifact.summary_id
+    widget.refresh()
+    assert widget.tabs.currentWidget() is panel
+    assert panel.selected_id == artifact.summary_id
+    destination = p.root / "workspace-minutes.md"
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *a, **k: (str(destination), "Markdown (*.md)"),
+    )
+    panel.actions["Export Minutes"].click()
+    assert artifact.summary.summary in destination.read_text(encoding="utf-8")
+    assert p.storage.load(identity) == stored
+    assert p.detail.load(identity).transcript == source.transcript
+    assert p.reader.load_words(source.final_generation.generation_id) == words
+    assert all(path.read_bytes() == original for path, original in audio.items())
+    assert not p.requests
 
 
 def test_product_speaker_source_words_race_does_not_persist(product, qtbot):

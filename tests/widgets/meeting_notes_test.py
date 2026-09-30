@@ -7,6 +7,7 @@ import pytest
 from PyQt6.QtCore import QThread
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 from buzz.meeting.meeting_notes import MeetingNotesService, NotesError
+from buzz.meeting.meeting_detail import MeetingDetailTranscriptState
 from buzz.meeting.meeting_summary import (
     meeting_summary_to_json,
     MeetingSummaryFreshness as F,
@@ -220,6 +221,64 @@ def test_history_newest_default_preserves_explicit_then_selects_created(
     assert panel.selected_id == third.summary_id
     assert "None recorded" in panel.content.toPlainText()
     assert "Profile version" in panel.provenance.text()
+
+
+def test_detail_notes_reuses_panel_preserves_history_and_clears_on_meeting_switch(
+    controller, qtbot
+):
+    from buzz.widgets.meeting_detail_widget import MeetingDetailWidget
+
+    control, provider = controller
+    detail = MeetingDetailWidget(
+        control.service.detail, Mock(), Mock(), meeting_notes=control
+    )
+    qtbot.addWidget(detail)
+    detail.open_meeting(MEETING_ID)
+    panel = detail.notes_panel
+    assert isinstance(panel, MeetingNotesPanel)
+    assert detail.tabs.widget(2) is panel
+    detail.tabs.setCurrentWidget(panel)
+    control.copy_request(MEETING_ID)
+    first = control.import_response(MEETING_ID, meeting_summary_to_json(summary()))
+    control.import_response(
+        MEETING_ID, meeting_summary_to_json(replace(summary(), summary="Newer notes"))
+    )
+    panel.history.setCurrentIndex(1)
+    assert panel.selected_id == first.summary_id
+    before = panel.content.toPlainText(), panel.provenance.text()
+    detail.refresh()
+    assert detail.tabs.currentWidget() is panel
+    assert panel.selected_id == panel.history.currentData() == first.summary_id
+    assert (panel.content.toPlainText(), panel.provenance.text()) == before
+    for area in (0, 1, 3, 2):
+        detail.tabs.setCurrentIndex(area)
+    assert panel.selected_id == first.summary_id
+    assert not provider.calls
+    assert not control.candidates
+    assert len(control.history(MEETING_ID)) == 2
+
+    other = uuid.UUID(int=999)
+    panel.message.setText("Message for previous meeting")
+    # A different meeting with no transcript or notes still clears the old view.
+    control.service.detail = DetailService(RuntimeError("unavailable"))
+    detail._detail_service = DetailService(
+        snapshot(
+            meeting_value=replace(snapshot().meeting, session_id=other),
+            transcript_state=MeetingDetailTranscriptState.NOT_AVAILABLE,
+        )
+    )
+    detail.open_meeting(other)
+    assert detail.tabs.currentIndex() == 0
+    assert detail.notes_panel is panel
+    assert panel.meeting_id == other
+    assert panel.selected_id is None and panel.history.count() == 0
+    assert panel.artifacts == {}
+    assert first.summary.summary not in panel.content.toPlainText()
+    assert panel.provenance.text() == panel.message.text() == ""
+    assert "complete readable final transcript" in panel.source.text()
+    assert not panel.actions["Export Minutes"].isEnabled()
+    assert not panel.actions["Generate with API"].isEnabled()
+    assert not provider.calls
 
 
 def test_history_failure_is_not_empty(controller, panel, monkeypatch):

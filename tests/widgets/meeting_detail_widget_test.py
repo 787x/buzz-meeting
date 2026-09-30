@@ -25,7 +25,9 @@ from buzz.meeting.meeting_audio_tracks import (
     MeetingTrackRole,
 )
 from buzz.meeting.meeting_detail import (
+    MeetingDetailError,
     MeetingDetailLoadError,
+    MeetingDetailNotFoundError,
     MeetingDetailSnapshot,
     MeetingDetailSpeakerReviewState,
     MeetingDetailTranscriptState,
@@ -376,6 +378,162 @@ def open_widget(qtbot, value, speaker_service=None, factory=None):
     widget = make_widget(qtbot, detail, speaker_service, factory)
     widget.open_meeting(MEETING_ID)
     return widget, detail
+
+
+@pytest.fixture
+def workspace(qtbot):
+    notes = Mock(candidates={}, manual_contexts={}, busy=False, closing=False)
+    notes.history.return_value = ()
+    notes.prepare.return_value = Mock(review_id=None)
+    generation_controller = Mock(busy=False, closing=False)
+    generation_controller.message_for.return_value = ""
+    detail = DetailService(
+        snapshot(
+            review_state=MeetingDetailSpeakerReviewState.FRESH,
+            review_value=review(),
+        )
+    )
+    widget = MeetingDetailWidget(
+        detail,
+        Mock(),
+        Mock(return_value=PreviewPlayer()),
+        meeting_notes=notes,
+        speaker_generation=generation_controller,
+    )
+    qtbot.addWidget(widget)
+    widget.open_meeting(MEETING_ID)
+    widget.show()
+    return widget, detail, notes, generation_controller
+
+
+def test_workspace_areas_and_default_transcript(workspace):
+    widget, _, _, _ = workspace
+    assert [widget.tabs.tabText(i) for i in range(widget.tabs.count())] == [
+        translate(name) for name in ("Transcript", "Speakers", "AI Notes", "Info")
+    ]
+    assert widget.tabs.currentIndex() == 0
+    assert widget.transcript_edit.isVisible()
+    assert not widget.speaker_list.isVisible()
+    assert not widget.audio_table.isVisible()
+    for index, control in (
+        (1, widget.speaker_list),
+        (2, widget.notes_panel),
+        (3, widget.audio_table),
+    ):
+        widget.tabs.setCurrentIndex(index)
+        assert control.isVisible()
+        assert not widget.transcript_edit.isVisible()
+
+
+def test_workspace_without_notes_keeps_transcript_speakers_and_info(qtbot):
+    widget, _ = open_widget(qtbot, snapshot())
+    assert [widget.tabs.tabText(i) for i in range(widget.tabs.count())] == [
+        translate(name) for name in ("Transcript", "Speakers", "Info")
+    ]
+    assert widget.tabs.currentIndex() == 0
+
+
+@pytest.mark.parametrize("area", range(4))
+def test_same_meeting_refresh_and_reopen_preserve_area_without_starting_work(
+    workspace, area
+):
+    widget, detail, notes, controller = workspace
+    widget.tabs.setCurrentIndex(area)
+    refreshed = replace(
+        transcript(), segments=(replace(transcript().segments[0], text="Updated"),)
+    )
+    detail.results[0] = snapshot(transcript_value=refreshed)
+    widget.refresh()
+    assert widget.tabs.currentIndex() == area
+    assert widget.transcript_edit.toPlainText() == "Updated"
+    widget.open_meeting(MEETING_ID)
+    assert widget.tabs.currentIndex() == area
+    assert widget.transcript_edit.toPlainText() == "Updated"
+    controller.submit.assert_not_called()
+    for action in ("submit", "copy_request", "import_response", "retry_save", "export"):
+        getattr(notes, action).assert_not_called()
+
+
+def test_tab_navigation_only_changes_presentation(workspace):
+    widget, detail, notes, controller = workspace
+    before = widget._snapshot
+    detail_calls = list(detail.calls)
+    notes_calls = list(notes.mock_calls)
+    controller_calls = list(controller.mock_calls)
+    for area in (1, 2, 3, 0, 2, 1):
+        widget.tabs.setCurrentIndex(area)
+    assert widget._snapshot is before
+    assert detail.calls == detail_calls
+    assert notes.mock_calls == notes_calls
+    assert controller.mock_calls == controller_calls
+    assert not widget._speaker_reviews.mock_calls
+
+
+@pytest.mark.parametrize("area", range(4))
+def test_different_meeting_resets_area_and_replaces_all_detail_presentation(
+    workspace, area
+):
+    widget, detail, _, _ = workspace
+    widget.tabs.setCurrentIndex(area)
+    previous_date = widget.date_value.text()
+    widget.name_edit.setText("Unsaved previous name")
+    widget.word_table.selectRow(0)
+    widget.preview_button.click()
+    previous_player = widget._preview_player
+    other = uuid.UUID(int=999)
+    second = replace(
+        meeting(remote_exists=False),
+        session_id=other,
+        started_at=datetime(2026, 2, 2, tzinfo=timezone.utc),
+        duration_ns=9_000_000_000,
+        remote_source_kind=MeetingRemoteSourceKind.APPLICATION,
+    )
+    detail.results[0] = snapshot(
+        meeting_value=second,
+        transcript_state=MeetingDetailTranscriptState.NOT_AVAILABLE,
+    )
+    widget.open_meeting(other)
+    assert widget.tabs.currentIndex() == 0
+    assert widget._snapshot.meeting == second
+    assert widget.transcript_edit.toPlainText() == ""
+    assert widget.speaker_list.count() == widget.word_model.rowCount() == 0
+    assert not widget.word_table.selectionModel().selectedRows()
+    assert widget.name_edit.text() == ""
+    assert widget.merge_target_combo.count() == widget.assign_speaker_combo.count() == 0
+    assert not widget.add_speaker_button.isEnabled()
+    assert previous_player.stops == 1
+    assert widget._preview_player is None
+    assert widget.duration_value.text() == "9s"
+    assert widget.date_value.text() and widget.date_value.text() != previous_date
+    assert widget.source_value.text() == "Application audio"
+    assert widget.audio_table.item(1, 1).text() == translate("Missing")
+    assert widget.notes_panel.meeting_id == other
+    assert widget.notes_panel.selected_id is None
+
+
+@pytest.mark.parametrize("area", range(4))
+@pytest.mark.parametrize(
+    "error, message",
+    [
+        (MeetingDetailNotFoundError("missing"), "Meeting not found."),
+        (MeetingDetailLoadError("bad", corrupt=True), "Meeting data is corrupt."),
+        (MeetingDetailLoadError("unavailable"), "Could not load meeting."),
+        (MeetingDetailError("failed"), "Could not load meeting."),
+    ],
+)
+def test_global_load_errors_visible_from_every_area(workspace, area, error, message):
+    widget, detail, _, _ = workspace
+    widget.tabs.setCurrentIndex(area)
+    detail.results[0] = error
+    widget.refresh()
+    assert widget.tabs.currentIndex() == area
+    assert widget.state_label.text() == translate(message)
+    assert widget.state_label.isVisible()
+    assert not widget.tabs.isAncestorOf(widget.state_label)
+    assert widget._snapshot is None
+    assert widget.transcript_edit.toPlainText() == ""
+    assert widget.speaker_list.count() == widget.audio_table.rowCount() == 0
+    assert not widget.generate_review_button.isEnabled()
 
 
 def test_metadata_and_audio_tracks_render_without_paths(qtbot) -> None:
