@@ -394,6 +394,9 @@ class MainWindow(QMainWindow):
             self.meetings_library_widget.meeting_open_requested.connect(
                 self.on_meeting_open_requested
             )
+            self.meetings_library_widget.new_meeting_requested.connect(
+                self.on_new_meeting
+            )
         self.meetings_library_widget.refresh()
         self.meetings_library_widget.show()
         self.meetings_library_widget.raise_()
