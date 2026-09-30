@@ -380,3 +380,269 @@ def test_widget_module_has_no_qsql_dependency() -> None:
     assert "QtSql" not in source
     assert "QSql" not in source
     assert "QSqlTableModel" not in source
+
+
+def visible_entries(widget):
+    return tuple(
+        widget.table_model.meeting_at(row)
+        for row in range(widget.table_model.rowCount())
+    )
+
+
+def test_visible_actions_and_open_enabled_only_with_selection(qtbot) -> None:
+    entries = (make_entry(1), make_entry(2))
+    widget = make_widget(qtbot, FakeService([entries]))
+    widget.refresh()
+    assert widget.new_meeting_button.text() == _("New Meeting")
+    assert widget.open_meeting_button.text() == _("Open Meeting")
+    assert widget.refresh_button.text() == _("Refresh")
+    assert widget.new_meeting_button.isEnabled()
+    assert widget.refresh_button.isEnabled()
+    assert not widget.open_meeting_button.isEnabled()
+    received = []
+    widget.meeting_open_requested.connect(received.append)
+    widget.open_meeting_button.click()
+    assert received == []
+    widget.table_view.selectRow(1)
+    assert widget.open_meeting_button.isEnabled()
+    widget.open_meeting_button.click()
+    assert received == [entries[1].session_id]
+    widget.table_view.clearSelection()
+    assert not widget.open_meeting_button.isEnabled()
+    widget.open_meeting_button.click()
+    assert received == [entries[1].session_id]
+
+
+def test_new_meeting_requests_once_without_reading_or_opening(qtbot) -> None:
+    service = FakeService()
+    widget = make_widget(qtbot, service)
+    requests, opened = [], []
+    widget.new_meeting_requested.connect(lambda: requests.append(True))
+    widget.meeting_open_requested.connect(opened.append)
+    widget.new_meeting_button.click()
+    assert requests == [True]
+    assert opened == []
+    assert service.calls == 0
+
+
+def test_refresh_button_reads_once_and_restores_uuid_after_row_moves(qtbot) -> None:
+    first, selected, new = make_entry(1), make_entry(2), make_entry(3)
+    service = FakeService([(first, selected), (selected, new), (new,)])
+    widget = make_widget(qtbot, service)
+    widget.refresh_button.click()
+    assert service.calls == 1
+    widget.table_view.selectRow(1)
+    opened = []
+    widget.meeting_open_requested.connect(opened.append)
+    widget.refresh_button.click()
+    assert service.calls == 2
+    assert widget.selected_meeting_id() == selected.session_id
+    assert widget.open_meeting_button.isEnabled()
+    widget.open_meeting_button.click()
+    assert opened == [selected.session_id]
+    widget.refresh_button.click()
+    assert service.calls == 3
+    assert widget.selected_meeting_id() is None
+    assert not widget.open_meeting_button.isEnabled()
+    qtbot.keyClick(widget.table_view, Qt.Key.Key_Return)
+    assert opened == [selected.session_id]
+
+
+def test_filter_options_use_only_existing_source_and_state_values(qtbot) -> None:
+    widget = make_widget(qtbot, FakeService())
+    assert [widget.source_filter.itemData(i) for i in range(3)] == [
+        None,
+        MeetingRemoteSourceKind.SYSTEM,
+        MeetingRemoteSourceKind.APPLICATION,
+    ]
+    assert [widget.source_filter.itemText(i) for i in range(3)] == [
+        _("All"),
+        _("System audio"),
+        _("Application audio"),
+    ]
+    assert [
+        widget.state_filter.itemData(i) for i in range(widget.state_filter.count())
+    ] == [None, *MeetingSessionState]
+
+
+@pytest.mark.parametrize("source", list(MeetingRemoteSourceKind))
+def test_source_filter_is_local_and_keeps_service_order(qtbot, source) -> None:
+    entries = (
+        make_entry(3, remote_source_kind=MeetingRemoteSourceKind.APPLICATION),
+        make_entry(2),
+        make_entry(4, remote_source_kind=MeetingRemoteSourceKind.APPLICATION),
+        make_entry(1),
+    )
+    service = FakeService([entries])
+    widget = make_widget(qtbot, service)
+    widget.refresh()
+    assert visible_entries(widget) == entries
+    opened = []
+    widget.meeting_open_requested.connect(opened.append)
+    widget.source_filter.setCurrentIndex(widget.source_filter.findData(source))
+    assert visible_entries(widget) == tuple(
+        entry for entry in entries if entry.remote_source_kind == source
+    )
+    assert service.calls == 1
+    assert opened == []
+    assert widget.reset_filters_button.isEnabled()
+    widget.reset_filters_button.click()
+    assert visible_entries(widget) == entries
+    assert service.calls == 1
+    assert not widget.reset_filters_button.isEnabled()
+
+
+@pytest.mark.parametrize("state", list(MeetingSessionState))
+def test_state_filter_is_local_and_keeps_service_order(qtbot, state) -> None:
+    entries = tuple(
+        make_entry(i + 1, session_state=value)
+        for i, value in enumerate(reversed(list(MeetingSessionState)))
+    ) + (make_entry(10, session_state=state),)
+    service = FakeService([entries])
+    widget = make_widget(qtbot, service)
+    widget.refresh()
+    widget.state_filter.setCurrentIndex(widget.state_filter.findData(state))
+    assert visible_entries(widget) == tuple(
+        entry for entry in entries if entry.session_state == state
+    )
+    assert service.calls == 1
+    widget.reset_filters_button.click()
+    assert visible_entries(widget) == entries
+    assert service.calls == 1
+
+
+def test_combined_filters_and_empty_states(qtbot) -> None:
+    application = make_entry(1, remote_source_kind=MeetingRemoteSourceKind.APPLICATION)
+    failed = make_entry(2, session_state=MeetingSessionState.FAILED)
+    service = FakeService([(application, failed), ()])
+    widget = make_widget(qtbot, service)
+    widget.refresh()
+    widget.source_filter.setCurrentIndex(
+        widget.source_filter.findData(MeetingRemoteSourceKind.APPLICATION)
+    )
+    widget.state_filter.setCurrentIndex(
+        widget.state_filter.findData(MeetingSessionState.FAILED)
+    )
+    assert visible_entries(widget) == ()
+    assert widget.state_label.text() == _("No matching meetings.")
+    assert not widget.state_label.isHidden()
+    assert not widget.open_meeting_button.isEnabled()
+    assert service.calls == 1
+    widget.refresh()
+    assert widget.state_label.text() == _("No meetings yet.")
+    assert widget.source_filter.currentData() == MeetingRemoteSourceKind.APPLICATION
+    assert widget.state_filter.currentData() == MeetingSessionState.FAILED
+    widget.reset_filters_button.click()
+    assert widget.source_filter.currentIndex() == 0
+    assert widget.state_filter.currentIndex() == 0
+    assert widget.state_label.text() == _("No meetings yet.")
+    assert service.calls == 2
+
+
+@pytest.mark.parametrize("filter_name", ["source_filter", "state_filter"])
+def test_hidden_selection_cannot_open_after_filter_or_reset(qtbot, filter_name) -> None:
+    selected = make_entry(1)
+    remaining = make_entry(
+        2,
+        remote_source_kind=MeetingRemoteSourceKind.APPLICATION,
+        session_state=MeetingSessionState.FAILED,
+    )
+    widget = make_widget(qtbot, FakeService([(selected, remaining)]))
+    widget.refresh()
+    widget.table_view.selectRow(0)
+    opened = []
+    widget.meeting_open_requested.connect(opened.append)
+    combo = getattr(widget, filter_name)
+    value = (
+        MeetingRemoteSourceKind.APPLICATION
+        if filter_name == "source_filter"
+        else MeetingSessionState.FAILED
+    )
+    combo.setCurrentIndex(combo.findData(value))
+    assert visible_entries(widget) == (remaining,)
+    assert widget.selected_meeting_id() is None
+    assert not widget.table_view.currentIndex().isValid()
+    assert not widget.open_meeting_button.isEnabled()
+    widget.open_meeting_button.click()
+    qtbot.keyClick(widget.table_view, Qt.Key.Key_Return)
+    widget.reset_filters_button.click()
+    assert widget.selected_meeting_id() is None
+    assert not widget.open_meeting_button.isEnabled()
+    qtbot.keyClick(widget.table_view, Qt.Key.Key_Enter)
+    assert opened == []
+    widget.table_view.selectRow(1)
+    widget.open_meeting_button.click()
+    assert opened == [remaining.session_id]
+
+
+def test_visible_selection_survives_filter_and_filtered_refresh(qtbot) -> None:
+    selected = make_entry(2, session_state=MeetingSessionState.FAILED)
+    first = make_entry(1, session_state=MeetingSessionState.FAILED)
+    service = FakeService([(first, selected), (selected, first)])
+    widget = make_widget(qtbot, service)
+    widget.refresh()
+    widget.table_view.selectRow(1)
+    widget.state_filter.setCurrentIndex(
+        widget.state_filter.findData(MeetingSessionState.FAILED)
+    )
+    assert widget.selected_meeting_id() == selected.session_id
+    widget.refresh()
+    assert widget.selected_meeting_id() == selected.session_id
+    assert widget.table_view.selectionModel().selectedRows()[0].row() == 0
+    assert widget.open_meeting_button.isEnabled()
+    assert service.calls == 2
+
+
+def test_refresh_clears_selection_if_updated_header_no_longer_matches(qtbot) -> None:
+    from dataclasses import replace
+
+    selected = make_entry(1)
+    changed = replace(selected, remote_source_kind=MeetingRemoteSourceKind.APPLICATION)
+    widget = make_widget(qtbot, FakeService([(selected,), (changed,)]))
+    widget.refresh()
+    widget.source_filter.setCurrentIndex(
+        widget.source_filter.findData(MeetingRemoteSourceKind.SYSTEM)
+    )
+    widget.table_view.selectRow(0)
+    widget.refresh()
+    assert widget.selected_meeting_id() is None
+    assert not widget.open_meeting_button.isEnabled()
+    assert widget.state_label.text() == _("No matching meetings.")
+
+
+def test_failure_retains_filters_rows_and_selection_then_recovers(qtbot) -> None:
+    selected = make_entry(2, session_state=MeetingSessionState.FAILED)
+    entries = (make_entry(1), selected)
+    service = FakeService(
+        [entries, MeetingLibraryDatabaseError("unavailable"), (selected,)]
+    )
+    widget = make_widget(qtbot, service)
+    widget.refresh()
+    widget.source_filter.setCurrentIndex(
+        widget.source_filter.findData(MeetingRemoteSourceKind.SYSTEM)
+    )
+    widget.state_filter.setCurrentIndex(
+        widget.state_filter.findData(MeetingSessionState.FAILED)
+    )
+    widget.table_view.selectRow(0)
+    widget.refresh_button.click()
+    assert visible_entries(widget) == (selected,)
+    assert widget.selected_meeting_id() == selected.session_id
+    assert widget.open_meeting_button.isEnabled()
+    assert widget.source_filter.currentData() == MeetingRemoteSourceKind.SYSTEM
+    assert widget.state_filter.currentData() == MeetingSessionState.FAILED
+    assert widget.state_label.text() == _("Could not load meetings.")
+    widget.reset_filters_button.click()
+    assert visible_entries(widget) == entries
+    assert widget.state_label.text() == _("Could not load meetings.")
+    assert service.calls == 2
+    widget.state_filter.setCurrentIndex(
+        widget.state_filter.findData(MeetingSessionState.FAILED)
+    )
+    widget.refresh_button.click()
+    assert service.calls == 3
+    assert visible_entries(widget) == (selected,)
+    assert widget.selected_meeting_id() == selected.session_id
+    assert widget.state_filter.currentData() == MeetingSessionState.FAILED
+    assert widget.state_label.text() == ""
+    assert widget.state_label.isHidden()

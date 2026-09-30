@@ -23,6 +23,7 @@ from pytestqt.qtbot import QtBot
 from buzz.locale import _
 from buzz.meeting.meeting_library import MeetingLibraryService
 from buzz.meeting.meeting_detail import MeetingDetailNotFoundError, MeetingDetailService
+from buzz.meeting.meeting_session import MeetingRemoteSourceKind
 from buzz.meeting.speaker_review import MeetingSpeakerReviewService
 from buzz.db.entity.transcription import Transcription
 from buzz.db.service.transcription_service import TranscriptionService
@@ -46,6 +47,7 @@ from buzz.widgets.transcriber.file_transcriber_widget import FileTranscriberWidg
 from buzz.widgets.transcription_tasks_table_widget import (
     TranscriptionTasksTableWidget,
 )
+from tests.widgets.meetings_library_widget_test import make_entry
 
 mock_transcriptions: List[Transcription] = [
     Transcription(status="completed"),
@@ -174,6 +176,10 @@ class TestMainWindow:
             assert isinstance(widget, MeetingsLibraryWidget)
             assert meeting_service.list_meetings.call_count == 1
             assert widget.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose) is False
+            widget.source_filter.setCurrentIndex(
+                widget.source_filter.findData(MeetingRemoteSourceKind.APPLICATION)
+            )
+            assert meeting_service.list_meetings.call_count == 1
             original_identity = widget
 
             widget.close()
@@ -189,10 +195,97 @@ class TestMainWindow:
             assert meeting_service.list_meetings.call_count == 2
             assert not sip.isdeleted(widget)
             assert widget.table_model.rowCount() == 0
+            assert (
+                widget.source_filter.currentData()
+                == MeetingRemoteSourceKind.APPLICATION
+            )
+            assert widget.state_label.text() == _("No meetings yet.")
             assert QApplication.instance() is application
             setup_app_db.assert_not_called()
             posthog.assert_not_called()
             window.close()
+
+    def test_library_new_meeting_routes_once_and_reuses_existing_capture_workflow(
+        self, qtbot, transcription_service
+    ):
+        service = Mock(spec=MeetingLibraryService)
+        service.list_meetings.return_value = ()
+        controller = Mock(active=False)
+        capture = Mock()
+        window = MainWindow(
+            transcription_service, service, meeting_controller=controller
+        )
+        qtbot.add_widget(window)
+        with (
+            patch.object(window, "on_new_meeting", wraps=window.on_new_meeting) as new,
+            patch(
+                "buzz.widgets.main_window.MeetingCaptureWidget", return_value=capture
+            ) as capture_type,
+        ):
+            window.on_meetings_action_triggered()
+            library = window.meetings_library_widget
+            library.new_meeting_button.click()
+            new.assert_called_once_with()
+            capture_type.assert_called_once_with(controller, window)
+            assert window.meeting_capture_widget is capture
+            capture.show.assert_called_once_with()
+            capture.raise_.assert_called_once_with()
+            capture.activateWindow.assert_called_once_with()
+            library.close()
+            window.on_meetings_action_triggered()
+            assert window.meetings_library_widget is library
+            library.new_meeting_button.click()
+            assert new.call_count == 2
+            capture_type.assert_called_once()
+            assert capture.show.call_count == 2
+            assert service.list_meetings.call_count == 2
+            controller.start.assert_not_called()
+        window.close()
+
+    def test_library_controls_open_uuid_through_reused_detail_without_starting_work(
+        self, qtbot, transcription_service
+    ):
+        service = Mock(spec=MeetingLibraryService)
+        first = make_entry(1)
+        selected = make_entry(2, remote_source_kind=MeetingRemoteSourceKind.APPLICATION)
+        service.list_meetings.return_value = (first, selected)
+        controller = Mock(active=False)
+        final, notes, speakers = Mock(), Mock(), Mock()
+        detail = Mock()
+        window = MainWindow(
+            transcription_service,
+            service,
+            meeting_controller=controller,
+            meeting_final=final,
+            meeting_notes=notes,
+            meeting_speakers=speakers,
+        )
+        qtbot.add_widget(window)
+        with patch(
+            "buzz.widgets.main_window.MeetingDetailWidget", return_value=detail
+        ) as detail_type:
+            window.on_meetings_action_triggered()
+            library = window.meetings_library_widget
+            library.source_filter.setCurrentIndex(
+                library.source_filter.findData(MeetingRemoteSourceKind.APPLICATION)
+            )
+            library.table_view.selectRow(0)
+            library.refresh_button.click()
+            assert service.list_meetings.call_count == 2
+            detail_type.assert_not_called()
+            library.open_meeting_button.click()
+            library.table_view.doubleClicked.emit(library.table_model.index(0, 0))
+            qtbot.keyClick(library.table_view, Qt.Key.Key_Return)
+            detail_type.assert_called_once()
+            assert window.meeting_detail_widget is detail
+            assert detail.open_meeting.call_args_list == [call(selected.session_id)] * 3
+            assert window.centralWidget() is window.table_widget
+            assert window.meeting_capture_widget is None
+            controller.start.assert_not_called()
+            final.request.assert_not_called()
+            notes.request.assert_not_called()
+            speakers.request.assert_not_called()
+        window.close()
 
     def test_meetings_library_does_not_replace_legacy_central_widget(
         self, qtbot, transcription_service
