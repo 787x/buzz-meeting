@@ -8,9 +8,13 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QComboBox,
     QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -50,35 +54,68 @@ class MeetingCaptureWidget(QWidget):
         self.model_size.addItems(["TINY", "BASE", "SMALL", "MEDIUM", "LARGEV3"])
         self.model_size.setCurrentText("SMALL")
         self.model_help = QLabel(
-            "Final transcription uses a local Faster Whisper model. "
-            "Download the selected model in Preferences → Models before transcription. "
-            "If unavailable, your recording is saved and transcription can be retried.",
+            "Final transcription runs after the recording is saved. "
+            "If the model is unavailable, the recording remains saved "
+            "and transcription can be retried later.",
             self,
         )
         self.model_help.setWordWrap(True)
-        self.start_button = QPushButton("Start", self)
-        self.stop_button = QPushButton("Stop", self)
-        self.open_button = QPushButton("Open Meeting Details", self)
+        self.model_help.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum
+        )
+        self.start_button = QPushButton("Start Meeting", self)
+        self.stop_button = QPushButton("End && Save", self)
+        self.open_button = QPushButton("Open Meeting", self)
         self.status_label = QLabel(self)
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_label.setWordWrap(True)
+        status_font = self.status_label.font()
+        status_font.setBold(True)
+        self.status_label.setFont(status_font)
         self.error_label = QLabel(self)
+        self.error_label.setTextFormat(Qt.TextFormat.PlainText)
         self.error_label.setWordWrap(True)
+        self.error_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
         self.elapsed_label = QLabel("00:00:00", self)
-        layout = QFormLayout(self)
-        layout.addRow("Microphone", self.microphone)
-        layout.addRow("Meeting audio", self.remote)
-        layout.addRow("Application", self.target)
-        layout.addRow(self.refresh_targets)
-        layout.addRow("Final transcription model", self.model_size)
-        for widget in (
-            self.model_help,
-            self.start_button,
-            self.stop_button,
-            self.status_label,
-            self.elapsed_label,
-            self.error_label,
-            self.open_button,
-        ):
-            layout.addRow(widget)
+        self.elapsed_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.elapsed_label.setAccessibleName("Elapsed recording time")
+        elapsed_font = self.elapsed_label.font()
+        elapsed_font.setPointSize(32)
+        self.elapsed_label.setFont(elapsed_font)
+
+        layout = QVBoxLayout(self)
+        self.setup_group = QGroupBox("Recording Setup", self)
+        setup_layout = QFormLayout(self.setup_group)
+        setup_layout.addRow("Microphone", self.microphone)
+        setup_layout.addRow("Meeting audio", self.remote)
+        self.application_label = QLabel("Application", self)
+        self.application_controls = QWidget(self)
+        application_layout = QHBoxLayout(self.application_controls)
+        application_layout.setContentsMargins(0, 0, 0, 0)
+        application_layout.addWidget(self.target, 1)
+        application_layout.addWidget(self.refresh_targets)
+        setup_layout.addRow(self.application_label, self.application_controls)
+        final_group = QGroupBox("Final transcription", self)
+        final_layout = QFormLayout(final_group)
+        final_layout.addRow("Model", self.model_size)
+        final_layout.addRow(self.model_help)
+        setup_layout.addRow(final_group)
+        layout.addWidget(self.setup_group)
+
+        self.recording_group = QGroupBox("Recording", self)
+        recording_layout = QVBoxLayout(self.recording_group)
+        recording_layout.addWidget(self.elapsed_label)
+        recording_layout.addWidget(self.status_label)
+        recording_layout.addWidget(self.error_label)
+        actions = QHBoxLayout()
+        actions.addWidget(self.start_button)
+        actions.addWidget(self.stop_button)
+        recording_layout.addLayout(actions)
+        recording_layout.addWidget(self.open_button)
+        layout.addWidget(self.recording_group)
+        self.setMinimumWidth(560)
         self.start_button.clicked.connect(self._start)
         self.stop_button.clicked.connect(controller.end)
         self.open_button.clicked.connect(
@@ -109,6 +146,8 @@ class MeetingCaptureWidget(QWidget):
         self._render()
 
     def _start(self):
+        if self.controller.active:
+            return
         try:
             index = self.microphone.currentIndex()
             if index < 0:
@@ -131,7 +170,6 @@ class MeetingCaptureWidget(QWidget):
             self.config = FinalTranscriptionConfig(
                 whisper_model_size=self.model_size.currentText()
             )
-            self._started_at = None
             self.controller.start(microphone, remote, kind)
         except Exception as exc:
             self.controller.error = str(exc)
@@ -142,30 +180,37 @@ class MeetingCaptureWidget(QWidget):
         for widget in (self.microphone, self.remote, self.model_size):
             widget.setEnabled(not active)
         application = self.remote.currentData() is MeetingRemoteSourceKind.APPLICATION
+        self.application_label.setVisible(application)
+        self.application_controls.setVisible(application)
         self.target.setEnabled(not active and application)
         self.refresh_targets.setEnabled(not active and application)
         self.start_button.setEnabled(not active)
         self.stop_button.setEnabled(active and self.controller.worker is None)
         self.stop_button.setText(
             {
-                MeetingWorkflowState.AWAITING_PERSISTENCE: "Retry saving",
-                MeetingWorkflowState.CLEANUP_REQUIRED: "Retry ending meeting",
-            }.get(self.controller.workflow.state, "Stop")
+                MeetingWorkflowState.AWAITING_PERSISTENCE: "Retry Saving",
+                MeetingWorkflowState.CLEANUP_REQUIRED: "Retry Ending Meeting",
+            }.get(self.controller.workflow.state, "End && Save")
         )
         self.open_button.setEnabled(self.controller.saved_id is not None)
+        self.open_button.setVisible(self.controller.saved_id is not None)
         self.status_label.setText(self.controller.status)
         self.error_label.setText(self.controller.error)
+        self.error_label.setVisible(bool(self.controller.error))
+        # Starting is emitted synchronously by the controller, including when
+        # a reused window starts again. Never carry the previous attempt's clock.
+        if self.controller.status == "Starting…":
+            self._started_at = None
         if self.controller.status.startswith("Recording") and self._started_at is None:
             self._started_at = time.monotonic()
-        elapsed = None
+        elapsed = 0
         if self.controller.duration_seconds is not None:
             elapsed = int(self.controller.duration_seconds)
         elif active and self._started_at is not None:
             elapsed = int(time.monotonic() - self._started_at)
-        if elapsed is not None:
-            self.elapsed_label.setText(
-                f"{elapsed // 3600:02}:{elapsed // 60 % 60:02}:{elapsed % 60:02}"
-            )
+        self.elapsed_label.setText(
+            f"{elapsed // 3600:02}:{elapsed // 60 % 60:02}:{elapsed % 60:02}"
+        )
 
     def confirm_end(self):
         return (
