@@ -44,6 +44,7 @@ from buzz.meeting.meeting_detail import (
     MeetingDetailTranscriptState,
 )
 from buzz.meeting.meeting_storage import StoredMeetingAudioTrack
+from buzz.widgets.meeting_speaker_generation import can_generate_review
 from buzz.meeting.speaker_review import (
     MeetingSpeakerReview,
     MeetingSpeakerReviewService,
@@ -157,6 +158,7 @@ class MeetingDetailWidget(QWidget):
         flags: Qt.WindowType = Qt.WindowType.Widget,
         final_transcription=None,
         meeting_notes=None,
+        speaker_generation=None,
     ) -> None:
         super().__init__(parent, flags)
         self._detail_service = detail_service
@@ -167,11 +169,14 @@ class MeetingDetailWidget(QWidget):
         self._preview_player: Any | None = None
         self._final_transcription = final_transcription
         self._meeting_notes = meeting_notes
+        self._speaker_generation = speaker_generation
         self.notes_panel = None
         self.setWindowTitle(_("Meeting Details"))
         self.resize(1000, 760)
         self._build_ui()
         self._clear_presentation()
+        if speaker_generation is not None:
+            speaker_generation.changed.connect(self._generation_changed)
 
     def _build_ui(self) -> None:
         self.state_label = QLabel(self)
@@ -225,6 +230,15 @@ class MeetingDetailWidget(QWidget):
         review_layout = QVBoxLayout(review_group)
         self.review_state_label = QLabel(review_group)
         review_layout.addWidget(self.review_state_label)
+        self.generate_review_button = QPushButton(
+            _("Generate Speaker Review"), review_group
+        )
+        self.generate_review_button.setVisible(self._speaker_generation is not None)
+        self.generate_review_button.clicked.connect(self._generate_review)
+        self.generation_status_label = QLabel(review_group)
+        self.generation_status_label.setWordWrap(True)
+        review_layout.addWidget(self.generate_review_button)
+        review_layout.addWidget(self.generation_status_label)
 
         review_splitter = QSplitter(Qt.Orientation.Horizontal, review_group)
         speaker_panel = QWidget(review_splitter)
@@ -344,6 +358,8 @@ class MeetingDetailWidget(QWidget):
         self._render(snapshot)
 
     def _clear_presentation(self) -> None:
+        self.generate_review_button.setEnabled(False)
+        self.generation_status_label.clear()
         self.retry_transcription_button.setEnabled(False)
         self.state_label.clear()
         for label in (
@@ -448,6 +464,7 @@ class MeetingDetailWidget(QWidget):
         self.retry_transcription_button.setEnabled(False)
 
     def _render_review(self, snapshot: MeetingDetailSnapshot) -> None:
+        self._render_generation()
         labels = {
             MeetingDetailSpeakerReviewState.NOT_APPLICABLE: _("Not applicable"),
             MeetingDetailSpeakerReviewState.ABSENT: _("No speaker review"),
@@ -476,6 +493,34 @@ class MeetingDetailWidget(QWidget):
         )
         if review.speakers:
             self.speaker_list.setCurrentRow(0)
+
+    def _render_generation(self):
+        controller = self._speaker_generation
+        self.generate_review_button.setEnabled(
+            controller is not None
+            and not controller.closing
+            and not controller.busy
+            and self._snapshot is not None
+            and can_generate_review(self._snapshot)
+        )
+        self.generation_status_label.setText(
+            controller.message_for(self._current_meeting_id)
+            if controller is not None
+            else ""
+        )
+
+    def _generate_review(self):
+        if (
+            self._speaker_generation is not None
+            and self._current_meeting_id is not None
+        ):
+            self._speaker_generation.submit(self._current_meeting_id)
+
+    def _generation_changed(self, meeting_id):
+        if meeting_id == self._current_meeting_id:
+            self.refresh()
+        else:
+            self._render_generation()
 
     def _set_mutations_enabled(self, enabled: bool) -> None:
         for widget in (

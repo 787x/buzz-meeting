@@ -5,6 +5,7 @@ The legacy (non-meeting) transcription service is unused in these scenarios.
 """
 
 from dataclasses import replace
+from threading import Event, get_ident
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -12,6 +13,8 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import soundfile as sf
+from PyQt6.QtCore import Qt
+from PyQt6.QtSql import QSqlQuery
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from buzz.audio_capture.source import AudioSourceError
@@ -26,9 +29,14 @@ from buzz.meeting.final_transcription import (
     FinalTranscriptionReadService,
     FinalTranscriptionStatus,
     TrackTranscriptionInputSegment,
+    TrackTranscriptionInputWord,
+    TrackTranscriptionResult,
 )
 from buzz.meeting.meeting_audio_tracks import MeetingAudioTracksOutcome
-from buzz.meeting.meeting_detail import MeetingDetailService
+from buzz.meeting.meeting_detail import (
+    MeetingDetailService,
+    MeetingDetailSpeakerReviewState,
+)
 from buzz.meeting.meeting_library import MeetingLibraryService
 from buzz.meeting.meeting_notes import MeetingNotesService, NotesError
 from buzz.meeting.meeting_session import MeetingSessionState
@@ -39,13 +47,17 @@ from buzz.meeting.meeting_summary import (
 )
 from buzz.meeting.meeting_workflow import MeetingWorkflow
 from buzz.meeting.speaker_review import MeetingSpeakerReviewService
+from buzz.meeting.speaker_diarization import SpeakerDiarizationService
+from buzz.meeting.speaker_mapping import SpeakerAttributionStatus, map_words_to_speakers
 from buzz.widgets.main_window import MainWindow
 from buzz.widgets.meeting_final_transcription import MeetingFinalTranscription
 from buzz.widgets.meeting_mode import MeetingModeController
 from buzz.widgets.meeting_notes_controller import MeetingNotesController
+from buzz.widgets.meeting_speaker_generation import MeetingSpeakerGeneration
 from tests.meeting.meeting_workflow_test import ControlledAudioSource
 from tests.widgets.meeting_mode_test import Adapter
 from tests.widgets.meeting_notes_test import ControlledProvider, config
+from tests.widgets.meeting_speaker_generation_test import ControlledRunner
 
 
 @pytest.fixture(scope="session")
@@ -60,6 +72,13 @@ def product(db, tmp_path, qtbot, monkeypatch):
     reader = FinalTranscriptionReadService(repository)
     reviews = MeetingSpeakerReviewService(QSqlMeetingSpeakerRepository(db), reader)
     detail = MeetingDetailService(storage, reader, reviews)
+    speaker_runner = ControlledRunner()
+    speakers = MeetingSpeakerGeneration(
+        detail,
+        reader,
+        reviews,
+        service_factory=lambda _: SpeakerDiarizationService(speaker_runner),
+    )
     summaries = QSqlMeetingSummaryRepository(db)
     provider = ControlledProvider()
     requests = []
@@ -103,6 +122,7 @@ def product(db, tmp_path, qtbot, monkeypatch):
         meeting_controller=capture,
         meeting_final=final,
         meeting_notes=notes,
+        meeting_speakers=speakers,
     )
     window.new_meeting_action.trigger()
     assert window.meeting_capture_widget.windowTitle() == "New Meeting"
@@ -123,8 +143,14 @@ def product(db, tmp_path, qtbot, monkeypatch):
         window=window,
         db=db,
         root=tmp_path,
+        speakers=speakers,
+        speaker_runner=speaker_runner,
+        reviews=reviews,
+        repository=repository,
     )
     yield result
+    speaker_runner.release.set()
+    qtbot.waitUntil(lambda: not speakers.busy, timeout=15000)
     provider.allow_result.set()
     provider.allow_cleanup.set()
     qtbot.waitUntil(lambda: not notes.busy, timeout=15000)
@@ -140,6 +166,258 @@ def product(db, tmp_path, qtbot, monkeypatch):
     final.close()
     window.meeting_capture_widget.close()
     window.close()
+
+
+def reviewable_final(product, qtbot):
+    """Prepare v2 through the existing final-transcription pipeline and adapter."""
+    p = product
+    identity, stored = record(p, qtbot)
+    transcribe(p, qtbot)
+    p.final.request(
+        identity,
+        FinalTranscriptionConfig(profile_version=2, whisper_model_size="SMALL"),
+    )
+    for index in (3, 4):
+        qtbot.waitUntil(lambda: len(p.adapter.calls) == index)
+        path = Path(p.adapter.calls[-1][0])
+        assert path in (stored.microphone.path, stored.remote.path)
+        p.adapter.track_rich_completed.emit(
+            TrackTranscriptionResult(
+                segments=(
+                    TrackTranscriptionInputSegment(10, 100, f"From {path.stem}"),
+                ),
+                words=(
+                    TrackTranscriptionInputWord(0, 10, 40, "From"),
+                    TrackTranscriptionInputWord(0, 40, 100, path.stem),
+                ),
+            )
+        )
+    qtbot.waitUntil(lambda: not p.final.pending)
+    source = authoritative(p, identity)
+    assert source.final_generation.profile_version == 2
+    assert source.speaker_review_state is MeetingDetailSpeakerReviewState.ABSENT
+    assert not p.speaker_runner.calls, "opening/final completion started diarization"
+    assert p.window.meeting_detail_widget.generate_review_button.isEnabled()
+    return identity, stored, source
+
+
+def test_product_explicit_speaker_generation_persisted_reload(
+    product, qtbot, monkeypatch
+):
+    p = product
+    identity, stored, source = reviewable_final(p, qtbot)
+    audio_before = {
+        t.path: t.path.read_bytes() for t in (stored.microphone, stored.remote)
+    }
+    words_before = p.reader.load_words(source.final_generation.generation_id)
+    owner = get_ident()
+    calls = []
+    create = p.reviews.create_review
+
+    def save(*args):
+        assert get_ident() == owner and p.db.isOpen()
+        calls.append(args)
+        return create(*args)
+
+    monkeypatch.setattr(p.reviews, "create_review", save)
+    widget = p.window.meeting_detail_widget
+    widget.generate_review_button.click()
+    qtbot.waitUntil(p.speaker_runner.entered.is_set)
+    assert p.speaker_runner.calls[0][1] != owner
+    assert not widget.generate_review_button.isEnabled()
+    p.speaker_runner.release.set()
+    qtbot.waitUntil(lambda: not p.speakers.busy)
+    assert len(calls) == 1
+    assert calls[0][0] == source.final_generation.generation_id
+    # Fresh repositories/services must recover the same canonical review.
+    reader = FinalTranscriptionReadService(QSqlMeetingTranscriptionRepository(p.db))
+    reviews = MeetingSpeakerReviewService(QSqlMeetingSpeakerRepository(p.db), reader)
+    detail = MeetingDetailService(
+        MeetingStorage(QSqlMeetingRepository(p.db), root=p.root / "meetings"),
+        reader,
+        reviews,
+    )
+    reloaded = detail.load(identity)
+    assert reloaded.speaker_review_state is MeetingDetailSpeakerReviewState.FRESH
+    assert (
+        reloaded.speaker_review.source_generation_id
+        == source.final_generation.generation_id
+    )
+    assert tuple(w.word for w in reloaded.speaker_review.words) == words_before
+    assert all(
+        w.machine_status is SpeakerAttributionStatus.ASSIGNED
+        for w in reloaded.speaker_review.words
+    )
+    assert widget._snapshot.speaker_review == reloaded.speaker_review
+    assert widget.word_model.rowCount() == len(words_before)
+    assert widget.review_state_label.text() == "Available"
+    assert not widget.generate_review_button.isEnabled()
+    assert p.storage.load(identity) == stored
+    assert p.reader.load_words(source.final_generation.generation_id) == words_before
+    assert all(path.read_bytes() == original for path, original in audio_before.items())
+    np.testing.assert_allclose(p.speaker_runner.calls[0][0].waveform, 0.1, atol=0.0001)
+    np.testing.assert_allclose(p.speaker_runner.calls[1][0].waveform, 0.2, atol=0.0001)
+
+
+def test_product_speaker_source_words_race_does_not_persist(product, qtbot):
+    p = product
+    identity, _, source = reviewable_final(p, qtbot)
+    p.window.meeting_detail_widget.generate_review_button.click()
+    qtbot.waitUntil(p.speaker_runner.entered.is_set)
+    query = QSqlQuery(p.db)
+    query.prepare(
+        "UPDATE meeting_final_transcription_word SET text = ? WHERE generation_id = ?"
+    )
+    query.addBindValue("Durable source changed")
+    query.addBindValue(str(source.final_generation.generation_id))
+    assert query.exec(), query.lastError().text()
+    assert all(
+        w.text == "Durable source changed"
+        for w in p.reader.load_words(source.final_generation.generation_id)
+    )
+    p.speaker_runner.release.set()
+    qtbot.waitUntil(lambda: not p.speakers.busy)
+    assert (
+        p.reviews.load_review_for_generation(source.final_generation.generation_id)
+        is None
+    )
+    assert (
+        p.detail.load(identity).speaker_review_state
+        is MeetingDetailSpeakerReviewState.ABSENT
+    )
+    assert (
+        "Source changed"
+        in p.window.meeting_detail_widget.generation_status_label.text()
+    )
+
+
+def test_product_close_waits_for_speaker_work_and_thread_cleanup(
+    product, qtbot, monkeypatch, qapp
+):
+    p = product
+    identity, _, source = reviewable_final(p, qtbot)
+    p.window.show()
+    widget = p.window.meeting_detail_widget
+    widget.generate_review_button.click()
+    qtbot.waitUntil(p.speaker_runner.entered.is_set)
+    worker, thread = p.speakers.worker, p.speakers.worker_thread
+    cleanup_entered, allow_cleanup = Event(), Event()
+    closed = []
+
+    def hold_cleanup(*args):
+        cleanup_entered.set()
+        assert allow_cleanup.wait(10)
+
+    worker.outcome.connect(hold_cleanup, Qt.ConnectionType.DirectConnection)
+
+    def close_database():
+        assert p.speakers.worker is p.speakers.worker_thread is None
+        assert (
+            p.reviews.load_review_for_generation(source.final_generation.generation_id)
+            is not None
+        )
+        closed.append(identity)
+        p.db.close()
+
+    monkeypatch.setattr(qapp, "close_database", close_database, raising=False)
+    try:
+        assert not p.window.close()
+        assert p.db.isOpen() and not closed
+        assert p.speakers.parent() is p.window
+        assert p.speakers.worker is worker and p.speakers.worker_thread is thread
+        p.speaker_runner.release.set()
+        qtbot.waitUntil(cleanup_entered.is_set)
+        qtbot.waitUntil(
+            lambda: p.reviews.load_review_for_generation(
+                source.final_generation.generation_id
+            )
+            is not None
+        )
+        assert p.speakers.busy and not thread.wait(0)
+        assert not p.window.close()
+        assert p.db.isOpen() and not closed
+        assert p.speakers.worker is worker and p.speakers.worker_thread is thread
+        allow_cleanup.set()
+        qtbot.waitUntil(lambda: bool(closed))
+        assert closed == [identity]
+        assert not p.db.isOpen() and not p.window.isVisible()
+    finally:
+        allow_cleanup.set()
+        p.speaker_runner.release.set()
+        qtbot.waitUntil(lambda: not p.speakers.busy)
+        assert p.db.open()
+        monkeypatch.setattr(qapp, "close_database", lambda: None)
+
+
+def test_product_concurrent_review_keeps_user_edits(product, qtbot):
+    p = product
+    identity, _, source = reviewable_final(p, qtbot)
+    p.window.meeting_detail_widget.generate_review_button.click()
+    qtbot.waitUntil(p.speaker_runner.entered.is_set)
+    words = p.reader.load_words(source.final_generation.generation_id)
+    other = p.reviews.create_review(
+        source.final_generation.generation_id, (), map_words_to_speakers(words, ())
+    )
+    protected = p.reviews.create_speaker(other.id, "Protected participant")
+    p.speaker_runner.release.set()
+    qtbot.waitUntil(lambda: not p.speakers.busy)
+    assert (
+        p.reviews.load_review_for_generation(source.final_generation.generation_id)
+        == protected
+    )
+    assert p.detail.load(identity).speaker_review == protected
+    assert p.window.meeting_detail_widget._snapshot.speaker_review == protected
+
+
+def test_product_speaker_save_failure_rolls_back_then_explicit_retry(product, qtbot):
+    p = product
+    identity, stored, source = reviewable_final(p, qtbot)
+    words = p.reader.load_words(source.final_generation.generation_id)
+    query = QSqlQuery(p.db)
+    assert query.exec(
+        "CREATE TRIGGER fail_speaker_save BEFORE INSERT ON meeting_speaker_turn BEGIN SELECT RAISE(FAIL, 'controlled save failure'); END"
+    ), query.lastError().text()
+    widget = p.window.meeting_detail_widget
+    widget.generate_review_button.click()
+    qtbot.waitUntil(p.speaker_runner.entered.is_set)
+    p.speaker_runner.release.set()
+    qtbot.waitUntil(lambda: not p.speakers.busy)
+    assert (
+        p.reviews.load_review_for_generation(source.final_generation.generation_id)
+        is None
+    )
+    assert "controlled save failure" in widget.generation_status_label.text()
+    assert widget.generate_review_button.isEnabled()
+    assert p.storage.load(identity) == stored
+    assert p.reader.load_words(source.final_generation.generation_id) == words
+    assert query.exec("DROP TRIGGER fail_speaker_save"), query.lastError().text()
+    widget.generate_review_button.click()
+    qtbot.waitUntil(lambda: not p.speakers.busy)
+    assert (
+        p.detail.load(identity).speaker_review_state
+        is MeetingDetailSpeakerReviewState.FRESH
+    )
+
+
+def test_product_open_second_meeting_during_speaker_generation(product, qtbot):
+    p = product
+    first, _, source = reviewable_final(p, qtbot)
+    p.window.meeting_detail_widget.generate_review_button.click()
+    qtbot.waitUntil(p.speaker_runner.entered.is_set)
+    second, _ = record(p, qtbot)
+    transcribe(p, qtbot, start=4)
+    assert second != first
+    assert p.window.meeting_detail_widget._current_meeting_id == second
+    p.speaker_runner.release.set()
+    qtbot.waitUntil(lambda: not p.speakers.busy)
+    assert (
+        p.detail.load(first).speaker_review.source_generation_id
+        == source.final_generation.generation_id
+    )
+    assert p.detail.load(second).speaker_review is None
+    assert p.window.meeting_detail_widget._snapshot.speaker_review is None
+    p.window.on_meeting_open_requested(first)
+    assert p.window.meeting_detail_widget._snapshot.speaker_review is not None
 
 
 def record(product, qtbot, *, degraded=False):

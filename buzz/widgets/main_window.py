@@ -70,6 +70,7 @@ class MainWindow(QMainWindow):
         meeting_controller=None,
         meeting_final=None,
         meeting_notes=None,
+        meeting_speakers=None,
     ):
         super().__init__(flags=Qt.WindowType.Window)
 
@@ -93,6 +94,10 @@ class MainWindow(QMainWindow):
         self.meeting_controller = meeting_controller
         self.meeting_final = meeting_final
         self.meeting_notes = meeting_notes
+        self.meeting_speakers = meeting_speakers
+        if meeting_speakers is not None:
+            meeting_speakers.setParent(self)
+            meeting_speakers.idle.connect(self._resume_meeting_close)
         if meeting_notes is not None:
             meeting_notes.setParent(self)
             meeting_notes.idle.connect(self._resume_meeting_close)
@@ -401,6 +406,7 @@ class MainWindow(QMainWindow):
                 speaker_review_service=self.meeting_speaker_review_service,
                 final_transcription=self.meeting_final,
                 meeting_notes=self.meeting_notes,
+                speaker_generation=self.meeting_speakers,
                 preview_player_factory=self.preview_player_factory,
                 parent=self,
                 flags=Qt.WindowType.Window,
@@ -616,6 +622,8 @@ class MainWindow(QMainWindow):
             self.on_new_meeting()
             if self.meeting_capture_widget.confirm_end():
                 self._meeting_close_pending = True
+                if self.meeting_speakers is not None:
+                    self.meeting_speakers.close()
                 if self.meeting_notes is not None:
                     self.meeting_notes.close()
                 if self.meeting_final is not None:
@@ -623,6 +631,11 @@ class MainWindow(QMainWindow):
                 self.meeting_controller.end()
             else:
                 self._meeting_close_pending = False
+            return
+        if self.meeting_speakers is not None and not self.meeting_speakers.close():
+            event.ignore()
+            self._meeting_close_pending = True
+            self.statusBar().showMessage("Finishing Speaker Review before closing…")
             return
         if self.meeting_notes is not None and not self.meeting_notes.close():
             event.ignore()

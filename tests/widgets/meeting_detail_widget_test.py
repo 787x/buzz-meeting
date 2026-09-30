@@ -291,6 +291,64 @@ def make_widget(qtbot, detail, speaker_service=None, factory=None):
     return widget
 
 
+@pytest.mark.parametrize("profile", [1, 2])
+@pytest.mark.parametrize("status", list(FinalTranscriptionStatus))
+@pytest.mark.parametrize("state", list(MeetingDetailSpeakerReviewState))
+def test_generate_review_action_requires_absent_review_and_reviewable_v2(
+    qtbot, profile, status, state
+):
+    controller = Mock(busy=False, closing=False)
+    controller.message_for.return_value = ""
+    value = snapshot(
+        generation_value=replace(generation(status), profile_version=profile),
+        review_state=state,
+        review_value=review()
+        if state is MeetingDetailSpeakerReviewState.FRESH
+        else None,
+    )
+    widget = MeetingDetailWidget(
+        DetailService(value), Mock(), Mock(), speaker_generation=controller
+    )
+    qtbot.addWidget(widget)
+    widget.open_meeting(MEETING_ID)
+    controller.submit.assert_not_called()
+    eligible = (
+        profile == 2
+        and status
+        in (FinalTranscriptionStatus.COMPLETED, FinalTranscriptionStatus.PARTIAL)
+        and state is MeetingDetailSpeakerReviewState.ABSENT
+    )
+    assert widget.generate_review_button.isEnabled() == eligible
+    widget.generate_review_button.click()
+    if eligible:
+        controller.submit.assert_called_once_with(MEETING_ID)
+    else:
+        controller.submit.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "state",
+    [MeetingDetailTranscriptState.CORRUPT, MeetingDetailTranscriptState.LOAD_FAILED],
+)
+def test_generate_review_disabled_when_authoritative_transcript_cannot_load(
+    qtbot, state
+):
+    controller = Mock(busy=False, closing=False)
+    controller.message_for.return_value = ""
+    value = snapshot(
+        transcript_state=state,
+        generation_value=generation(),
+        review_state=MeetingDetailSpeakerReviewState.ABSENT,
+    )
+    widget = MeetingDetailWidget(
+        DetailService(value), Mock(), Mock(), speaker_generation=controller
+    )
+    qtbot.addWidget(widget)
+    widget.open_meeting(MEETING_ID)
+    assert not widget.generate_review_button.isEnabled()
+    controller.submit.assert_not_called()
+
+
 @pytest.mark.parametrize("status", list(FinalTranscriptionStatus))
 def test_final_retry_button_uses_existing_generation(qtbot, status):
     final = Mock(pending=0)

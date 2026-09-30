@@ -3,7 +3,9 @@ from unittest.mock import Mock, patch
 from buzz.widgets.application import _build_main_window
 
 
-def test_build_main_window_composes_both_services_with_same_database() -> None:
+def test_build_main_window_composes_both_services_with_same_database(
+    monkeypatch,
+) -> None:
     database = object()
     transcription_dao = object()
     transcription_segment_dao = object()
@@ -19,6 +21,10 @@ def test_build_main_window_composes_both_services_with_same_database() -> None:
     detail_service = object()
     preview_factory = object()
     main_window = Mock(name="main_window")
+    speakers_controller = Mock()
+    monkeypatch.setattr(
+        "buzz.widgets.application.MeetingSpeakerGeneration", speakers_controller
+    )
 
     with (
         patch(
@@ -108,10 +114,14 @@ def test_build_main_window_composes_both_services_with_same_database() -> None:
         controller_type.return_value,
         final_type.return_value,
         notes_controller.return_value,
+        speakers_controller.return_value,
     )
     notes_repo.assert_called_once_with(database)
     notes_service.assert_called_once_with(detail_service, notes_repo.return_value)
     notes_controller.assert_called_once_with(notes_service.return_value)
+    speakers_controller.assert_called_once_with(
+        detail_service, final_reader, speaker_service
+    )
     workflow_type.assert_called_once_with(meeting_storage)
     controller_type.assert_called_once_with(workflow_type.return_value)
     final_type.assert_called_once_with(
