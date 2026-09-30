@@ -228,6 +228,31 @@ def test_explicit_generation_off_gui_responsive_single_request_and_canonical_rel
     assert not case.widget.generate_review_button.isEnabled()
 
 
+def test_busy_generation_survives_tab_navigation_and_refresh(generation_case, qtbot):
+    case = generation_case
+    case.widget.tabs.setCurrentIndex(1)
+    trigger(case, qtbot)
+    worker, thread = case.controller.worker, case.controller.worker_thread
+    for area in (2, 0, 1):
+        case.widget.tabs.setCurrentIndex(area)
+        case.widget.refresh()
+        assert case.widget.tabs.currentIndex() == area
+        assert case.controller.worker is worker
+        assert case.controller.worker_thread is thread
+        assert case.controller.busy
+        assert "Generating" in case.widget.generation_status_label.text()
+        assert not case.widget.generate_review_button.isEnabled()
+        case.widget.generate_review_button.click()
+    assert len(case.runner.calls) == 1
+    case.widget.tabs.setCurrentIndex(2)
+    finish(case, qtbot)
+    assert case.widget.tabs.currentIndex() == 2
+    case.widget.tabs.setCurrentIndex(1)
+    assert case.widget.word_model.rowCount() == 1
+    assert case.widget._snapshot.speaker_review is not None
+    case.reviews.create_review.assert_called_once()
+
+
 @pytest.mark.parametrize(
     "failure", ["decode", "diarize", "map", "persist", "source_read"]
 )
@@ -400,6 +425,8 @@ def test_open_another_meeting_keeps_result_and_failure_associated_with_origin(
     trigger(case, qtbot)
     second = uuid.UUID(int=111)
     case.widget.open_meeting(second)
+    assert case.widget.tabs.currentIndex() == 0
+    case.widget.tabs.setCurrentIndex(1)
     assert "another meeting" in case.widget.generation_status_label.text()
     assert not case.widget.generate_review_button.isEnabled()
     finish(case, qtbot)
@@ -409,8 +436,11 @@ def test_open_another_meeting_keeps_result_and_failure_associated_with_origin(
     assert case.widget._current_meeting_id == second
     assert case.widget._snapshot.meeting.session_id == second
     assert case.widget._snapshot.speaker_review is None
+    assert case.widget.tabs.currentIndex() == 1
+    assert case.widget.word_model.rowCount() == case.widget.speaker_list.count() == 0
     assert not case.widget.generation_status_label.text()
     case.widget.open_meeting(MEETING_ID)
+    assert case.widget.tabs.currentIndex() == 0
     assert case.widget._snapshot.speaker_review is not None
 
 

@@ -180,6 +180,7 @@ class MeetingDetailWidget(QWidget):
 
     def _build_ui(self) -> None:
         self.state_label = QLabel(self)
+        self.state_label.setWordWrap(True)
 
         metadata_group = QGroupBox(_("Meeting"), self)
         metadata_layout = QFormLayout(metadata_group)
@@ -288,7 +289,7 @@ class MeetingDetailWidget(QWidget):
         word_layout.addLayout(word_buttons)
         review_splitter.addWidget(speaker_panel)
         review_splitter.addWidget(word_panel)
-        review_layout.addWidget(review_splitter)
+        review_layout.addWidget(review_splitter, 1)
         self.mutation_error_label = QLabel(review_group)
         review_layout.addWidget(self.mutation_error_label)
         self.preview_host = QVBoxLayout()
@@ -304,26 +305,29 @@ class MeetingDetailWidget(QWidget):
         self.complete_button.clicked.connect(self._mark_completed)
 
         layout = QVBoxLayout(self)
+        # Load errors apply to the whole meeting, regardless of the active area.
+        layout.addWidget(self.state_label)
+        self.tabs = QTabWidget(self)
+        layout.addWidget(self.tabs)
+        self.tabs.addTab(transcript_group, _("Transcript"))
+        self.tabs.addTab(review_group, _("Speakers"))
         if self._meeting_notes is not None:
             from buzz.widgets.meeting_notes_panel import MeetingNotesPanel
             from buzz.widgets.meeting_notes_configuration import NotesConfiguration
 
-            tabs = QTabWidget(self)
-            layout.addWidget(tabs)
-            details = QWidget(tabs)
-            layout = QVBoxLayout(details)
-            tabs.addTab(details, _("Meeting"))
             self.notes_panel = MeetingNotesPanel(
-                self._meeting_notes, NotesConfiguration(), tabs
+                self._meeting_notes, NotesConfiguration(), self.tabs
             )
-            tabs.addTab(self.notes_panel, _("AI Notes"))
-        layout.addWidget(self.state_label)
-        layout.addWidget(metadata_group)
-        layout.addWidget(audio_group)
-        layout.addWidget(transcript_group, 1)
-        layout.addWidget(review_group, 2)
+            self.tabs.addTab(self.notes_panel, _("AI Notes"))
+        info = QWidget(self.tabs)
+        info_layout = QVBoxLayout(info)
+        info_layout.addWidget(metadata_group)
+        info_layout.addWidget(audio_group, 1)
+        self.tabs.addTab(info, _("Info"))
 
     def open_meeting(self, meeting_id: uuid.UUID) -> None:
+        if meeting_id != self._current_meeting_id:
+            self.tabs.setCurrentIndex(0)
         self._current_meeting_id = meeting_id
         self._snapshot = None
         self._clear_presentation()
